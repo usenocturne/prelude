@@ -49,6 +49,7 @@ const MAXIMUM_AUDIO_CONTROL_BYTES: usize = 2 * 1024;
 const MAXIMUM_AUDIO_PREROLL_BYTES: usize = 512 * 1024;
 const MAXIMUM_AUDIO_FLUSH_DRAIN_PACKETS: usize = 4096;
 const NTP_UNIX_EPOCH_OFFSET: u64 = 2_208_988_800;
+const LOW_LATENCY_MUSIC_BUFFER_MS: u32 = 400;
 const TIMING_STEP_THRESHOLD_NS: i128 = 128_000_000;
 const TIMING_DELAY_WINDOW: usize = 8;
 const TIMING_PICK_COUNT: u8 = 2;
@@ -249,6 +250,7 @@ struct MediaSupervisor {
     recording_requested: bool,
     flush_state: Arc<Mutex<AudioFlushState>>,
     audio_stream_latencies: Arc<Mutex<Vec<AudioStreamLatencyStatus>>>,
+    music_buffer_limit_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -562,6 +564,9 @@ impl LiveMediaRuntime {
             recording_requested: false,
             flush_state,
             audio_stream_latencies: Arc::clone(&audio_stream_latencies),
+            music_buffer_limit_ms: config
+                .low_latency_music
+                .then_some(LOW_LATENCY_MUSIC_BUFFER_MS),
         };
         let worker = thread::Builder::new()
             .name("prelude-media".to_owned())
@@ -1176,6 +1181,7 @@ impl MediaSupervisor {
         output_key: Zeroizing<[u8; 32]>,
         input_key: Option<Zeroizing<[u8; 32]>>,
     ) -> Result<(), String> {
+        let descriptor = limit_music_buffer(descriptor, self.music_buffer_limit_ms);
         let key = descriptor.key();
         if self.children.contains_key(&key) {
             return Err("media stream worker was already started".to_owned());
@@ -2761,6 +2767,29 @@ fn audio_stream_id(kind: AudioStreamKind) -> AudioStreamId {
     }
 }
 
+fn limit_music_buffer(mut descriptor: StreamDescriptor, limit_ms: Option<u32>) -> StreamDescriptor {
+    if let (StreamDescriptor::Audio(audio), Some(limit_ms)) = (&mut descriptor, limit_ms)
+        && matches!(
+            AudioFormatId::new(audio.audio_format).codec(),
+            Ok(prelude_media::EncodedAudioCodec::AacLc { .. })
+        )
+    {
+        let requested_ms = audio
+            .audio_latency_ms
+            .filter(|latency| *latency != 0)
+            .unwrap_or(AudioLatencyConfig::default().aac_jitter_ms);
+        if requested_ms > limit_ms {
+            tracing::info!(
+                requested_ms,
+                limit_ms,
+                "shortening the wireless CarPlay music buffer"
+            );
+            audio.audio_latency_ms = Some(limit_ms);
+        }
+    }
+    descriptor
+}
+
 fn audio_stream_config(descriptor: &AudioDescriptor) -> AudioStreamConfig {
     AudioStreamConfig::with_negotiated_latency(
         audio_stream_id(descriptor.kind),
@@ -3151,6 +3180,56 @@ mod tests {
             microphone: None,
         };
         assert!(validate_audio_descriptor(&unadvertised).is_err());
+    }
+
+    #[test]
+    fn low_latency_music_shortens_only_the_wireless_music_buffer() {
+        let audio = |audio_format, audio_latency_ms| {
+            StreamDescriptor::Audio(AudioDescriptor {
+                kind: AudioStreamKind::High,
+                connection_id: 44,
+                audio_type: "media".to_owned(),
+                audio_format,
+                audio_latency_ms,
+                frames_per_packet: None,
+                microphone: None,
+            })
+        };
+        let latency = |descriptor: StreamDescriptor| match descriptor {
+            StreamDescriptor::Audio(audio) => audio.audio_latency_ms,
+            _ => unreachable!("audio descriptor"),
+        };
+        let limit = Some(LOW_LATENCY_MUSIC_BUFFER_MS);
+        for requested in [Some(1_000), Some(0), None] {
+            assert_eq!(
+                latency(limit_music_buffer(
+                    audio(AAC_LC_48K_STEREO, requested),
+                    limit
+                )),
+                Some(LOW_LATENCY_MUSIC_BUFFER_MS)
+            );
+        }
+        assert_eq!(
+            latency(limit_music_buffer(
+                audio(AAC_LC_48K_STEREO, Some(300)),
+                limit
+            )),
+            Some(300)
+        );
+        assert_eq!(
+            latency(limit_music_buffer(
+                audio(AAC_LC_48K_STEREO, Some(1_000)),
+                None
+            )),
+            Some(1_000)
+        );
+        assert_eq!(
+            latency(limit_music_buffer(
+                audio(OPUS_48K_MONO_FORMAT, Some(1_000)),
+                limit
+            )),
+            Some(1_000)
+        );
     }
 
     #[test]

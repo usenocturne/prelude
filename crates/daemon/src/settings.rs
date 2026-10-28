@@ -44,6 +44,7 @@ pub struct RuntimeSettings {
     pub original_dpi: u32,
     pub dpi_customized: bool,
     pub phone_audio: bool,
+    pub low_latency_music: bool,
     pub carplay_dock: CarPlayDock,
     pub presets: [PresetAction; PRESET_COUNT],
     pub equalizer: prelude_media::EqualizerSettings,
@@ -60,6 +61,7 @@ impl Default for RuntimeSettings {
             original_dpi: prelude_android_auto_protocol::DEFAULT_VIDEO_DENSITY_DPI,
             dpi_customized: false,
             phone_audio: false,
+            low_latency_music: true,
             carplay_dock: CarPlayDock::Left,
             presets: PresetAction::DEFAULTS,
             equalizer: Default::default(),
@@ -83,6 +85,7 @@ impl RuntimeSettings {
             dpi_customized: false,
             phone_audio: config.airplay.disable_audio_output
                 && config.android_auto.disable_audio_output,
+            low_latency_music: config.media.low_latency_music,
             carplay_dock: config.airplay.dock,
             presets: config.platform.presets.actions(),
             equalizer: config.media.equalizer.settings(),
@@ -149,6 +152,7 @@ impl RuntimeSettings {
         config.android_auto.ui_density_dpi = settings.reported_dpi;
         config.airplay.disable_audio_output = settings.phone_audio;
         config.android_auto.disable_audio_output = settings.phone_audio;
+        config.media.low_latency_music = settings.low_latency_music;
         config.airplay.dock = settings.carplay_dock;
         config.platform.presets.set(settings.presets);
         if let Some(channel) = settings.wifi_channel {
@@ -246,6 +250,7 @@ mod tests {
             original_dpi: 170,
             dpi_customized: true,
             phone_audio: true,
+            low_latency_music: false,
             carplay_dock: CarPlayDock::Bottom,
             presets: [
                 PresetAction::VoiceAssistant,

@@ -255,6 +255,7 @@ enum Item {
     Density,
     CarPlayDock,
     PhoneAudio,
+    LowLatencyMusic,
     Equalizer,
     Presets,
     Preset(usize),
@@ -453,6 +454,7 @@ struct SettingsUi<D> {
     staged_dpi: u32,
     staged_dpi_customized: bool,
     staged_phone_audio: bool,
+    staged_low_latency_music: bool,
     staged_dock: CarPlayDock,
     presets: PresetBindings,
     staged_presets: [PresetAction; PRESET_COUNT],
@@ -507,6 +509,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
             staged_dpi: settings.reported_dpi,
             staged_dpi_customized: settings.dpi_customized,
             staged_phone_audio: settings.phone_audio,
+            staged_low_latency_music: settings.low_latency_music,
             staged_dock: settings.carplay_dock,
             presets,
             staged_presets: settings.presets,
@@ -629,6 +632,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         self.staged_dpi != self.settings.reported_dpi
             || self.staged_dpi_customized != self.settings.dpi_customized
             || self.staged_phone_audio != self.settings.phone_audio
+            || self.staged_low_latency_music != self.settings.low_latency_music
             || self.staged_dock != self.settings.carplay_dock
             || self.staged_presets != self.settings.presets
             || self.staged_radio != self.settings.wifi_radio()
@@ -647,7 +651,10 @@ impl<D: OverlaySurface> SettingsUi<D> {
                         Item::CarPlayDock,
                     ],
                 ),
-                Section::titled("Audio", vec![Item::PhoneAudio, Item::Equalizer]),
+                Section::titled(
+                    "Audio",
+                    vec![Item::PhoneAudio, Item::LowLatencyMusic, Item::Equalizer],
+                ),
                 Section::titled("Controls", vec![Item::Presets]),
                 Section::titled("Advanced", vec![Item::Wifi, Item::Support, Item::Version]),
             ],
@@ -726,6 +733,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         self.staged_dpi = self.settings.reported_dpi;
         self.staged_dpi_customized = self.settings.dpi_customized;
         self.staged_phone_audio = self.settings.phone_audio;
+        self.staged_low_latency_music = self.settings.low_latency_music;
         self.staged_dock = self.settings.carplay_dock;
         self.staged_presets = self.settings.presets;
         self.staged_radio = self.settings.wifi_radio();
@@ -748,6 +756,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         next.reported_dpi = self.staged_dpi;
         next.dpi_customized = self.staged_dpi_customized;
         next.phone_audio = self.staged_phone_audio;
+        next.low_latency_music = self.staged_low_latency_music;
         next.carplay_dock = self.staged_dock;
         next.presets = self.staged_presets;
         if let Some((channel, width)) = self.staged_radio {
@@ -763,6 +772,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         let restart_required = next.reported_dpi != self.settings.reported_dpi
             || next.dpi_customized != self.settings.dpi_customized
             || next.phone_audio != self.settings.phone_audio
+            || next.low_latency_music != self.settings.low_latency_music
             || next.carplay_dock != self.settings.carplay_dock;
         let radio_changed = next.wifi_radio() != self.settings.wifi_radio();
         self.presets.set(next.presets);
@@ -935,6 +945,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
             Item::AutoNightMode => self.toggle_auto_night_mode(),
             Item::Density => self.enter(Page::Density),
             Item::PhoneAudio => self.toggle_phone_audio(),
+            Item::LowLatencyMusic => self.toggle_low_latency_music(),
             Item::Equalizer => self.enter(Page::Equalizer),
             Item::Presets => self.enter(Page::Presets),
             Item::PresetsReset => self.reset_presets(),
@@ -1161,6 +1172,12 @@ impl<D: OverlaySurface> SettingsUi<D> {
 
     fn toggle_phone_audio(&mut self) {
         self.staged_phone_audio = !self.staged_phone_audio;
+        self.error_message = None;
+        self.redraw();
+    }
+
+    fn toggle_low_latency_music(&mut self) {
+        self.staged_low_latency_music = !self.staged_low_latency_music;
         self.error_message = None;
         self.redraw();
     }
@@ -1669,6 +1686,11 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 RowView::new("Phone audio", Trailing::Switch(self.staged_phone_audio))
                     .detail("Keep sound on your phone")
             }
+            Item::LowLatencyMusic => RowView::new(
+                "Low-latency music",
+                Trailing::Switch(self.staged_low_latency_music),
+            )
+            .detail("Wireless CarPlay starts faster"),
             Item::Equalizer => RowView::new(
                 "Equalizer",
                 Trailing::Link(on_off(self.equalizer_ui.settings.enabled), SECONDARY),
@@ -2413,6 +2435,26 @@ mod tests {
     }
 
     #[test]
+    fn low_latency_music_restarts_projection_on_close() {
+        let mut harness = Harness::new();
+        assert!(harness.ui.settings.low_latency_music);
+        harness.focus(Item::LowLatencyMusic);
+        harness.press(KnobInputButton::Select);
+        assert!(!harness.ui.staged_low_latency_music);
+        harness.press(KnobInputButton::Back);
+        let events: Vec<_> = harness.events.try_iter().collect();
+        assert!(matches!(
+            events.as_slice(),
+            [HostUiEvent::SettingsCommitted(SettingsCommitted {
+                restart_required: true,
+                radio_changed: false,
+                ..
+            })]
+        ));
+        assert!(!harness.ui.settings.low_latency_music);
+    }
+
+    #[test]
     fn carplay_dock_is_picked_in_place_and_restarts_projection_on_close() {
         let mut harness = Harness::new();
         harness.focus(Item::CarPlayDock);
@@ -2690,6 +2732,8 @@ mod tests {
         capture(&harness, "settings");
         harness.focus(Item::Density);
         capture(&harness, "settings-scrolled");
+        harness.focus(Item::LowLatencyMusic);
+        capture(&harness, "settings-audio");
         harness.focus(Item::PhoneAudio);
         harness.press(KnobInputButton::Select);
         harness.focus(Item::Version);
