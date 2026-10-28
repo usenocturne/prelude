@@ -4,6 +4,7 @@
 )]
 
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -16,6 +17,10 @@ use std::{
 
 use prelude_bluetooth_sco::ScoLink;
 use prelude_wireless::bluez::{PairingPasskeys, PhoneKind};
+use sonora::{
+    AudioProcessing, AudioProcessingStats, Config, StreamConfig,
+    config::{EchoCanceller, HighPassFilter, NoiseSuppression},
+};
 
 use crate::wireless_runtime::{SharedBluetoothAddress, SharedBluetoothControl, remember_phone};
 
@@ -23,6 +28,10 @@ use crate::wireless_runtime::{SharedBluetoothAddress, SharedBluetoothControl, re
 pub(crate) use bridge::CallBridge;
 
 const CAR_ADDRESS_POLL: Duration = Duration::from_millis(100);
+const CALL_VOICE_RATE: u32 = 8_000;
+const CALL_VOICE_FRAME_SAMPLES: usize = CALL_VOICE_RATE as usize / 100;
+const CALL_VOICE_FRAME_BYTES: usize = CALL_VOICE_FRAME_SAMPLES * 2;
+const ECHO_REFERENCE_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Default)]
 struct CallListeners {
@@ -253,6 +262,93 @@ impl Upsampler {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CallVoiceProcessor {
+    processing: AudioProcessing,
+    scheduled: VecDeque<(Instant, Vec<u8>)>,
+    far_end: Vec<u8>,
+    near_end: Vec<u8>,
+    input: Vec<i16>,
+    output: Vec<i16>,
+}
+
+impl CallVoiceProcessor {
+    pub(crate) fn new() -> Self {
+        let stream = StreamConfig::new(CALL_VOICE_RATE, 1);
+        let processing = AudioProcessing::builder()
+            .config(Config {
+                high_pass_filter: Some(HighPassFilter::default()),
+                echo_canceller: Some(EchoCanceller::default()),
+                noise_suppression: Some(NoiseSuppression::default()),
+                ..Config::default()
+            })
+            .capture_config(stream)
+            .render_config(stream)
+            .build();
+        Self {
+            processing,
+            scheduled: VecDeque::new(),
+            far_end: Vec::with_capacity(CALL_VOICE_FRAME_BYTES * 4),
+            near_end: Vec::with_capacity(CALL_VOICE_FRAME_BYTES * 4),
+            input: vec![0; CALL_VOICE_FRAME_SAMPLES],
+            output: vec![0; CALL_VOICE_FRAME_SAMPLES],
+        }
+    }
+
+    pub(crate) fn far_end(&mut self, pcm_s16le: &[u8], now: Instant) {
+        self.scheduled
+            .push_back((now + ECHO_REFERENCE_DELAY, pcm_s16le.to_vec()));
+        self.release_far_end(now);
+    }
+
+    fn release_far_end(&mut self, now: Instant) {
+        while let Some((due, _)) = self.scheduled.front()
+            && *due <= now
+        {
+            if let Some((_, pcm_s16le)) = self.scheduled.pop_front() {
+                self.far_end.extend_from_slice(&pcm_s16le);
+            }
+        }
+        let complete = self.far_end.len() - self.far_end.len() % CALL_VOICE_FRAME_BYTES;
+        for frame in self.far_end[..complete].chunks_exact(CALL_VOICE_FRAME_BYTES) {
+            decode_samples(frame, &mut self.input);
+            let _ = self
+                .processing
+                .process_render_i16(&self.input, &mut self.output);
+        }
+        self.far_end.drain(..complete);
+    }
+
+    pub(crate) fn near_end(&mut self, pcm_s16le: &[u8], now: Instant, uplink: &mut VecDeque<u8>) {
+        self.release_far_end(now);
+        self.near_end.extend_from_slice(pcm_s16le);
+        let complete = self.near_end.len() - self.near_end.len() % CALL_VOICE_FRAME_BYTES;
+        for frame in self.near_end[..complete].chunks_exact(CALL_VOICE_FRAME_BYTES) {
+            decode_samples(frame, &mut self.input);
+            if self
+                .processing
+                .process_capture_i16(&self.input, &mut self.output)
+                .is_ok()
+            {
+                uplink.extend(self.output.iter().flat_map(|sample| sample.to_le_bytes()));
+            } else {
+                uplink.extend(frame);
+            }
+        }
+        self.near_end.drain(..complete);
+    }
+
+    pub(crate) fn statistics(&self) -> &AudioProcessingStats {
+        self.processing.statistics()
+    }
+}
+
+fn decode_samples(pcm_s16le: &[u8], samples: &mut [i16]) {
+    for (sample, bytes) in samples.iter_mut().zip(pcm_s16le.chunks_exact(2)) {
+        *sample = i16::from_le_bytes([bytes[0], bytes[1]]);
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 mod bridge {
     use std::{
@@ -263,7 +359,7 @@ mod bridge {
             atomic::{AtomicBool, Ordering},
         },
         thread::{self, JoinHandle},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use prelude_bluetooth_sco::ScoLink;
@@ -272,12 +368,13 @@ mod bridge {
         MicrophoneBackendEvent,
     };
 
-    use super::{Upsampler, format_address};
+    use super::{CallVoiceProcessor, Upsampler, format_address};
     use crate::android_auto_runtime::AudioClock;
 
     const CALL_FORMAT: AudioFormatId = AudioFormatId::new(0x10);
     const CALL_OUTPUT_RATE: u32 = 16_000;
     const DOWNLINK_FRAME_BYTES: usize = 320;
+    const SILENT_DOWNLINK_FRAME: [u8; DOWNLINK_FRAME_BYTES] = [0; DOWNLINK_FRAME_BYTES];
     const UPLINK_LIMIT_BYTES: usize = 1_600;
     const READ_BUFFER_BYTES: usize = 1_024;
     const LINK_TIMEOUT: Duration = Duration::from_millis(200);
@@ -306,7 +403,24 @@ mod bridge {
                     let peer = peer.clone();
                     move || {
                         let mut microphone = microphone;
-                        let clock = pump(&link, &frames, clock, &stop, &mut microphone, &peer);
+                        let mut voice = CallVoiceProcessor::new();
+                        let clock = pump(
+                            &link,
+                            &frames,
+                            clock,
+                            &stop,
+                            &mut microphone,
+                            &mut voice,
+                            &peer,
+                        );
+                        let statistics = voice.statistics();
+                        tracing::info!(
+                            peer,
+                            echo_delay_ms = ?statistics.delay_ms,
+                            echo_return_loss_enhancement_db =
+                                ?statistics.echo_return_loss_enhancement.map(f64::round),
+                            "call echo canceller summary"
+                        );
                         if let Some(microphone) = microphone
                             && let Err(error) = microphone.shutdown()
                         {
@@ -351,6 +465,7 @@ mod bridge {
         mut clock: AudioClock,
         stop: &AtomicBool,
         microphone: &mut Option<LinuxMicrophoneBackend>,
+        voice: &mut CallVoiceProcessor,
         peer: &str,
     ) -> AudioClock {
         let mut uplink = VecDeque::with_capacity(UPLINK_LIMIT_BYTES * 2);
@@ -359,7 +474,7 @@ mod bridge {
         let mut upsampler = Upsampler::default();
         let mut dropped_frames = 0_u64;
         while !stop.load(Ordering::Acquire) {
-            drain_microphone(microphone, &mut uplink, peer);
+            drain_microphone(microphone, voice, &mut uplink, peer);
             let read = match link.recv(&mut packet) {
                 Ok(0) => break,
                 Ok(read) => read,
@@ -381,17 +496,20 @@ mod bridge {
             downlink.extend_from_slice(&packet[..read]);
             while downlink.len() >= DOWNLINK_FRAME_BYTES {
                 let pcm = upsampler.double_rate(&downlink[..DOWNLINK_FRAME_BYTES]);
-                downlink.drain(..DOWNLINK_FRAME_BYTES);
                 let submitted = clock
                     .frame(AudioStreamId::High, CALL_FORMAT, CALL_OUTPUT_RATE, 1, &pcm)
                     .map_err(|error| error.to_string())
                     .and_then(|frame| frames.try_submit(frame).map_err(|error| error.to_string()));
                 if let Err(error) = submitted {
+                    voice.far_end(&SILENT_DOWNLINK_FRAME, Instant::now());
                     dropped_frames = dropped_frames.saturating_add(1);
                     if dropped_frames.is_power_of_two() {
                         tracing::warn!(peer, dropped_frames, %error, "dropping Bluetooth call audio");
                     }
+                } else {
+                    voice.far_end(&downlink[..DOWNLINK_FRAME_BYTES], Instant::now());
                 }
+                downlink.drain(..DOWNLINK_FRAME_BYTES);
             }
             let reply = take_uplink(&mut uplink, read);
             let mtu = match link.mtu() {
@@ -420,6 +538,7 @@ mod bridge {
 
     fn drain_microphone(
         microphone: &mut Option<LinuxMicrophoneBackend>,
+        voice: &mut CallVoiceProcessor,
         uplink: &mut VecDeque<u8>,
         peer: &str,
     ) {
@@ -440,7 +559,7 @@ mod bridge {
         }
         while let Ok(Some(event)) = backend.try_event() {
             if let MicrophoneBackendEvent::Packet { packet, .. } = event {
-                uplink.extend(&packet.encoded);
+                voice.near_end(&packet.encoded, Instant::now(), uplink);
             }
         }
         let excess = uplink.len().saturating_sub(UPLINK_LIMIT_BYTES);
@@ -488,6 +607,116 @@ mod tests {
             samples(&upsampler.double_rate(&pcm(&[-200, i16::MIN]))),
             [0, -200, -16_484, i16::MIN]
         );
+    }
+
+    fn energy(samples: &[i16]) -> f64 {
+        samples
+            .iter()
+            .map(|sample| f64::from(*sample).powi(2))
+            .sum::<f64>()
+            / samples.len().max(1) as f64
+    }
+
+    fn assert_echo_removed_and_driver_kept(echo_delay: Duration) {
+        const RATE: usize = CALL_VOICE_RATE as usize;
+        const CHUNK: usize = RATE / 50;
+        let echo_delay = RATE * echo_delay.as_millis() as usize / 1_000;
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let far_end: Vec<i16> = (0..RATE * 12)
+            .map(|index| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let envelope = match index / (RATE / 4) {
+                    talk if talk >= 36 => 0.0,
+                    talk if talk % 3 == 2 => 0.1,
+                    _ => 1.0,
+                };
+                (f64::from((seed >> 48) as i16 / 4) * envelope) as i16
+            })
+            .collect();
+        let echo: Vec<i16> = (0..far_end.len())
+            .map(|index| {
+                let tap = |delay: usize| {
+                    index
+                        .checked_sub(echo_delay + delay)
+                        .map_or(0.0, |source| f64::from(far_end[source]))
+                };
+                (0.5 * tap(0) + 0.2 * tap(3) - 0.1 * tap(11)) as i16
+            })
+            .collect();
+        let driver: Vec<i16> = (0..far_end.len())
+            .map(|index| {
+                if index < RATE * 10 || index % (RATE * 3 / 10) >= RATE / 5 {
+                    return 0;
+                }
+                let time = index as f64 / RATE as f64;
+                let voiced: f64 = (1..=12_u32)
+                    .map(|harmonic| {
+                        let harmonic = f64::from(harmonic);
+                        (std::f64::consts::TAU * 140.0 * harmonic * time).sin() / harmonic
+                    })
+                    .sum();
+                (voiced * 2_500.0) as i16
+            })
+            .collect();
+        let microphone: Vec<i16> = echo
+            .iter()
+            .zip(&driver)
+            .map(|(echo, driver)| echo.saturating_add(*driver))
+            .collect();
+        let mut voice = CallVoiceProcessor::new();
+        let mut uplink = VecDeque::new();
+        let started = Instant::now();
+        for (index, (far, near)) in far_end
+            .chunks(CHUNK)
+            .zip(microphone.chunks(CHUNK))
+            .enumerate()
+        {
+            let now = started + Duration::from_millis(20) * index as u32;
+            voice.far_end(&pcm(far), now);
+            voice.near_end(&pcm(near), now, &mut uplink);
+        }
+        let processed = samples(&uplink.into_iter().collect::<Vec<_>>());
+        assert_eq!(processed.len(), microphone.len());
+        let echo_only = RATE * 4..RATE * 9;
+        let reduction_db =
+            10.0 * (energy(&echo[echo_only.clone()]) / energy(&processed[echo_only])).log10();
+        assert!(
+            reduction_db > 20.0,
+            "echo only reduced by {reduction_db:.1} dB"
+        );
+        let driver_only = RATE * 21 / 2..RATE * 12;
+        let kept_db =
+            10.0 * (energy(&processed[driver_only.clone()]) / energy(&driver[driver_only])).log10();
+        assert!(
+            kept_db > -6.0,
+            "the driver was attenuated by {kept_db:.1} dB"
+        );
+    }
+
+    #[test]
+    fn call_voice_processing_removes_the_expected_car_speaker_echo() {
+        assert_echo_removed_and_driver_kept(Duration::from_millis(400));
+    }
+
+    #[test]
+    fn call_voice_processing_reaches_echo_beyond_the_canceller_window() {
+        assert_echo_removed_and_driver_kept(Duration::from_millis(550));
+    }
+
+    #[test]
+    fn call_voice_processing_waits_for_whole_frames() {
+        let mut voice = CallVoiceProcessor::new();
+        let mut uplink = VecDeque::new();
+        let now = Instant::now();
+        voice.far_end(&[0; 7], now);
+        voice.near_end(&[0; CALL_VOICE_FRAME_BYTES - 1], now, &mut uplink);
+        assert!(uplink.is_empty());
+        voice.near_end(&[0; CALL_VOICE_FRAME_BYTES + 3], now, &mut uplink);
+        assert_eq!(uplink.len(), CALL_VOICE_FRAME_BYTES * 2);
+        voice.near_end(&[0; 1], now, &mut uplink);
+        assert_eq!(uplink.len(), CALL_VOICE_FRAME_BYTES * 2);
     }
 
     #[test]

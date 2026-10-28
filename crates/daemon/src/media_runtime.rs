@@ -2699,15 +2699,18 @@ fn microphone_config(
     if descriptor.kind != AudioStreamKind::Main || channels != 1 {
         return Err("microphone uplink requires negotiated mono MainAudio".to_owned());
     }
-    let frame_duration_micros = microphone.frames_per_packet.map_or(20_000, |frames| {
-        u32::try_from(
-            u64::from(frames)
-                .saturating_mul(1_000_000)
-                .checked_div(u64::from(sample_rate_hz))
-                .unwrap_or(0),
-        )
-        .unwrap_or(0)
-    });
+    let frame_duration_micros = microphone.frames_per_packet.map_or(
+        prelude_media::DEFAULT_MICROPHONE_FRAME_MICROS,
+        |frames| {
+            u32::try_from(
+                u64::from(frames)
+                    .saturating_mul(1_000_000)
+                    .checked_div(u64::from(sample_rate_hz))
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0)
+        },
+    );
     MicrophoneConfig {
         stream_id: AudioStreamId::Main,
         codec: microphone_codec,
@@ -2727,7 +2730,7 @@ fn preflight_microphone_config(codec: MicrophoneCodec) -> MicrophoneConfig {
         codec,
         sample_rate_hz: 48_000,
         channels: 1,
-        frame_duration_micros: 20_000,
+        frame_duration_micros: prelude_media::DEFAULT_MICROPHONE_FRAME_MICROS,
         maximum_encoded_frame_bytes: 64 * 1024,
         maximum_pcm_buffer_bytes: 256 * 1024,
     }

@@ -2589,11 +2589,17 @@ fn build_info_payload(
 }
 
 fn info_audio_latencies() -> Vec<Value> {
+    let input_micros = u64::from(
+        prelude_media::MICROPHONE_CAPTURE_PERIOD_MICROS
+            + prelude_media::DEFAULT_MICROPHONE_FRAME_MICROS,
+    );
+    let output_micros =
+        u64::from(prelude_media::AudioLatencyConfig::default().output_latency_micros());
     let latency = |stream_type: u64, audio_type: Option<&str>| {
         let mut value = Dictionary::new();
         value.insert("type".to_owned(), Value::from(stream_type));
-        value.insert("inputLatencyMicros".to_owned(), Value::from(0_u64));
-        value.insert("outputLatencyMicros".to_owned(), Value::from(0_u64));
+        value.insert("inputLatencyMicros".to_owned(), Value::from(input_micros));
+        value.insert("outputLatencyMicros".to_owned(), Value::from(output_micros));
         if let Some(audio_type) = audio_type {
             value.insert("audioType".to_owned(), Value::String(audio_type.to_owned()));
         }
@@ -3630,13 +3636,13 @@ mod tests {
                 latency
                     .get("inputLatencyMicros")
                     .and_then(Value::as_unsigned_integer),
-                Some(0)
+                Some(30_000)
             );
             assert_eq!(
                 latency
                     .get("outputLatencyMicros")
                     .and_then(Value::as_unsigned_integer),
-                Some(0)
+                Some(171_333)
             );
         }
         let formats = decoded

@@ -35,10 +35,11 @@ pub use audio_wire::{
 };
 pub use backend_plan::{
     AudioLatencyConfig, AudioLatencySnapshot, AudioMixPolicy, AudioMixerPlan, AudioStreamConfig,
-    AudioStreamPlan, CapsPlan, CapsValue, MAXIMUM_AUDIO_STREAMS, MAXIMUM_BACKEND_FRAME_BYTES,
-    MAXIMUM_CODEC_DATA_BYTES, MAXIMUM_RTP_PACKET_BYTES, MicrophonePipelinePlan,
-    PipelineElementPlan, SCREEN_FRAMES_PER_SECOND, SCREEN_HEIGHT, SCREEN_WIDTH,
-    TARGET_VIDEO_DEVICE, TARGET_VIDEO_DRIVER_NAME, UNITY_GAIN_Q15, VideoPipelinePlan,
+    AudioStreamPlan, CapsPlan, CapsValue, DEFAULT_MICROPHONE_FRAME_MICROS, MAXIMUM_AUDIO_STREAMS,
+    MAXIMUM_BACKEND_FRAME_BYTES, MAXIMUM_CODEC_DATA_BYTES, MAXIMUM_RTP_PACKET_BYTES,
+    MICROPHONE_CAPTURE_PERIOD_MICROS, MIXER_OUTPUT_BUFFER_MICROS, MIXER_TEST_TONE_SAMPLES,
+    MicrophonePipelinePlan, PipelineElementPlan, SCREEN_FRAMES_PER_SECOND, SCREEN_HEIGHT,
+    SCREEN_WIDTH, TARGET_VIDEO_DEVICE, TARGET_VIDEO_DRIVER_NAME, UNITY_GAIN_Q15, VideoPipelinePlan,
 };
 pub use backpressure::{
     VideoBackpressureConfig, VideoBackpressureStats, VideoFrameDisposition, VideoIngressBuffer,

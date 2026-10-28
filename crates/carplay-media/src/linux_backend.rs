@@ -17,6 +17,7 @@ use crate::{
     AlsaEndpoint, AudioFormatId, AudioLatencyConfig, AudioLatencySnapshot, AudioMixPolicy,
     AudioMixerPlan, AudioOutputDelay, AudioStreamConfig, AudioStreamId, CapsPlan, CapsValue,
     EncodedAudioCodec, EncryptedAudioFrame, EncryptedVideoFrame, Error, LinuxDisplayHandle,
+    MICROPHONE_CAPTURE_PERIOD_MICROS, MIXER_OUTPUT_BUFFER_MICROS, MIXER_TEST_TONE_SAMPLES,
     MicrophoneCodec, MicrophoneConfig, MicrophonePacket, MicrophonePacketizer, Result,
     TARGET_VIDEO_DEVICE, TARGET_VIDEO_DRIVER_ATTRIBUTE, UNITY_GAIN_Q15, UsbDacMatcher,
     VideoBackpressureConfig, VideoBackpressureStats, VideoCodecConfiguration,
@@ -2099,6 +2100,29 @@ fn audio_worker(context: AudioWorkerContext) -> Result<()> {
     stop_audio_pipeline(&mut active, &telemetry)
 }
 
+fn schedule_jitter_latency_on_branch(pad: &gst::Pad, jitter_latency_ms: u32) -> Result<()> {
+    let jitter = gst::ClockTime::from_mseconds(u64::from(jitter_latency_ms));
+    let offset = i64::try_from(jitter.nseconds())
+        .map_err(|_| Error::Backend("RTP jitter latency overflows a pad offset".to_owned()))?;
+    pad.set_offset(offset);
+    pad.add_probe(
+        gst::PadProbeType::QUERY_UPSTREAM | gst::PadProbeType::PULL,
+        move |_, info| {
+            if let Some(gst::PadProbeData::Query(query)) = &mut info.data
+                && let gst::QueryViewMut::Latency(latency) = query.view_mut()
+            {
+                let (live, minimum, maximum) = latency.result();
+                if live {
+                    latency.set(live, minimum.saturating_sub(jitter), maximum);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        },
+    )
+    .ok_or_else(|| Error::Backend("cannot schedule RTP jitter latency on its branch".to_owned()))?;
+    Ok(())
+}
+
 fn floating_mix_caps(plan: &AudioMixerPlan) -> Result<gst::Caps> {
     let mut mix = plan.output_caps.clone();
     for (name, value) in &mut mix.fields {
@@ -2125,6 +2149,11 @@ impl AudioGstPipeline {
         pipeline.use_clock(Some(&clock));
         let mixer = make("audiomixer", "carplay-mixer")?;
         set_checked(&mixer, "ignore-inactive-pads", true)?;
+        set_checked(
+            &mixer,
+            "output-buffer-duration",
+            u64::from(MIXER_OUTPUT_BUFFER_MICROS) * 1_000,
+        )?;
         let output_convert = make("audioconvert", "mixer-output-converter")?;
         let output_caps = make("capsfilter", "mixer-output-caps")?;
         set_checked(&output_caps, "caps", caps(&plan.output_caps)?)?;
@@ -2155,6 +2184,12 @@ impl AudioGstPipeline {
         gst::Element::link_many(&output_elements).map_err(gst_error("cannot link audio output"))?;
         let test_tone = make("audiotestsrc", "audio-output-test-tone")?;
         set_checked(&test_tone, "is-live", true)?;
+        set_checked(
+            &test_tone,
+            "samplesperbuffer",
+            i32::try_from(MIXER_TEST_TONE_SAMPLES)
+                .map_err(|_| Error::Backend("test-tone buffer size overflows".to_owned()))?,
+        )?;
         set_checked(&test_tone, "freq", 440.0_f64)?;
         set_checked(&test_tone, "volume", 0.08_f64)?;
         set_enum_checked(&test_tone, "wave", "silence")?;
@@ -2243,6 +2278,9 @@ impl AudioGstPipeline {
                 .last()
                 .and_then(|element| element.static_pad("src"))
                 .ok_or_else(|| Error::Backend("audio branch has no source pad".to_owned()))?;
+            if let Some(jitter_latency_ms) = stream.jitter_latency_ms {
+                schedule_jitter_latency_on_branch(&source_pad, jitter_latency_ms)?;
+            }
             let mixer_pad = mixer.request_pad_simple("sink_%u").ok_or_else(|| {
                 Error::Backend("audiomixer did not allocate an input pad".to_owned())
             })?;
@@ -2784,6 +2822,11 @@ impl MicrophoneGstPipeline {
         let pipeline = gst::Pipeline::new();
         let source = make("alsasrc", "built-in-microphone")?;
         set_checked(&source, "device", input.device())?;
+        set_checked(
+            &source,
+            "latency-time",
+            i64::from(MICROPHONE_CAPTURE_PERIOD_MICROS),
+        )?;
         let source_caps = make("capsfilter", "microphone-source-caps")?;
         set_checked(&source_caps, "caps", caps(&plan.source_caps)?)?;
         let queue = make("queue", "microphone-capture-queue")?;
@@ -3772,6 +3815,38 @@ mod tests {
             .expect("target decoder device");
         set_enum_checked(&decoder, "output-io-mode", "mmap").expect("decoder output mmap");
         set_enum_checked(&decoder, "capture-io-mode", "mmap").expect("decoder capture mmap");
+    }
+
+    #[test]
+    fn rtp_jitter_buffers_do_not_delay_the_other_mixer_streams() {
+        gst::init().expect("GStreamer");
+        let pcm = AudioFormatId::new(0x8000);
+        let opus = AudioFormatId::new(0x4000_0000);
+        let aac = AudioFormatId::new(0x80_0000);
+        let wired = [
+            AudioStreamConfig::with_negotiated_latency(AudioStreamId::Main, pcm, Some(32)),
+            AudioStreamConfig::new(AudioStreamId::Alternate, pcm),
+        ];
+        let wireless = [
+            AudioStreamConfig::new(AudioStreamId::Main, opus),
+            AudioStreamConfig::new(AudioStreamId::Alternate, opus),
+            AudioStreamConfig::with_negotiated_latency(AudioStreamId::High, aac, Some(1_000)),
+        ];
+        for streams in [&wired[..], &wireless[..]] {
+            let latency = AudioLatencyConfig::default();
+            let plan =
+                AudioMixerPlan::with_stream_options(streams, AudioMixPolicy::default(), latency)
+                    .expect("mixer plan");
+            let pipeline = AudioGstPipeline::start(plan, "null").expect("null mixer");
+            let mut query = gst::query::Latency::new();
+            assert!(pipeline.pipeline.query(&mut query));
+            let (live, minimum, _) = query.result();
+            assert!(live);
+            assert_eq!(
+                minimum.useconds(),
+                u64::from(latency.output_latency_micros())
+            );
+        }
     }
 
     #[test]

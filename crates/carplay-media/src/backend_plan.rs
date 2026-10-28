@@ -17,6 +17,11 @@ pub const MAXIMUM_BACKEND_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAXIMUM_AUDIO_STREAMS: usize = 3;
 pub const MAXIMUM_RTP_PACKET_BYTES: usize = 64 * 1024;
 pub const UNITY_GAIN_Q15: u16 = i16::MAX as u16;
+pub const MIXER_TEST_TONE_SAMPLES: u32 = 1_024;
+pub const MIXER_OUTPUT_BUFFER_MICROS: u32 = 10_000;
+pub const MICROPHONE_CAPTURE_PERIOD_MICROS: u32 = 10_000;
+pub const DEFAULT_MICROPHONE_FRAME_MICROS: u32 = 20_000;
+const MIXER_SAMPLE_RATE_HZ: u32 = 48_000;
 const OPUS_RTP_CLOCK_RATE_HZ: u32 = 48_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -589,6 +594,13 @@ impl AudioLatencyConfig {
         Ok(self)
     }
 
+    pub fn output_latency_micros(self) -> u32 {
+        MIXER_TEST_TONE_SAMPLES * 1_000_000 / MIXER_SAMPLE_RATE_HZ
+            + MIXER_OUTPUT_BUFFER_MICROS
+            + self.sink_buffer_micros
+            + 2 * self.sink_period_micros
+    }
+
     pub fn effective_playout_latency_ms(
         self,
         format_id: AudioFormatId,
@@ -987,6 +999,14 @@ mod tests {
         assert_eq!(&adapted[..12], &[0x80, 0xe4, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]);
         assert_eq!(&adapted[12..16], &[0, 16, 0, 32]);
         assert_eq!(&adapted[16..], &[0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn default_output_latency_matches_the_measured_carplay_mixer() {
+        assert_eq!(
+            AudioLatencyConfig::default().output_latency_micros(),
+            171_333
+        );
     }
 
     #[test]
