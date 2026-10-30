@@ -19,7 +19,7 @@ use prelude_bluetooth_sco::ScoLink;
 use prelude_wireless::bluez::{PairingPasskeys, PhoneKind};
 use sonora::{
     AudioProcessing, AudioProcessingStats, Config, StreamConfig,
-    config::{EchoCanceller, HighPassFilter, NoiseSuppression},
+    config::{EchoCanceller, HighPassFilter},
 };
 
 use crate::wireless_runtime::{SharedBluetoothAddress, SharedBluetoothControl, remember_phone};
@@ -279,7 +279,6 @@ impl CallVoiceProcessor {
             .config(Config {
                 high_pass_filter: Some(HighPassFilter::default()),
                 echo_canceller: Some(EchoCanceller::default()),
-                noise_suppression: Some(NoiseSuppression::default()),
                 ..Config::default()
             })
             .capture_config(stream)
@@ -703,6 +702,37 @@ mod tests {
     #[test]
     fn call_voice_processing_reaches_echo_beyond_the_canceller_window() {
         assert_echo_removed_and_driver_kept(Duration::from_millis(550));
+    }
+
+    #[test]
+    fn call_voice_processing_passes_the_cabin_through_when_nothing_plays() {
+        const RATE: usize = CALL_VOICE_RATE as usize;
+        const CHUNK: usize = RATE / 50;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let cabin: Vec<i16> = (0..RATE * 5)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 48) as i16 / 8
+            })
+            .collect();
+        let mut voice = CallVoiceProcessor::new();
+        let mut uplink = VecDeque::new();
+        let started = Instant::now();
+        for (index, near) in cabin.chunks(CHUNK).enumerate() {
+            let now = started + Duration::from_millis(20) * index as u32;
+            voice.far_end(&[0; CHUNK * 2], now);
+            voice.near_end(&pcm(near), now, &mut uplink);
+        }
+        let processed = samples(&uplink.into_iter().collect::<Vec<_>>());
+        let settled = RATE * 2..RATE * 5;
+        let change_db =
+            10.0 * (energy(&processed[settled.clone()]) / energy(&cabin[settled])).log10();
+        assert!(
+            change_db.abs() < 1.5,
+            "the cabin changed by {change_db:.1} dB"
+        );
     }
 
     #[test]

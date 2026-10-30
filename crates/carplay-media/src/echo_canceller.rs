@@ -5,7 +5,7 @@ use std::{
 
 use sonora::{
     AudioProcessing, Config, StreamConfig,
-    config::{EchoCanceller as EchoCancellerConfig, HighPassFilter, NoiseSuppression},
+    config::{EchoCanceller as EchoCancellerConfig, HighPassFilter, MaxProcessingRate, Pipeline},
 };
 
 const FRAMES_PER_SECOND: u32 = 100;
@@ -132,9 +132,13 @@ impl EchoCanceller {
         let capture = StreamConfig::new(capture_rate_hz, 1);
         let processing = AudioProcessing::builder()
             .config(Config {
+                pipeline: Pipeline {
+                    maximum_internal_processing_rate: MaxProcessingRate::Rate48kHz,
+                    multi_channel_render: false,
+                    ..Pipeline::default()
+                },
                 high_pass_filter: Some(HighPassFilter::default()),
                 echo_canceller: Some(EchoCancellerConfig::default()),
-                noise_suppression: Some(NoiseSuppression::default()),
                 ..Config::default()
             })
             .capture_config(capture)
@@ -364,6 +368,33 @@ mod tests {
     #[test]
     fn cancels_echo_when_capture_buffers_are_not_whole_frames() {
         assert_echo_removed_and_driver_kept(250, 25);
+    }
+
+    #[test]
+    fn passes_the_cabin_through_untouched_when_nothing_plays() {
+        let reference = EchoReference::new();
+        let mut canceller = EchoCanceller::attach(&reference, CAPTURE_RATE);
+        let mut noise = Noise(0x2545_f491);
+        let near_end: Vec<i16> = (0..5 * CAPTURE_RATE as usize)
+            .map(|_| (noise.next() * 4_000.0) as i16)
+            .collect();
+        let mut uplink = Vec::with_capacity(near_end.len());
+        for chunk in near_end.chunks(480) {
+            reference.render_s16le(&[0; 1_920], MIXER_RATE, 2);
+            let mut bytes = encode(chunk);
+            canceller.process_s16le(&mut bytes);
+            uplink.extend(
+                bytes
+                    .chunks_exact(2)
+                    .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]])),
+            );
+        }
+        let settled = 2 * CAPTURE_RATE as usize..5 * CAPTURE_RATE as usize - 480;
+        let change = decibels(
+            energy(&uplink[settled.start + 480..settled.end + 480]),
+            energy(&near_end[settled]),
+        );
+        assert!(change.abs() < 1.5, "cabin sound changed by {change:.1} dB");
     }
 
     #[test]
