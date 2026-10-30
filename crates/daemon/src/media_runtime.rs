@@ -231,6 +231,7 @@ struct MediaSupervisor {
     display: Option<LinuxDisplayHandle>,
     audio_route: Option<AudioOutputRoute>,
     equalizer: prelude_media::EqualizerControl,
+    echo_reference: prelude_media::EchoReference,
     audio_output_enabled: bool,
     peer: Option<SocketAddrV6>,
     audio_descriptors: BTreeMap<StreamKey, AudioDescriptor>,
@@ -545,6 +546,7 @@ impl LiveMediaRuntime {
             display,
             audio_route,
             equalizer: config.equalizer.clone(),
+            echo_reference: prelude_media::EchoReference::new(),
             audio_output_enabled: audio_output_available,
             peer: None,
             audio_descriptors: BTreeMap::new(),
@@ -1296,6 +1298,7 @@ impl MediaSupervisor {
                 let feedback_clock = Arc::clone(&self.feedback_clock);
                 let flush_state = Arc::clone(&self.flush_state);
                 let microphone_route = MicrophoneInputRoute::BuiltInSuperbird;
+                let echo_reference = self.echo_reference.clone();
                 thread::Builder::new()
                     .name(format!("prelude-audio-{}", descriptor.stream_type()))
                     .spawn(move || {
@@ -1313,6 +1316,7 @@ impl MediaSupervisor {
                             feedback_clock,
                             flush_state,
                             microphone_route,
+                            echo_reference,
                             generation,
                         );
                         if let Err(error) = &result {
@@ -1434,6 +1438,7 @@ impl MediaSupervisor {
             .ok_or_else(|| "audio output is enabled without a route".to_owned())?;
         let mut config = LinuxAudioBackendConfig::with_negotiated_route(base_route, streams);
         config.equalizer = self.equalizer.clone();
+        config.echo_reference = Some(self.echo_reference.clone());
         config.command_capacity = 64;
         config.mix_policy = AudioMixPolicy::carplay();
         let backend = match LinuxAudioBackend::start(config) {
@@ -2122,6 +2127,7 @@ fn audio_worker(
     feedback_clock: Arc<FeedbackClock>,
     flush_state: Arc<Mutex<AudioFlushState>>,
     microphone_route: MicrophoneInputRoute,
+    echo_reference: prelude_media::EchoReference,
     stream_generation: u64,
 ) -> Result<(), String> {
     validate_local_scope(&data, peer.scope_id())?;
@@ -2232,6 +2238,7 @@ fn audio_worker(
                                 microphone_descriptor,
                                 input_key.as_deref(),
                                 &microphone_route,
+                                &echo_reference,
                                 &data,
                             ) {
                                 Ok((started, socket, config)) => {
@@ -2327,11 +2334,23 @@ fn audio_worker(
     }
     let _ = decoder.teardown();
     if let Some(microphone) = microphone {
+        log_echo_canceller_summary(&microphone);
         if let Err(error) = microphone.shutdown() {
             tracing::warn!(error = %error, "stopping CarPlay microphone failed");
         }
     }
     Ok(())
+}
+
+fn log_echo_canceller_summary(microphone: &LinuxMicrophoneBackend) {
+    let Some(summary) = microphone.echo_canceller_summary() else {
+        return;
+    };
+    tracing::info!(
+        echo_delay_ms = ?summary.delay_ms,
+        echo_return_loss_enhancement_db = ?summary.echo_return_loss_enhancement_db.map(f64::round),
+        "CarPlay echo canceller summary"
+    );
 }
 
 struct MicrophoneActivityGuard {
@@ -2577,6 +2596,7 @@ fn start_microphone(
     microphone: &prelude_net::MicrophoneDescriptor,
     input_key: Option<&[u8; 32]>,
     route: &MicrophoneInputRoute,
+    echo_reference: &prelude_media::EchoReference,
     data: &UdpSocket,
 ) -> Result<(LinuxMicrophoneBackend, UdpSocket, MicrophoneConfig), String> {
     let key = input_key.ok_or_else(|| "microphone SETUP has no input key".to_owned())?;
@@ -2584,11 +2604,10 @@ fn start_microphone(
     let packetizer = MicrophonePacketizer::new(*key, config)
         .map_err(|error| format!("initializing microphone packetizer failed: {error}"))?;
     let socket = bind_microphone_socket(data)?;
-    let backend = LinuxMicrophoneBackend::start(LinuxMicrophoneBackendConfig::with_route(
-        packetizer,
-        route.clone(),
-    ))
-    .map_err(|error| format!("starting microphone input failed: {error}"))?;
+    let mut backend_config = LinuxMicrophoneBackendConfig::with_route(packetizer, route.clone());
+    backend_config.echo_reference = Some(echo_reference.clone());
+    let backend = LinuxMicrophoneBackend::start(backend_config)
+        .map_err(|error| format!("starting microphone input failed: {error}"))?;
     Ok((backend, socket, config))
 }
 

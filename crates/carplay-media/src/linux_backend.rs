@@ -1040,6 +1040,7 @@ pub struct LinuxAudioBackendConfig {
     pub command_capacity: usize,
     pub mix_policy: AudioMixPolicy,
     pub latency: AudioLatencyConfig,
+    pub echo_reference: Option<crate::EchoReference>,
 }
 
 impl LinuxAudioBackendConfig {
@@ -1068,6 +1069,7 @@ impl LinuxAudioBackendConfig {
             command_capacity: DEFAULT_COMMAND_CAPACITY,
             mix_policy: AudioMixPolicy::default(),
             latency: AudioLatencyConfig::default(),
+            echo_reference: None,
         }
     }
 }
@@ -1390,6 +1392,7 @@ impl LinuxAudioBackend {
                     plan,
                     output,
                     equalizer: config.equalizer,
+                    echo_reference: config.echo_reference,
                     frames: frame_receivers,
                     controls: control_rx,
                     cancel: worker_cancel,
@@ -1779,6 +1782,7 @@ impl PcmClockOrigin {
 
 struct AudioWorkerContext {
     equalizer: crate::EqualizerControl,
+    echo_reference: Option<crate::EchoReference>,
     plan: AudioMixerPlan,
     output: ResolvedAudioOutput,
     frames: BTreeMap<AudioStreamId, Receiver<QueuedAudioFrame>>,
@@ -1874,6 +1878,7 @@ fn audio_worker(context: AudioWorkerContext) -> Result<()> {
         plan,
         output,
         equalizer,
+        echo_reference,
         frames,
         controls,
         cancel,
@@ -1890,7 +1895,12 @@ fn audio_worker(context: AudioWorkerContext) -> Result<()> {
         revalidate_audio_output(&output, &telemetry)?;
         prime_alsa_output(output.device(), plan.latency)?;
         revalidate_audio_output(&output, &telemetry)?;
-        AudioGstPipeline::start_with_equalizer(plan, output.device(), equalizer.clone())
+        AudioGstPipeline::start_with_equalizer(
+            plan,
+            output.device(),
+            equalizer.clone(),
+            echo_reference.clone(),
+        )
     })();
     let (mut active, _registration) = match initialized {
         Ok(mut active) => {
@@ -2123,6 +2133,42 @@ fn schedule_jitter_latency_on_branch(pad: &gst::Pad, jitter_latency_ms: u32) -> 
     Ok(())
 }
 
+fn tap_echo_reference(
+    sink: &gst::Element,
+    output_caps: &crate::CapsPlan,
+    reference: crate::EchoReference,
+) -> Result<()> {
+    let signed_field = |name| match output_caps.field(name) {
+        Some(CapsValue::Signed(value)) => u32::try_from(*value).ok(),
+        _ => None,
+    };
+    let rate = signed_field("rate")
+        .ok_or_else(|| Error::Backend("mixer output caps have no rate".to_owned()))?;
+    let channels = signed_field("channels")
+        .and_then(|channels| u16::try_from(channels).ok())
+        .ok_or_else(|| Error::Backend("mixer output caps have no channel count".to_owned()))?;
+    if output_caps.field("format") != Some(&CapsValue::String("S16LE".to_owned())) {
+        return Err(Error::Backend(
+            "echo reference needs S16LE mixer output".to_owned(),
+        ));
+    }
+    let pad = sink
+        .static_pad("sink")
+        .ok_or_else(|| Error::Backend("audio sink has no input pad".to_owned()))?;
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(buffer) = info.buffer()
+            && let Ok(mapped) = buffer.map_readable()
+        {
+            reference.render_s16le(mapped.as_slice(), rate, channels);
+        }
+        gst::PadProbeReturn::Ok
+    })
+    .ok_or_else(|| {
+        Error::Backend("cannot tap the mixer output for echo cancellation".to_owned())
+    })?;
+    Ok(())
+}
+
 fn floating_mix_caps(plan: &AudioMixerPlan) -> Result<gst::Caps> {
     let mut mix = plan.output_caps.clone();
     for (name, value) in &mut mix.fields {
@@ -2136,13 +2182,14 @@ fn floating_mix_caps(plan: &AudioMixerPlan) -> Result<gst::Caps> {
 impl AudioGstPipeline {
     #[cfg(test)]
     fn start(plan: AudioMixerPlan, alsa_device: &str) -> Result<Self> {
-        Self::start_with_equalizer(plan, alsa_device, Default::default())
+        Self::start_with_equalizer(plan, alsa_device, Default::default(), None)
     }
 
     fn start_with_equalizer(
         plan: AudioMixerPlan,
         alsa_device: &str,
         equalizer_control: crate::EqualizerControl,
+        echo_reference: Option<crate::EchoReference>,
     ) -> Result<Self> {
         let pipeline = gst::Pipeline::new();
         let clock = gst::SystemClock::obtain();
@@ -2182,6 +2229,9 @@ impl AudioGstPipeline {
             .add_many(&output_elements)
             .map_err(gst_error("cannot add audio output elements"))?;
         gst::Element::link_many(&output_elements).map_err(gst_error("cannot link audio output"))?;
+        if let Some(reference) = echo_reference {
+            tap_echo_reference(&sink, &plan.output_caps, reference)?;
+        }
         let test_tone = make("audiotestsrc", "audio-output-test-tone")?;
         set_checked(&test_tone, "is-live", true)?;
         set_checked(
@@ -2585,6 +2635,7 @@ pub struct LinuxMicrophoneBackendConfig {
     pub packetizer: MicrophonePacketizer,
     pub event_capacity: usize,
     pub route: MicrophoneInputRoute,
+    pub echo_reference: Option<crate::EchoReference>,
 }
 
 impl std::fmt::Debug for LinuxMicrophoneBackendConfig {
@@ -2594,6 +2645,7 @@ impl std::fmt::Debug for LinuxMicrophoneBackendConfig {
             .field("packetizer", &"<redacted-key-state>")
             .field("event_capacity", &self.event_capacity)
             .field("route", &self.route)
+            .field("echo_cancellation", &self.echo_reference.is_some())
             .finish()
     }
 }
@@ -2604,6 +2656,7 @@ impl LinuxMicrophoneBackendConfig {
             packetizer,
             event_capacity: 32,
             route: MicrophoneInputRoute::BuiltInSuperbird,
+            echo_reference: None,
         }
     }
 
@@ -2612,6 +2665,7 @@ impl LinuxMicrophoneBackendConfig {
             packetizer,
             event_capacity: 32,
             route,
+            echo_reference: None,
         }
     }
 }
@@ -2621,7 +2675,10 @@ pub struct LinuxMicrophoneBackend {
     events: Mutex<Receiver<MicrophoneBackendEvent>>,
     errors: Mutex<Receiver<BackendFailure>>,
     worker: Option<JoinHandle<Result<()>>>,
+    echo_canceller: Option<SharedEchoCanceller>,
 }
+
+type SharedEchoCanceller = Arc<Mutex<crate::EchoCanceller>>;
 
 impl std::fmt::Debug for LinuxMicrophoneBackend {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2664,11 +2721,19 @@ impl LinuxMicrophoneBackend {
         let (error_tx, error_rx) = mpsc::sync_channel(8);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        let echo_canceller = config.echo_reference.as_ref().map(|reference| {
+            Arc::new(Mutex::new(crate::EchoCanceller::attach(
+                reference,
+                config.packetizer.config().sample_rate_hz,
+            )))
+        });
+        let worker_echo_canceller = echo_canceller.clone();
         let worker = thread::Builder::new()
             .name("carplay-microphone".to_owned())
             .spawn(move || {
                 microphone_worker(
                     config.packetizer,
+                    worker_echo_canceller,
                     input,
                     event_tx,
                     worker_cancel,
@@ -2690,7 +2755,18 @@ impl LinuxMicrophoneBackend {
             events: Mutex::new(event_rx),
             errors: Mutex::new(error_rx),
             worker: Some(worker),
+            echo_canceller,
         })
+    }
+
+    pub fn echo_canceller_summary(&self) -> Option<crate::EchoCancellerSummary> {
+        let canceller = self.echo_canceller.as_ref()?;
+        Some(
+            canceller
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .summary(),
+        )
     }
 
     pub fn try_event(&self) -> Result<Option<MicrophoneBackendEvent>> {
@@ -2724,6 +2800,7 @@ impl Drop for LinuxMicrophoneBackend {
 
 fn microphone_worker(
     mut packetizer: MicrophonePacketizer,
+    echo_canceller: Option<SharedEchoCanceller>,
     input: ResolvedMicrophoneInput,
     events: SyncSender<MicrophoneBackendEvent>,
     cancel: Arc<AtomicBool>,
@@ -2733,7 +2810,7 @@ fn microphone_worker(
     let initialized = (|| {
         gst::init()
             .map_err(|error| Error::Backend(format!("cannot initialize GStreamer: {error}")))?;
-        MicrophoneGstPipeline::start(&packetizer, &input)
+        MicrophoneGstPipeline::start(&packetizer, &input, echo_canceller)
     })();
     let active = match initialized {
         Ok(active) => {
@@ -2816,7 +2893,11 @@ struct MicrophoneGstPipeline {
 }
 
 impl MicrophoneGstPipeline {
-    fn start(packetizer: &MicrophonePacketizer, input: &ResolvedMicrophoneInput) -> Result<Self> {
+    fn start(
+        packetizer: &MicrophonePacketizer,
+        input: &ResolvedMicrophoneInput,
+        echo_canceller: Option<SharedEchoCanceller>,
+    ) -> Result<Self> {
         let plan = crate::MicrophonePipelinePlan::new(packetizer.config())?;
         let codec = packetizer.config().codec;
         let pipeline = gst::Pipeline::new();
@@ -2837,6 +2918,9 @@ impl MicrophoneGstPipeline {
         let resample = make("audioresample", "microphone-resampler")?;
         let output_caps = make("capsfilter", "microphone-packetizer-caps")?;
         set_checked(&output_caps, "caps", caps(&plan.packetizer_input_caps)?)?;
+        if let Some(canceller) = echo_canceller {
+            cancel_echo_on_capture(&output_caps, canceller)?;
+        }
         let mut elements = vec![source, source_caps, queue, convert, resample, output_caps];
         if codec == MicrophoneCodec::Opus {
             let encoder = make("opusenc", "microphone-opus-encoder")?;
@@ -2892,6 +2976,25 @@ impl Drop for MicrophoneGstPipeline {
     fn drop(&mut self) {
         let _ = stop_pipeline(&self.pipeline, "microphone pipeline");
     }
+}
+
+fn cancel_echo_on_capture(element: &gst::Element, canceller: SharedEchoCanceller) -> Result<()> {
+    let pad = element
+        .static_pad("src")
+        .ok_or_else(|| Error::Backend("microphone caps filter has no output pad".to_owned()))?;
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data
+            && let Ok(mut mapped) = buffer.make_mut().map_writable()
+        {
+            canceller
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .process_s16le(mapped.as_mut_slice());
+        }
+        gst::PadProbeReturn::Ok
+    })
+    .ok_or_else(|| Error::Backend("cannot add echo cancellation to the microphone".to_owned()))?;
+    Ok(())
 }
 
 fn process_microphone_sample(
@@ -3847,6 +3950,77 @@ mod tests {
                 u64::from(latency.output_latency_micros())
             );
         }
+    }
+
+    #[test]
+    fn mixer_output_feeds_the_echo_reference_while_a_microphone_listens() {
+        gst::init().expect("GStreamer");
+        let plan = AudioMixerPlan::new(&[(AudioStreamId::Main, AudioFormatId::new(0x8000))])
+            .expect("mixer plan");
+        let reference = crate::EchoReference::new();
+        let _canceller = crate::EchoCanceller::attach(&reference, 48_000);
+        let _pipeline = AudioGstPipeline::start_with_equalizer(
+            plan,
+            "null",
+            Default::default(),
+            Some(reference.clone()),
+        )
+        .expect("null mixer");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while reference.pending_samples() < 48_000 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(reference.pending_samples() >= 48_000);
+    }
+
+    #[test]
+    fn microphone_echo_canceller_rewrites_capture_buffers() {
+        gst::init().expect("GStreamer");
+        let reference = crate::EchoReference::new();
+        let canceller = Arc::new(Mutex::new(crate::EchoCanceller::attach(&reference, 48_000)));
+        let pipeline = gst::Pipeline::new();
+        let source = make("audiotestsrc", "capture").expect("source");
+        set_checked(&source, "num-buffers", 50_i32).expect("buffers");
+        set_checked(&source, "samplesperbuffer", 240_i32).expect("buffer size");
+        let filter = make("capsfilter", "capture-caps").expect("caps");
+        set_checked(
+            &filter,
+            "caps",
+            gst::Caps::builder("audio/x-raw")
+                .field("format", "S16LE")
+                .field("layout", "interleaved")
+                .field("rate", 48_000_i32)
+                .field("channels", 1_i32)
+                .build(),
+        )
+        .expect("caps");
+        cancel_echo_on_capture(&filter, Arc::clone(&canceller)).expect("probe");
+        let sink_element = make("appsink", "capture-sink").expect("sink");
+        let sink = sink_element
+            .clone()
+            .downcast::<gst_app::AppSink>()
+            .expect("appsink");
+        sink.set_sync(false);
+        pipeline
+            .add_many([&source, &filter, &sink_element])
+            .expect("add");
+        gst::Element::link_many([&source, &filter, &sink_element]).expect("link");
+        pipeline.set_state(gst::State::Playing).expect("play");
+        let mut samples = Vec::new();
+        while let Ok(sample) = sink.pull_sample() {
+            let buffer = sample.buffer().expect("buffer");
+            let mapped = buffer.map_readable().expect("map");
+            assert_eq!(mapped.len(), 480);
+            samples.extend(
+                mapped
+                    .chunks_exact(2)
+                    .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]])),
+            );
+        }
+        pipeline.set_state(gst::State::Null).expect("stop");
+        assert_eq!(samples.len(), 50 * 240);
+        assert!(samples[..480].iter().all(|sample| *sample == 0));
+        assert!(samples[480..].iter().any(|sample| *sample != 0));
     }
 
     #[test]
