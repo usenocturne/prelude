@@ -902,12 +902,27 @@ impl VideoGstPipeline {
     }
 
     fn check_bus(&self) -> Result<()> {
-        check_bus(&self.pipeline, "video pipeline")
+        check_bus(&self.pipeline, "video pipeline").map_err(|error| match error {
+            Error::Backend(message) => Error::Backend(format!(
+                "{message}; stream caps {}; decoded caps {}",
+                pad_caps(&self.pipeline, "h264-parser-output-caps", "src"),
+                pad_caps(&self.pipeline, "hardware-decoder", "src"),
+            )),
+            error => error,
+        })
     }
 
     fn stop(self) -> Result<()> {
         stop_pipeline(&self.pipeline, "video pipeline")
     }
+}
+
+fn pad_caps(pipeline: &gst::Pipeline, element: &str, pad: &str) -> String {
+    pipeline
+        .by_name(element)
+        .and_then(|element| element.static_pad(pad))
+        .and_then(|pad| pad.current_caps())
+        .map_or_else(|| "none".to_owned(), |caps| caps.to_string())
 }
 
 fn video_sink_capacity(output_delay: AudioOutputDelay) -> u32 {
@@ -952,7 +967,7 @@ fn h264_caps_without_unsupported_colorimetry(caps: &gst::CapsRef) -> Option<gst:
         || structure.get::<u32>("bit-depth-luma").ok()? != 8
         || structure.get::<u32>("bit-depth-chroma").ok()? != 8
         || structure.get::<&str>("chroma-format").ok()? != "4:2:0"
-        || structure.get::<&str>("colorimetry").ok()? != "1:4:5:1"
+        || structure.get::<&str>("colorimetry").ok()? == "bt709"
     {
         return None;
     }
@@ -4770,7 +4785,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_h264_colorimetry_is_removed_only_for_eight_bit_420() {
+    fn non_bt709_h264_colorimetry_is_removed_only_for_eight_bit_420() {
         if gst::init().is_err() {
             skip("GStreamer runtime is unavailable");
             return;
@@ -4807,5 +4822,22 @@ mod tests {
             .expect("supported caps contain one structure")
             .set("colorimetry", "bt709");
         assert!(h264_caps_without_unsupported_colorimetry(&supported).is_none());
+
+        for colorimetry in ["bt601", "2:4:5:4", "1:3:5:1", "1:4:7:1"] {
+            let mut android = caps.clone();
+            android
+                .make_mut()
+                .structure_mut(0)
+                .expect("android caps contain one structure")
+                .set("colorimetry", colorimetry);
+            let adapted = h264_caps_without_unsupported_colorimetry(&android)
+                .expect("non-bt709 colorimetry should be removed");
+            assert!(
+                !adapted
+                    .structure(0)
+                    .expect("adapted caps")
+                    .has_field("colorimetry")
+            );
+        }
     }
 }
