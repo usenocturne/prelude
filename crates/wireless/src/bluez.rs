@@ -18,7 +18,7 @@ use zbus::{
 
 use crate::{
     Error, Result,
-    hfp::{AUDIO_GATEWAY_UUID, HANDS_FREE_UUID},
+    hfp::{self, AUDIO_GATEWAY_UUID, HANDS_FREE_UUID},
     wpp::ANDROID_AUTO_RFCOMM_UUID,
 };
 
@@ -102,6 +102,7 @@ pub struct BluetoothConfig {
     pub projection: bool,
     pub android_auto: bool,
     pub carplay: bool,
+    pub wideband_calls: bool,
 }
 
 pub struct RfcommConnection {
@@ -660,6 +661,10 @@ async fn register_on(
             .await?;
         let mut options = HashMap::new();
         options.insert("Name", Value::from("Hands-Free"));
+        options.insert(
+            "Features",
+            Value::from(hfp::sdp_features(config.wideband_calls)),
+        );
         options.insert("AutoConnect", Value::from(true));
         options.insert("RequireAuthentication", Value::from(true));
         register_profile(connection, HANDS_FREE_PATH, HANDS_FREE_UUID, options).await?;

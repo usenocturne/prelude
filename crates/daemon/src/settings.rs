@@ -35,7 +35,7 @@ pub enum SettingsError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RuntimeSettings {
     pub auto_brightness: bool,
     pub auto_night_mode: bool,
@@ -44,7 +44,6 @@ pub struct RuntimeSettings {
     pub original_dpi: u32,
     pub dpi_customized: bool,
     pub phone_audio: bool,
-    pub low_latency_music: bool,
     pub carplay_dock: CarPlayDock,
     pub presets: [PresetAction; PRESET_COUNT],
     pub equalizer: prelude_media::EqualizerSettings,
@@ -61,7 +60,6 @@ impl Default for RuntimeSettings {
             original_dpi: prelude_android_auto_protocol::DEFAULT_VIDEO_DENSITY_DPI,
             dpi_customized: false,
             phone_audio: false,
-            low_latency_music: true,
             carplay_dock: CarPlayDock::Left,
             presets: PresetAction::DEFAULTS,
             equalizer: Default::default(),
@@ -85,7 +83,6 @@ impl RuntimeSettings {
             dpi_customized: false,
             phone_audio: config.airplay.disable_audio_output
                 && config.android_auto.disable_audio_output,
-            low_latency_music: config.media.low_latency_music,
             carplay_dock: config.airplay.dock,
             presets: config.platform.presets.actions(),
             equalizer: config.media.equalizer.settings(),
@@ -152,7 +149,6 @@ impl RuntimeSettings {
         config.android_auto.ui_density_dpi = settings.reported_dpi;
         config.airplay.disable_audio_output = settings.phone_audio;
         config.android_auto.disable_audio_output = settings.phone_audio;
-        config.media.low_latency_music = settings.low_latency_music;
         config.airplay.dock = settings.carplay_dock;
         config.platform.presets.set(settings.presets);
         if let Some(channel) = settings.wifi_channel {
@@ -250,7 +246,6 @@ mod tests {
             original_dpi: 170,
             dpi_customized: true,
             phone_audio: true,
-            low_latency_music: false,
             carplay_dock: CarPlayDock::Bottom,
             presets: [
                 PresetAction::VoiceAssistant,
@@ -470,6 +465,30 @@ mod tests {
         assert!(toml::from_str::<RuntimeSettings>("presets = [\"home\"]\n").is_err());
         assert!(
             toml::from_str::<RuntimeSettings>("presets = [\"x\", \"x\", \"x\", \"x\"]\n").is_err()
+        );
+    }
+
+    #[test]
+    fn settings_with_retired_options_keep_every_current_choice() {
+        let directory = TempDir::new().expect("state directory");
+        let path = directory.path().join(SETTINGS_FILE);
+        fs::write(
+            &path,
+            "phone_audio = true\nlow_latency_music = true\ncarplay_dock = \"bottom\"\n\
+             presets = [\"home\", \"back\", \"voice_assistant\", \"end_call\"]\n",
+        )
+        .expect("settings from an older build");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("permissions");
+        let settings =
+            RuntimeSettings::load(directory.path(), RuntimeSettings::default()).expect("load");
+        assert!(settings.phone_audio);
+        assert_eq!(settings.carplay_dock, CarPlayDock::Bottom);
+        assert_eq!(settings.presets[2], PresetAction::VoiceAssistant);
+        settings.persist(directory.path()).expect("persist");
+        assert!(
+            !fs::read_to_string(&path)
+                .expect("rewritten settings")
+                .contains("low_latency_music")
         );
     }
 

@@ -1,3 +1,5 @@
+pub mod msbc;
+
 use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -6,7 +8,9 @@ use std::{
 
 const BTPROTO_SCO: libc::c_int = 2;
 const SOL_BLUETOOTH: libc::c_int = 274;
+const BT_DEFER_SETUP: libc::c_int = 7;
 const BT_VOICE: libc::c_int = 11;
+const BT_VOICE_TRANSPARENT: u16 = 0x0003;
 const BT_VOICE_CVSD_16BIT: u16 = 0x0060;
 const SOL_SCO: libc::c_int = 17;
 const SCO_OPTIONS: libc::c_int = 1;
@@ -31,9 +35,30 @@ struct BtVoice {
     setting: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirMode {
+    Cvsd,
+    Transparent,
+}
+
+impl AirMode {
+    const fn voice_setting(self) -> u16 {
+        match self {
+            Self::Cvsd => BT_VOICE_CVSD_16BIT,
+            Self::Transparent => BT_VOICE_TRANSPARENT,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ScoListener {
     fd: OwnedFd,
+}
+
+#[derive(Debug)]
+pub struct IncomingSco {
+    fd: OwnedFd,
+    peer: [u8; 6],
 }
 
 #[derive(Debug)]
@@ -65,11 +90,12 @@ impl ScoListener {
                 setting: BT_VOICE_CVSD_16BIT,
             },
         )?;
+        set_option(&fd, SOL_BLUETOOTH, BT_DEFER_SETUP, &1_u32)?;
         check(unsafe { libc::listen(fd.as_raw_fd(), LISTEN_BACKLOG) })?;
         Ok(Self { fd })
     }
 
-    pub fn accept(&self, timeout: Duration) -> io::Result<Option<ScoLink>> {
+    pub fn accept(&self, timeout: Duration) -> io::Result<Option<IncomingSco>> {
         if !wait_readable(&self.fd, timeout)? {
             return Ok(None);
         }
@@ -88,15 +114,42 @@ impl ScoListener {
             Err(error) => return Err(error),
         };
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mut options = ScoOptions::default();
-        get_option(&fd, SOL_SCO, SCO_OPTIONS, &mut options)?;
         let mut peer = remote.address;
         peer.reverse();
-        Ok(Some(ScoLink {
-            fd,
-            peer,
+        Ok(Some(IncomingSco { fd, peer }))
+    }
+}
+
+impl IncomingSco {
+    pub const fn peer(&self) -> [u8; 6] {
+        self.peer
+    }
+
+    pub fn accept(self, air_mode: AirMode) -> io::Result<ScoLink> {
+        let mut options = ScoOptions::default();
+        get_option(&self.fd, SOL_SCO, SCO_OPTIONS, &mut options)?;
+        set_option(
+            &self.fd,
+            SOL_BLUETOOTH,
+            BT_VOICE,
+            &BtVoice {
+                setting: air_mode.voice_setting(),
+            },
+        )?;
+        let mut trigger = [0_u8; 1];
+        check_size(unsafe {
+            libc::recv(
+                self.fd.as_raw_fd(),
+                trigger.as_mut_ptr().cast(),
+                trigger.len(),
+                libc::MSG_DONTWAIT,
+            )
+        })?;
+        Ok(ScoLink {
+            fd: self.fd,
+            peer: self.peer,
             mtu: usize::from(options.mtu),
-        }))
+        })
     }
 }
 
@@ -119,27 +172,25 @@ impl ScoLink {
     }
 
     pub fn recv(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        let read = unsafe {
+        check_size(unsafe {
             libc::recv(
                 self.fd.as_raw_fd(),
                 buffer.as_mut_ptr().cast(),
                 buffer.len(),
                 0,
             )
-        };
-        usize::try_from(read).map_err(|_| io::Error::last_os_error())
+        })
     }
 
     pub fn send(&self, packet: &[u8]) -> io::Result<usize> {
-        let written = unsafe {
+        check_size(unsafe {
             libc::send(
                 self.fd.as_raw_fd(),
                 packet.as_ptr().cast(),
                 packet.len(),
                 send_flags(),
             )
-        };
-        usize::try_from(written).map_err(|_| io::Error::last_os_error())
+        })
     }
 }
 
@@ -270,6 +321,10 @@ fn check(result: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
+fn check_size(result: libc::ssize_t) -> io::Result<usize> {
+    usize::try_from(result).map_err(|_| io::Error::last_os_error())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +335,12 @@ mod tests {
         assert_eq!(size_of::<SockaddrSco>(), 8);
         assert_eq!(size_of::<ScoOptions>(), 2);
         assert_eq!(size_of::<BtVoice>(), 2);
+    }
+
+    #[test]
+    fn air_modes_use_the_kernel_voice_settings() {
+        assert_eq!(AirMode::Cvsd.voice_setting(), 0x0060);
+        assert_eq!(AirMode::Transparent.voice_setting(), 0x0003);
     }
 
     #[cfg(not(target_os = "linux"))]
