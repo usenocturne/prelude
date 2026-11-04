@@ -5,10 +5,28 @@ use std::{
 
 use sonora::{
     AudioProcessing, Config, StreamConfig,
-    config::{EchoCanceller as EchoCancellerConfig, HighPassFilter, NoiseSuppression},
+    config::{
+        AdaptiveDigital, EchoCanceller as EchoCancellerConfig, GainController2, HighPassFilter,
+        NoiseSuppression,
+    },
 };
 
 const FRAMES_PER_SECOND: u32 = 100;
+const INITIAL_GAIN_DB: f32 = 30.0;
+const SPEECH_HEADROOM_DB: f32 = 12.0;
+const MAXIMUM_OUTPUT_NOISE_DBFS: f32 = -40.0;
+
+pub fn voice_gain_controller() -> GainController2 {
+    GainController2 {
+        adaptive_digital: Some(AdaptiveDigital {
+            headroom_db: SPEECH_HEADROOM_DB,
+            initial_gain_db: INITIAL_GAIN_DB,
+            max_output_noise_level_dbfs: MAXIMUM_OUTPUT_NOISE_DBFS,
+            ..AdaptiveDigital::default()
+        }),
+        ..GainController2::default()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RenderFormat {
@@ -135,6 +153,7 @@ impl EchoCanceller {
                 high_pass_filter: Some(HighPassFilter::default()),
                 echo_canceller: Some(EchoCancellerConfig::default()),
                 noise_suppression: Some(NoiseSuppression::default()),
+                gain_controller2: Some(voice_gain_controller()),
                 ..Config::default()
             })
             .capture_config(capture)
@@ -286,7 +305,7 @@ mod tests {
         let echo_delay = echo_delay_ms * capture_per_ms;
         let near_end: Vec<i16> = (0..far_end.len())
             .map(|index| {
-                let echo = [(0, 0.5), (37, 0.2), (113, -0.1)]
+                let echo = [(0, 0.05), (37, 0.02), (113, -0.01)]
                     .iter()
                     .filter_map(|(tap, gain)| {
                         index
@@ -299,7 +318,7 @@ mod tests {
                     let voiced = (time * 140.0 * std::f64::consts::TAU).sin()
                         + 0.5 * (time * 280.0 * std::f64::consts::TAU).sin()
                         + 0.25 * (time * 420.0 * std::f64::consts::TAU).sin();
-                    voiced * 2_500.0
+                    voiced * 250.0
                 } else {
                     0.0
                 };
@@ -342,17 +361,25 @@ mod tests {
         let (near_end, uplink, _) = run_call(echo_delay_ms, 10, capture_chunk_ms);
         let per_ms = CAPTURE_RATE as usize / 1_000;
         let shift = 10 * per_ms;
-        let echo = 4_000 * per_ms..9_000 * per_ms;
+        let echo = 4_000 * per_ms + shift..9_000 * per_ms + shift;
         let driver = 10_500 * per_ms..12_000 * per_ms;
-        let reduction = decibels(
-            energy(&near_end[echo.clone()]),
-            energy(&uplink[echo.start + shift..echo.end + shift]),
-        );
-        let kept = decibels(
-            energy(&uplink[driver.start..driver.end]),
+        let echo_over_driver = decibels(
+            energy(&near_end[echo.start - shift..echo.end - shift]),
             energy(&near_end[driver.start - shift..driver.end - shift]),
         );
-        assert!(reduction > 30.0, "echo only fell by {reduction:.1} dB");
+        let driver_over_echo = decibels(energy(&uplink[driver.clone()]), energy(&uplink[echo]));
+        let kept = decibels(
+            energy(&uplink[driver.clone()]),
+            energy(&near_end[driver.start - shift..driver.end - shift]),
+        );
+        assert!(
+            echo_over_driver > -3.0,
+            "the echo starts {echo_over_driver:.1} dB over the driver"
+        );
+        assert!(
+            driver_over_echo > 30.0,
+            "the driver is only {driver_over_echo:.1} dB over the echo"
+        );
         assert!(kept > -6.0, "driver fell by {kept:.1} dB");
     }
 
@@ -364,6 +391,118 @@ mod tests {
     #[test]
     fn cancels_echo_when_capture_buffers_are_not_whole_frames() {
         assert_echo_removed_and_driver_kept(250, 25);
+    }
+
+    fn voice(seconds: usize, amplitude: f64) -> Vec<i16> {
+        let rate = f64::from(CAPTURE_RATE);
+        let vowels = [
+            [700.0, 1_150.0, 2_500.0],
+            [300.0, 2_200.0, 3_000.0],
+            [500.0, 900.0, 2_400.0],
+        ];
+        let mut glottis = 0.0;
+        let mut resonators = [[0.0_f64; 2]; 3];
+        (0..seconds * CAPTURE_RATE as usize)
+            .map(|index| {
+                let time = index as f64 / rate;
+                glottis += (120.0 + 25.0 * (time * 1.3 * std::f64::consts::TAU).sin()) / rate;
+                let pulse = if glottis >= 1.0 {
+                    glottis -= 1.0;
+                    1.0
+                } else {
+                    0.0
+                };
+                let syllable = (time * 4.0).fract() * std::f64::consts::PI;
+                let vowel = vowels[(time * 4.0) as usize % vowels.len()];
+                let mut sample = 0.0;
+                for (formant, (frequency, state)) in vowel.iter().zip(&mut resonators).enumerate() {
+                    let angle = std::f64::consts::TAU * frequency / rate;
+                    let next = pulse + 2.0 * 0.97 * angle.cos() * state[0] - 0.97 * 0.97 * state[1];
+                    state[1] = state[0];
+                    state[0] = next;
+                    sample += next / (formant + 1) as f64;
+                }
+                (sample * syllable.sin().powi(2) * amplitude).clamp(-32_768.0, 32_767.0) as i16
+            })
+            .collect()
+    }
+
+    fn talk_without_music(talker: &[i16]) -> Vec<i16> {
+        let reference = EchoReference::new();
+        let mut canceller = EchoCanceller::attach(&reference, CAPTURE_RATE);
+        let mut uplink = Vec::with_capacity(talker.len());
+        for chunk in talker.chunks(480) {
+            reference.render_s16le(&[0; 1_920], MIXER_RATE, 2);
+            let mut bytes = encode(chunk);
+            canceller.process_s16le(&mut bytes);
+            uplink.extend(
+                bytes
+                    .chunks_exact(2)
+                    .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]])),
+            );
+        }
+        uplink
+    }
+
+    fn settled_level_dbfs(samples: &[i16]) -> f64 {
+        let last_three_seconds = samples.len() - 3 * CAPTURE_RATE as usize..samples.len();
+        decibels(
+            energy(&samples[last_three_seconds]),
+            f64::from(i16::MAX).powi(2),
+        )
+    }
+
+    #[test]
+    fn brings_a_distant_talker_up_to_call_level() {
+        let talker = voice(10, 30.0);
+        let uplink = talk_without_music(&talker);
+        let before = settled_level_dbfs(&talker);
+        let after = settled_level_dbfs(&uplink);
+        assert!(before < -50.0, "the talker starts at {before:.1} dBFS");
+        assert!(
+            (-32.0..-20.0).contains(&after),
+            "the talker reaches {after:.1} dBFS"
+        );
+    }
+
+    #[test]
+    fn leaves_a_talker_already_at_call_level_alone() {
+        let talker = voice(10, 1_500.0);
+        let uplink = talk_without_music(&talker);
+        let change = settled_level_dbfs(&uplink) - settled_level_dbfs(&talker);
+        assert!(change.abs() < 3.0, "the talker changed by {change:.1} dB");
+    }
+
+    #[test]
+    fn quiets_steady_hiss_without_quieting_the_talker() {
+        let rate = CAPTURE_RATE as usize;
+        let mut hiss = Noise(0x2545_f491);
+        let mut talker = voice(8, 30.0);
+        talker.resize(11 * rate, 0);
+        let near_end: Vec<i16> = talker
+            .iter()
+            .map(|sample| (f64::from(*sample) + hiss.next() * 8.0) as i16)
+            .collect();
+        let uplink = talk_without_music(&near_end);
+        let talking = 5 * rate..8 * rate;
+        let paused = 9 * rate..11 * rate;
+        let hiss_below = |samples: &[i16]| {
+            decibels(
+                energy(&samples[talking.clone()]),
+                energy(&samples[paused.clone()]),
+            )
+        };
+        let before = hiss_below(&near_end);
+        let after = hiss_below(&uplink);
+        assert!(
+            after - before > 6.0,
+            "the hiss went from {before:.1} to {after:.1} dB below the talker"
+        );
+        assert!(
+            settled_level_dbfs(&uplink[..8 * rate]) > -32.0,
+            "the talker fell to {:.1} dBFS",
+            settled_level_dbfs(&uplink[..8 * rate])
+        );
     }
 
     #[test]

@@ -280,6 +280,7 @@ impl CallVoiceProcessor {
                 high_pass_filter: Some(HighPassFilter::default()),
                 echo_canceller: Some(EchoCanceller::default()),
                 noise_suppression: Some(NoiseSuppression::default()),
+                gain_controller2: Some(prelude_media::voice_gain_controller()),
                 ..Config::default()
             })
             .capture_config(stream)
@@ -703,6 +704,66 @@ mod tests {
     #[test]
     fn call_voice_processing_reaches_echo_beyond_the_canceller_window() {
         assert_echo_removed_and_driver_kept(Duration::from_millis(550));
+    }
+
+    fn distant_voice(seconds: usize, amplitude: f64) -> Vec<i16> {
+        const RATE: f64 = CALL_VOICE_RATE as f64;
+        let vowels = [
+            [700.0, 1_150.0, 2_500.0],
+            [300.0, 2_200.0, 3_000.0],
+            [500.0, 900.0, 2_400.0],
+        ];
+        let mut glottis = 0.0;
+        let mut resonators = [[0.0_f64; 2]; 3];
+        (0..seconds * CALL_VOICE_RATE as usize)
+            .map(|index| {
+                let time = index as f64 / RATE;
+                glottis += (120.0 + 25.0 * (time * 1.3 * std::f64::consts::TAU).sin()) / RATE;
+                let pulse = if glottis >= 1.0 {
+                    glottis -= 1.0;
+                    1.0
+                } else {
+                    0.0
+                };
+                let syllable = (time * 4.0).fract() * std::f64::consts::PI;
+                let vowel = vowels[(time * 4.0) as usize % vowels.len()];
+                let mut sample = 0.0;
+                for (formant, (frequency, state)) in vowel.iter().zip(&mut resonators).enumerate() {
+                    let angle = std::f64::consts::TAU * frequency / RATE;
+                    let next = pulse + 2.0 * 0.97 * angle.cos() * state[0] - 0.97 * 0.97 * state[1];
+                    state[1] = state[0];
+                    state[0] = next;
+                    sample += next / (formant + 1) as f64;
+                }
+                (sample * syllable.sin().powi(2) * amplitude) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn call_voice_processing_brings_a_distant_talker_up_to_call_level() {
+        const RATE: usize = CALL_VOICE_RATE as usize;
+        const CHUNK: usize = RATE / 50;
+        let talker = distant_voice(10, 30.0);
+        let mut voice = CallVoiceProcessor::new();
+        let mut uplink = VecDeque::new();
+        let started = Instant::now();
+        for (index, near) in talker.chunks(CHUNK).enumerate() {
+            let now = started + Duration::from_millis(20) * index as u32;
+            voice.far_end(&[0; CHUNK * 2], now);
+            voice.near_end(&pcm(near), now, &mut uplink);
+        }
+        let processed = samples(&uplink.into_iter().collect::<Vec<_>>());
+        let level_dbfs = |samples: &[i16]| {
+            10.0 * (energy(&samples[RATE * 7..RATE * 10]) / f64::from(i16::MAX).powi(2)).log10()
+        };
+        let before = level_dbfs(&talker);
+        let after = level_dbfs(&processed);
+        assert!(before < -50.0, "the talker starts at {before:.1} dBFS");
+        assert!(
+            (-32.0..-20.0).contains(&after),
+            "the talker reaches {after:.1} dBFS"
+        );
     }
 
     #[test]
