@@ -32,7 +32,7 @@
 ### Requirements
 
 - Terbium driver is required on Windows: `irm https://driver.terbium.app/get | iex` (Powershell)
-- A USB OTG adapter and USB hub is required to use this. Some USB hubs may support USB OTG on their own, but your milage may vary. At minimum, you will require the USB OTG adapter to use Prelude. We recommend [this adapter](https://www.amazon.com/dp/B08KPD5S82) and a standard USB hub.
+- A USB OTG adapter and USB hub is required to use this. Some USB hubs may support USB OTG on their own, but your milage may vary. [This Anker hub](https://www.amazon.com/dp/B0BQLLB61B) works if you do not want to buy a USB OTG adapter. Otherwise, we recommend [this USB OTG adapter](https://www.amazon.com/dp/B08KPD5S82) and a standard USB hub.
 - A USB Wi-Fi adapter is required if you would like to use Wireless CarPlay/Android Auto. Any adapter with Linux support and Access Point mode should work. We recommend [this adapter](https://www.amazon.com/dp/B07PB1X4CN).
 - A USB DAC if your USB hub does not have audio out. Without one, turn on **Phone audio** in settings to keep sound on your phone (speaker, Bluetooth, etc.). We recommend the [Apple USB-C to 3.5 mm Headphone Jack Adapter](https://www.amazon.com/Apple-USB-C-Headphone-Jack-Adapter/dp/B0D7FF5Y3X) paired with a USB C to A adapter if needed.
 
