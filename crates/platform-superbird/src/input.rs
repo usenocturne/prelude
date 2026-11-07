@@ -739,8 +739,6 @@ impl InputParser {
                     slot.pending_up = Some((x, y));
                 } else {
                     slot.pending_down = false;
-                    slot.x = None;
-                    slot.y = None;
                 }
                 slot.tracking_id = None;
                 slot.position_dirty = false;
@@ -751,8 +749,6 @@ impl InputParser {
                     return false;
                 }
                 slot.tracking_id = Some(tracking_id);
-                slot.x = None;
-                slot.y = None;
                 slot.reported_down = false;
                 slot.position_dirty = false;
                 slot.pending_down = true;
@@ -832,8 +828,6 @@ impl InputParser {
                 slot.position_dirty = false;
             }
             if slot.tracking_id.is_none() && slot.pending_up.is_none() {
-                slot.x = None;
-                slot.y = None;
                 slot.reported_down = false;
             }
         }
@@ -1053,6 +1047,42 @@ mod tests {
                 x: 21,
                 y: 468,
             }
+        );
+    }
+
+    #[test]
+    fn a_new_contact_inherits_the_slot_position_the_kernel_left_unchanged() {
+        let mut parser = InputParser::new(InputParserConfig::default()).expect("parser");
+        touch(&mut parser, ABS_MT_TRACKING_ID, 1, 1);
+        touch(&mut parser, ABS_MT_POSITION_X, 10, 2);
+        touch(&mut parser, ABS_MT_POSITION_Y, 20, 3);
+        sync(&mut parser, 4);
+        touch(&mut parser, ABS_MT_TRACKING_ID, -1, 5);
+        sync(&mut parser, 6);
+        touch(&mut parser, ABS_MT_TRACKING_ID, 2, 7);
+        touch(&mut parser, ABS_MT_POSITION_Y, 300, 8);
+        assert_eq!(
+            sync(&mut parser, 9),
+            vec![touch_event(
+                MonotonicMicros(9),
+                0,
+                TouchInputPhase::Down,
+                300,
+                469
+            )]
+        );
+        touch(&mut parser, ABS_MT_TRACKING_ID, -1, 10);
+        sync(&mut parser, 11);
+        touch(&mut parser, ABS_MT_TRACKING_ID, 3, 12);
+        assert_eq!(
+            sync(&mut parser, 13),
+            vec![touch_event(
+                MonotonicMicros(13),
+                0,
+                TouchInputPhase::Down,
+                300,
+                469
+            )]
         );
     }
 
