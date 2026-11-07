@@ -351,7 +351,6 @@ pub struct MediaConfig {
     pub usb_dac: Option<UsbDacConfig>,
     pub socket_poll_interval_ms: u64,
     pub timing_interval_ms: u64,
-    pub low_latency_music: bool,
 }
 
 impl std::fmt::Debug for MediaConfig {
@@ -364,7 +363,6 @@ impl std::fmt::Debug for MediaConfig {
             .field("usb_dac_configured", &self.usb_dac.is_some())
             .field("socket_poll_interval_ms", &self.socket_poll_interval_ms)
             .field("timing_interval_ms", &self.timing_interval_ms)
-            .field("low_latency_music", &self.low_latency_music)
             .finish()
     }
 }
@@ -379,7 +377,6 @@ impl Default for MediaConfig {
             usb_dac: None,
             socket_poll_interval_ms: 20,
             timing_interval_ms: 1_000,
-            low_latency_music: true,
         }
     }
 }

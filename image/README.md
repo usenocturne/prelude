@@ -257,8 +257,18 @@ With Phone audio off, `preluded` advertises the controller address in Android
 Auto service discovery so the phone pairs for calls on its own. The BlueZ agent
 uses numeric comparison, and `preluded` forwards the passkey over Android Auto
 so the phone can confirm the pairing itself. It then plays
-the SCO call audio (CVSD, 8 kHz) through the USB DAC and sends the built-in
-microphone back. Once the controller is up, `preluded` runs
+the SCO call audio through the USB DAC and sends the built-in microphone back.
+`preluded` cancels the speaker echo and suppresses noise on that microphone
+itself, and sends `AT+NREC=0` after the Hands-Free link comes up so the phone
+turns its own echo and noise reduction off instead of stacking a second pass.
+Calls use HD voice (mSBC, 16 kHz, encoded in `preluded`) when the phone
+negotiates it, otherwise CVSD at 8 kHz. Android only picks mSBC when the
+Hands-Free SDP record advertises wide band speech, so `preluded` registers it
+with `Features` (`0x3c`, or `0x1c` once calls fall back to narrowband). If no mSBC frame decodes within 2 s,
+`preluded` closes that link, offers only CVSD (`AT+BAC=1`), asks an active call
+to reopen its audio (`AT+BCC`), and writes `narrowband-calls` to its wireless
+state directory so later calls stay on CVSD; delete that file to try HD voice
+again. Once the controller is up, `preluded` runs
 `hcitool cmd 0x3f 0x1c` to route SCO over the UART rather than the BCM PCM pins.
 Without a Wi-Fi adapter, Bluetooth stays on only for Hands-Free and stays
 hidden: it registers no iAP2 or Android Auto wireless records and is pairable

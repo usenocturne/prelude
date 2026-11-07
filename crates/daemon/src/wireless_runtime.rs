@@ -573,6 +573,7 @@ impl WirelessService {
                 projection: true,
                 android_auto: wireless.android_auto,
                 carplay: wireless.carplay,
+                wideband_calls: hands_free.call_codecs().wideband(),
             };
             let dispatch = BluetoothDispatch {
                 wireless: wireless.clone(),
@@ -1228,6 +1229,7 @@ impl BluetoothDispatch {
             pairable: (base.pairable && projection) || self.hands_free_calls(),
             projection,
             carplay: base.carplay && projection,
+            wideband_calls: self.hands_free.call_codecs().wideband(),
             ..base.clone()
         }
     }
@@ -1436,12 +1438,22 @@ fn run_hands_free(
     links: &RfcommLinks,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
-    hfp::run_hands_free(
+    let codecs = links.hands_free.call_codecs();
+    codecs.forget(peer);
+    let result = hfp::run_hands_free(
         connection,
+        codecs.wideband(),
         || stop.load(Ordering::Relaxed) || links.keeps_calls_on_phone(peer),
-        |event| tracing::info!(peer, ?event, "hands-free"),
-    )
-    .map_err(|error| Error::Runtime(error.to_string()))?;
+        || codecs.take_narrowband_request(peer),
+        |event| {
+            if let hfp::HandsFreeEvent::CodecSelected(codec) = event {
+                codecs.select(peer, codec);
+            }
+            tracing::info!(peer, ?event, "hands-free");
+        },
+    );
+    codecs.forget(peer);
+    result.map_err(|error| Error::Runtime(error.to_string()))?;
     if links.keeps_calls_on_phone(peer)
         && let Some(control) = current_control(&links.bluetooth_control)
     {

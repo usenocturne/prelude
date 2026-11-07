@@ -2930,6 +2930,7 @@ impl MicrophoneGstPipeline {
         set_checked(&queue, "max-size-bytes", 0_u32)?;
         set_checked(&queue, "max-size-buffers", 0_u32)?;
         let convert = make("audioconvert", "microphone-downmixer")?;
+        select_one_microphone(&convert, &plan.source_caps)?;
         let resample = make("audioresample", "microphone-resampler")?;
         let output_caps = make("capsfilter", "microphone-packetizer-caps")?;
         set_checked(&output_caps, "caps", caps(&plan.packetizer_input_caps)?)?;
@@ -2991,6 +2992,20 @@ impl Drop for MicrophoneGstPipeline {
     fn drop(&mut self) {
         let _ = stop_pipeline(&self.pipeline, "microphone pipeline");
     }
+}
+
+fn select_one_microphone(convert: &gst::Element, source_caps: &CapsPlan) -> Result<()> {
+    let Some(CapsValue::Signed(channels)) = source_caps.field("channels") else {
+        return Err(Error::Backend(
+            "microphone source caps have no channel count".to_owned(),
+        ));
+    };
+    let row = (0..*channels).map(|channel| if channel == 0 { 1.0_f32 } else { 0.0 });
+    set_checked(
+        convert,
+        "mix-matrix",
+        gst::Array::new([gst::Array::new(row)]),
+    )
 }
 
 fn cancel_echo_on_capture(element: &gst::Element, canceller: SharedEchoCanceller) -> Result<()> {
@@ -4036,6 +4051,92 @@ mod tests {
         assert_eq!(samples.len(), 50 * 240);
         assert!(samples[..480].iter().all(|sample| *sample == 0));
         assert!(samples[480..].iter().any(|sample| *sample != 0));
+    }
+
+    #[test]
+    fn microphone_array_is_reduced_to_its_first_microphone() {
+        for channel_mask in [0, 0x33] {
+            let samples = first_microphone_samples(channel_mask);
+            assert_eq!(samples.len(), 960);
+            assert!(
+                samples
+                    .iter()
+                    .all(|sample| (i32::from(sample.unsigned_abs()) - 4_096).abs() <= 1),
+                "channel mask {channel_mask:#x} mixed in other microphones"
+            );
+        }
+    }
+
+    fn first_microphone_samples(channel_mask: u64) -> Vec<i16> {
+        gst::init().expect("GStreamer");
+        let plan = crate::MicrophonePipelinePlan::new(crate::MicrophoneConfig {
+            stream_id: AudioStreamId::Main,
+            codec: MicrophoneCodec::PcmS16,
+            sample_rate_hz: 48_000,
+            channels: 1,
+            frame_duration_micros: 20_000,
+            maximum_encoded_frame_bytes: 64 * 1024,
+            maximum_pcm_buffer_bytes: 256 * 1024,
+        })
+        .expect("plan");
+        let frames = 960;
+        let levels = [1_i32 << 28, 1 << 27, 1 << 26, 1 << 25];
+        let array: Vec<u8> = (0..frames)
+            .flat_map(|frame| {
+                let sign = if frame % 48 < 24 { 1 } else { -1 };
+                levels.map(|level| (level * sign).to_le_bytes())
+            })
+            .flatten()
+            .collect();
+        let pipeline = gst::Pipeline::new();
+        let source = make("appsrc", "array").expect("source");
+        let source = source.downcast::<gst_app::AppSrc>().expect("appsrc");
+        let mut source_caps = caps(&plan.source_caps).expect("source caps");
+        source_caps
+            .make_mut()
+            .set("channel-mask", gst::Bitmask::new(channel_mask));
+        source.set_caps(Some(&source_caps));
+        source.set_format(gst::Format::Time);
+        let convert = make("audioconvert", "downmixer").expect("convert");
+        select_one_microphone(&convert, &plan.source_caps).expect("matrix");
+        let filter = make("capsfilter", "mono").expect("caps");
+        set_checked(
+            &filter,
+            "caps",
+            caps(&plan.packetizer_input_caps).expect("mono caps"),
+        )
+        .expect("caps");
+        let sink_element = make("appsink", "mono-sink").expect("sink");
+        let sink = sink_element
+            .clone()
+            .downcast::<gst_app::AppSink>()
+            .expect("appsink");
+        sink.set_sync(false);
+        let source_element = source.clone().upcast::<gst::Element>();
+        pipeline
+            .add_many([&source_element, &convert, &filter, &sink_element])
+            .expect("add");
+        gst::Element::link_many([&source_element, &convert, &filter, &sink_element]).expect("link");
+        pipeline.set_state(gst::State::Playing).expect("play");
+        let mut buffer = gst::Buffer::from_mut_slice(array);
+        buffer
+            .get_mut()
+            .expect("buffer")
+            .set_pts(gst::ClockTime::ZERO);
+        source.push_buffer(buffer).expect("push");
+        source.end_of_stream().expect("eos");
+        let mut samples = Vec::new();
+        while let Ok(sample) = sink.pull_sample() {
+            let buffer = sample.buffer().expect("buffer");
+            let mapped = buffer.map_readable().expect("map");
+            samples.extend(
+                mapped
+                    .chunks_exact(2)
+                    .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]])),
+            );
+        }
+        pipeline.set_state(gst::State::Null).expect("stop");
+        samples
     }
 
     #[test]

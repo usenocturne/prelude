@@ -47,8 +47,6 @@ use std::{
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 use platform_superbird::{LinuxInputBackend, LinuxInputConfig};
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
-use prelude_bluetooth_sco::ScoLink;
-#[cfg(all(target_os = "linux", feature = "linux-media"))]
 use prelude_media::{
     AudioBackendFailureKind, AudioBackendTelemetrySnapshot, AudioOutputDelaySource,
     AudioStreamConfig, LinuxAudioBackend, LinuxAudioBackendConfig, LinuxDisplayHandle,
@@ -62,7 +60,7 @@ use prelude_media::{
 use crate::first_video::{FirstVideoAction, FirstVideoWatchdog};
 use crate::hands_free::HandsFree;
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
-use crate::hands_free::{CallBridge, CallSubscription};
+use crate::hands_free::{CallAudio, CallBridge, CallSubscription};
 use crate::{
     AndroidAutoConfig, AudioBackend, AudioPipelineState, AudioRuntimeRoute, AudioRuntimeSnapshot,
     ConnectionStep, DaemonConfig, DisplayPlatform, DisplayStatus, Error, HealthState, MediaConfig,
@@ -90,7 +88,6 @@ const AUDIO_PLAYOUT_LATENCY_MS: u32 = 200;
 const MICROPHONE_FRAME_DURATION_MICROS: u32 = 20_000;
 const MICROPHONE_MAXIMUM_FRAME_BYTES: usize = 4_096;
 const MICROPHONE_MAXIMUM_BUFFER_BYTES: usize = 16 * 1024;
-const CALL_MICROPHONE_RATE: u32 = 8_000;
 const SYSTEM_CLOCK: usize = 2;
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 const BLUETOOTH_PASSKEY_WAIT: Duration = Duration::from_secs(60);
@@ -2180,13 +2177,13 @@ impl LiveMedia {
         {
             self.end_call();
         }
-        if let Some(link) = self.calls.as_ref().and_then(CallSubscription::try_next) {
+        if let Some(audio) = self.calls.as_ref().and_then(CallSubscription::try_next) {
             self.end_call();
-            self.start_call(link);
+            self.start_call(audio);
         }
     }
 
-    fn start_call(&mut self, link: ScoLink) {
+    fn start_call(&mut self, audio: CallAudio) {
         let Some(frames) = self
             .audio
             .as_ref()
@@ -2203,8 +2200,9 @@ impl LiveMedia {
                 status.microphone.ready = false;
             });
         }
-        let mtu = link.mtu();
-        let microphone = match start_call_microphone() {
+        let mtu = audio.mtu();
+        let codec = audio.codec();
+        let microphone = match start_call_microphone(audio.sample_rate()) {
             Ok(microphone) => Some(microphone),
             Err(error) => {
                 tracing::warn!(%error, "the call microphone could not start; the caller hears silence");
@@ -2213,7 +2211,7 @@ impl LiveMedia {
         };
         let has_microphone = microphone.is_some();
         let bridge =
-            match CallBridge::start(link, frames, self.audio_clocks[SYSTEM_CLOCK], microphone) {
+            match CallBridge::start(audio, frames, self.audio_clocks[SYSTEM_CLOCK], microphone) {
                 Ok(bridge) => bridge,
                 Err(error) => {
                     tracing::warn!(%error, "starting Bluetooth call audio failed");
@@ -2222,6 +2220,7 @@ impl LiveMedia {
             };
         tracing::info!(
             peer = bridge.peer(),
+            ?codec,
             mtu,
             microphone = has_microphone,
             "playing Bluetooth call audio on the DAC"
@@ -2372,11 +2371,13 @@ impl LiveMedia {
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
-fn start_call_microphone() -> std::result::Result<LinuxMicrophoneBackend, String> {
+fn start_call_microphone(
+    sample_rate_hz: u32,
+) -> std::result::Result<LinuxMicrophoneBackend, String> {
     let packetizer = MicrophonePacketizer::new_raw_pcm_s16le(MicrophoneConfig {
         stream_id: AudioStreamId::Main,
         codec: MicrophoneCodec::RawPcmS16Le,
-        sample_rate_hz: CALL_MICROPHONE_RATE,
+        sample_rate_hz,
         channels: 1,
         frame_duration_micros: MICROPHONE_FRAME_DURATION_MICROS,
         maximum_encoded_frame_bytes: MICROPHONE_MAXIMUM_FRAME_BYTES,
