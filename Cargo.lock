@@ -1744,7 +1744,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platform-superbird"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "evdev",
  "fs2",
@@ -1798,7 +1798,7 @@ dependencies = [
 
 [[package]]
 name = "prelude-android-auto"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "rusb",
  "thiserror 2.0.20",
@@ -1806,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "prelude-android-auto-protocol"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "proptest",
  "prost",
@@ -1817,14 +1817,14 @@ dependencies = [
 
 [[package]]
 name = "prelude-bluetooth-sco"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "prelude-control"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "plist",
  "prelude-net",
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "prelude-iap2"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bitflags 2.13.1",
  "bytes",
@@ -1846,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "prelude-media"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chacha20poly1305",
  "gstreamer",
@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "prelude-mfi"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "fs2",
  "i2cdev",
@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "prelude-net"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "aes",
  "chacha20poly1305",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "prelude-usb-carkit"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "der",
  "openssl",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "prelude-wireless"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "nix 0.30.1",
  "prost",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "preludectl"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "preluded"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "clap",
  "fontdue",
