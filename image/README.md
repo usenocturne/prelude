@@ -36,9 +36,9 @@ There are three KAS profiles:
 - `kas/prelude-prod-local.yml` builds the same image from this checkout through
   `EXTERNALSRC`.
 
-Other images (`prelude-dev-image`, `prelude-usb-host-test-image`,
-`prelude-update`) are built with `bitbake` from `just shell`, which opens
-the local production profile.
+Other images (`prelude-dev-image`, `prelude-usb-host-test-image`) and the
+OTA bundles (`prelude-update-prod`, `prelude-update-dev`) are built with
+`bitbake` from `just shell`, which opens the local production profile.
 
 The development image loads `/etc/prelude/config-dev.toml`, which explicitly
 opts into automatic phone selection. An iPhone uses configuration 6, the
@@ -149,12 +149,9 @@ powers the hub, phone, DAC, and Wi-Fi adapter.
   normal boot transaction. Holding Back/ESC during the startup sample keeps USB
   device mode and starts those units on demand. This is the default image:
   build it with `just build` and flash it with `just flash`.
-- `prelude-update` wraps the `prelude-dev-image` boot FAT image and
-  squashfs-lz4 root filesystem in the BSP SWUpdate A/B format. Apply it only to
-  the inactive slot selected from `slot_active`; U-Boot gives the new slot
-  three attempts before falling back to the previously active slot. Build it
-  alongside the image with
-  `bitbake prelude-dev-image prelude-update` from `just shell`.
+- `prelude-update-prod` and `prelude-update-dev` wrap the matching image's
+  boot FAT image and root filesystem in the BSP SWUpdate A/B format as signed
+  bundles. See [Over-the-air updates](#over-the-air-updates).
 
 First qualify a new adapter with `prelude-usb-host-test-image`; only after
 external enumeration passes should the always-host OTG image be flashed. The
@@ -241,6 +238,96 @@ the timeout or `device-mode` restores it. The production image includes the
 gadget disabled for Back-held, on-demand recovery.
 Mask-ROM flashing remains the fallback if neither host Ethernet nor device-mode
 networking is available.
+
+## Over-the-air updates
+
+Prelude images can be updated in place through the BSP's SWUpdate A/B slots.
+Every bundle is signed, and an image only accepts bundles signed by the key it
+was built with.
+
+### Signing keys
+
+Generate a key pair once and keep it outside the repository:
+
+```sh
+mkdir -p ~/keys && chmod 700 ~/keys
+openssl genrsa -out ~/keys/prelude-ota.key 4096
+openssl rsa -in ~/keys/prelude-ota.key -pubout -out ~/keys/prelude-ota.pub
+```
+
+The public key is baked into every image built with it and becomes that
+device's long-term trust anchor: devices only take updates signed by the
+matching private key until they are reflashed. Official releases must be built
+with the project's release key.
+
+`kas-run` mounts `PRELUDE_OTA_KEY_DIR` read-only at `/keys` inside the build
+container, so the two key variables use container paths:
+
+```sh
+export PRELUDE_OTA_KEY_DIR=~/keys
+export PRELUDE_OTA_SIGNING_KEY=/keys/prelude-ota.key
+export PRELUDE_OTA_PUBLIC_KEY=/keys/prelude-ota.pub
+just build
+just shell   # then: bitbake prelude-update-prod prelude-update-dev
+```
+
+Bundles are deployed as `prelude_update_prod_v<version>.swu` and
+`prelude_update_dev_v<version>.swu`. Building a bundle without
+`PRELUDE_OTA_SIGNING_KEY` fails. Building an image without
+`PRELUDE_OTA_PUBLIC_KEY` succeeds, but the image is marked
+`/etc/prelude/ota-disabled` and cannot accept any bundle.
+
+### Image markers
+
+- `/etc/prelude/flavour` is `prod` or `dev`. A device only takes the bundle of
+  its own flavour; a dev device that installed a prod bundle would lose its
+  development tooling.
+- `/etc/prelude/ota-disabled` exists when the image has no OTA public key, and
+  on `prelude-usb-host-test-image`, which never takes updates.
+
+### Installing a bundle by hand
+
+Install only from a slot that is already confirmed healthy, and always write
+the pending marker before installing:
+
+```sh
+test -e /run/prelude/ready || exit 1
+running=$(sed -n 's/.*superbird\.slot=\([ab]\).*/\1/p' /proc/cmdline)
+target=$([ "$running" = a ] && echo b || echo a)
+printf 'slot=%s\nversion=%s\n' "$target" 1.0.5 > /var/lib/prelude/pending-update
+sync
+swupdate-client -e "stable,slot_$target" prelude_update_prod_v1.0.5.swu
+reboot
+```
+
+### Health gate and fallback
+
+U-Boot gives a newly installed slot three boot attempts. Prelude replaces the
+BSP's "mark good 60 s after boot" timer:
+
+- `preluded` writes `/run/prelude/ready` once the daemon and its settings UI
+  have run continuously for 45 seconds.
+- `prelude-slot-ok.path` then resets the slot's try counter (once per boot) and
+  removes `/var/lib/prelude/pending-update`.
+- `prelude-trial-watchdog` runs five minutes after boot. If the running slot is
+  the pending update's slot and Prelude never became ready, it reboots so the
+  try counter runs down and U-Boot falls back to the previous slot. Boots that
+  stayed in USB recovery (Back held at startup) are left alone.
+
+The U-Boot environment that holds `slot_active` and the try counters is a
+single, non-redundant `uboot.env` file on a FAT partition. Losing power while
+it is being written can corrupt it, and U-Boot then starts from its built-in
+default environment. The BSP already rewrites this file on every boot; an
+update adds one more write.
+
+### Wireless identity
+
+The access point's country and any build-time passphrase are copied to
+`/var/lib/prelude/wireless-identity.toml` on first boot, and that copy wins
+afterwards, so an update built with different defaults keeps the device's
+region and its paired phones working. To change the country after first boot,
+factory-reset the device or remove that file. Devices that use the default
+serial-derived passphrase keep using it.
 
 ## Wireless projection
 
