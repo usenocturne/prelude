@@ -61,8 +61,17 @@ kernel_config = text(
     "meta-prelude/recipes-kernel/linux/linux-superbird/prelude-usb.cfg"
 )
 kernel_policy = text("meta-prelude/recipes-kernel/linux/linux-superbird_%.bbappend")
-otg_update_recipe = text(
-    "meta-prelude/recipes-core/prelude-update/prelude-update.bb"
+dev_update_recipe = text(
+    "meta-prelude/recipes-core/prelude-update/prelude-update-dev.bb"
+)
+prod_update_recipe = text(
+    "meta-prelude/recipes-core/prelude-update/prelude-update-prod.bb"
+)
+update_signing = text(
+    "meta-prelude/recipes-core/prelude-update/prelude-update-signing.inc"
+)
+update_sw_description = text(
+    "meta-prelude/recipes-core/prelude-update/files/sw-description"
 )
 dev_packagegroup = text(
     "meta-prelude/recipes-core/packagegroups/packagegroup-prelude-dev.bb"
@@ -737,14 +746,44 @@ for fragment in ("file://prelude-usb.cfg", "file://prelude-wireless.cfg"):
 for radio_removal in ("SRC_URI:remove", "uart_A"):
     if radio_removal in kernel_policy:
         fail(f"downstream Linux recipe still strips the onboard radio: {radio_removal}")
-for update_contract in (
-    "require recipes-core/superbird-bsp-update/superbird-bsp-update.inc",
-    'SUPERBIRD_OTA_SOURCE_IMAGE = "prelude-dev-image"',
-    'SUPERBIRD_OTA_SYSTEM_ARTIFACT = "${SUPERBIRD_OTA_SOURCE_LINKNAME}.squashfs-lz4"',
-    'SUPERBIRD_OTA_SYSTEM_CPIO_NAME = "system.img"',
+for update_recipe, flavour, source_image, artifact in (
+    (dev_update_recipe, "dev", "prelude-dev-image", "squashfs-lz4"),
+    (prod_update_recipe, "prod", "prelude-prod-image", "ext4"),
 ):
-    if update_contract not in otg_update_recipe:
-        fail(f"OTG A/B update recipe is missing contract: {update_contract}")
+    for update_contract in (
+        "require recipes-core/superbird-bsp-update/superbird-bsp-update.inc",
+        "require prelude-update-signing.inc",
+        f'PRELUDE_UPDATE_FLAVOUR = "{flavour}"',
+        f'SUPERBIRD_OTA_SOURCE_IMAGE = "{source_image}"',
+        f'SUPERBIRD_OTA_SYSTEM_ARTIFACT = "${{SUPERBIRD_OTA_SOURCE_LINKNAME}}.{artifact}"',
+        'SUPERBIRD_OTA_SYSTEM_CPIO_NAME = "system.img"',
+    ):
+        if update_contract not in update_recipe:
+            fail(f"{flavour} A/B update recipe is missing contract: {update_contract}")
+for signing_contract in (
+    'SWUPDATE_SIGNING = "RSA"',
+    'SWUPDATE_PRIVATE_KEY = "${PRELUDE_OTA_SIGNING_KEY}"',
+    'IMAGE_LINK_NAME = "prelude_update_${PRELUDE_UPDATE_FLAVOUR}_v${DISTRO_VERSION}"',
+    'do_swuimage[prefuncs] += "prelude_require_signing_key prelude_check_root_fits"',
+):
+    if signing_contract not in update_signing:
+        fail(f"OTA bundle signing is missing contract: {signing_contract}")
+if re.search(r"^python __anonymous|^python \(\)", update_signing, re.MULTILINE):
+    fail("OTA key checks must not run at parse time; keyless image builds would break")
+for image_name in ("boot.vfat", "system.img"):
+    if f'sha256 = "$swupdate_get_sha256({image_name})";' not in update_sw_description:
+        fail(f"signed sw-description does not hash {image_name}")
+swupdate_signing = text("meta-prelude/recipes-support/swupdate/files/prelude-signing.cfg")
+for option in ("CONFIG_SIGNED_IMAGES=y", "CONFIG_SIGALG_RAWRSA=y"):
+    if option not in swupdate_signing:
+        fail(f"swupdate is not built with {option}")
+kas_run = text("scripts/kas-run")
+for variable in ("PRELUDE_OTA_SIGNING_KEY", "PRELUDE_OTA_PUBLIC_KEY", "PRELUDE_OTA_KEY_DIR"):
+    if variable not in kas_run:
+        fail(f"kas-run does not pass {variable} into the build container")
+for variable in ("PRELUDE_OTA_SIGNING_KEY", "PRELUDE_OTA_PUBLIC_KEY"):
+    if f"  {variable}: null" not in kas:
+        fail(f"KAS profile does not pass {variable} to BitBake")
 
 wireless_kernel_config = text(
     "meta-prelude/recipes-kernel/linux/linux-superbird/prelude-wireless.cfg"

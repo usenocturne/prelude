@@ -1,0 +1,61 @@
+# Prelude copy of the BSP full A/B sw-description with per-image SHA-256
+# hashes. The hashes live in the signed manifest, so a modified payload is
+# rejected even though the payload itself is not signed.
+# raw write to boot_X + root_X by partlabel; bootenv flips slot_active + tries.
+# selector via `swupdate-client -e stable,slot_a|slot_b`.
+
+software =
+{
+    version = "@@VERSION@@";
+    description = "Prelude OTA (@@PRELUDE_UPDATE_FLAVOUR@@)";
+
+    # Matched against /etc/hwrevision (`superbird 1.0`) - second column.
+    hardware-compatibility: [ "1.0" ];
+
+    stable: {
+        slot_a: {
+            images: (
+                {
+                    filename = "boot.vfat";
+                    type = "raw";
+                    device = "/dev/disk/by-partlabel/boot_a";
+                    installed-directly = true;
+                    sha256 = "$swupdate_get_sha256(boot.vfat)";
+                },
+                {
+                    filename = "system.img";
+                    type = "raw";
+                    device = "/dev/disk/by-partlabel/root_a";
+                    installed-directly = true;
+                    sha256 = "$swupdate_get_sha256(system.img)";
+                }
+            );
+            bootenv: (
+                { name = "slot_active";  value = "a"; },
+                { name = "slot_a_tries"; value = "3"; }
+            );
+        };
+        slot_b: {
+            images: (
+                {
+                    filename = "boot.vfat";
+                    type = "raw";
+                    device = "/dev/disk/by-partlabel/boot_b";
+                    installed-directly = true;
+                    sha256 = "$swupdate_get_sha256(boot.vfat)";
+                },
+                {
+                    filename = "system.img";
+                    type = "raw";
+                    device = "/dev/disk/by-partlabel/root_b";
+                    installed-directly = true;
+                    sha256 = "$swupdate_get_sha256(system.img)";
+                }
+            );
+            bootenv: (
+                { name = "slot_active";  value = "b"; },
+                { name = "slot_b_tries"; value = "3"; }
+            );
+        };
+    };
+};

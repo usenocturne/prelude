@@ -37,11 +37,20 @@ if [ "$operation" != checkout ]; then
   case "$target" in
     *-local) runtime_args="$runtime_args -v $monorepo_dir:/monorepo" ;;
   esac
-  for variable in PRELUDE_MONOREPO_SRC_URI PRELUDE_MONOREPO_SRCREV PRELUDE_WIRELESS_COUNTRY PRELUDE_WIRELESS_PASSPHRASE; do
+  for variable in PRELUDE_MONOREPO_SRC_URI PRELUDE_MONOREPO_SRCREV PRELUDE_WIRELESS_COUNTRY PRELUDE_WIRELESS_PASSPHRASE PRELUDE_OTA_SIGNING_KEY PRELUDE_OTA_PUBLIC_KEY; do
     if [ -n "${!variable:-}" ]; then
       runtime_args="$runtime_args -e $variable"
     fi
   done
+  # OTA keys live outside the repository. Mount their directory read-only at
+  # /keys and point PRELUDE_OTA_SIGNING_KEY / PRELUDE_OTA_PUBLIC_KEY at /keys/...
+  if [ -n "${PRELUDE_OTA_KEY_DIR:-}" ]; then
+    if [ ! -d "$PRELUDE_OTA_KEY_DIR" ]; then
+      echo "PRELUDE_OTA_KEY_DIR is not a directory: $PRELUDE_OTA_KEY_DIR" >&2
+      exit 1
+    fi
+    runtime_args="$runtime_args -v $(cd "$PRELUDE_OTA_KEY_DIR" && pwd):/keys:ro"
+  fi
 fi
 
 args=()
