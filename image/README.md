@@ -296,9 +296,19 @@ running=$(sed -n 's/.*superbird\.slot=\([ab]\).*/\1/p' /proc/cmdline)
 target=$([ "$running" = a ] && echo b || echo a)
 printf 'slot=%s\nversion=%s\n' "$target" 1.0.5 > /var/lib/prelude/pending-update
 sync
-swupdate-client -e "stable,slot_$target" prelude_update_prod_v1.0.5.swu
-reboot
+systemctl stop swupdate.socket swupdate.service
+swupdate -f /etc/swupdate.cfg -e "stable,slot_$target" -i prelude_update_prod_v1.0.5.swu
+systemctl reboot
 ```
+
+The image does not ship `swupdate-client`, so the bundle is installed with
+`swupdate` itself after stopping the daemon. Over ADB, reboot with
+`adb shell systemctl reboot`; this adbd ignores `adb reboot`.
+
+A rejected or interrupted install can leave the inactive slot half written.
+The boot environment is only changed after every image has been written and
+verified, so the running slot stays active, but the inactive slot is not a
+usable fallback until the next successful install.
 
 ### Health gate and fallback
 
