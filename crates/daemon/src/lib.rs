@@ -28,6 +28,7 @@ mod media_runtime;
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 mod pairing_code;
 mod presets;
+pub mod readiness;
 mod settings;
 #[cfg(target_os = "linux")]
 mod shared_mfi;

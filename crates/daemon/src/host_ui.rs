@@ -111,6 +111,7 @@ pub struct HostUi {
     events: Receiver<HostUiEvent>,
     stop: Arc<AtomicBool>,
     wake: Arc<Notify>,
+    heartbeat: Arc<crate::readiness::Heartbeat>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -129,6 +130,8 @@ impl HostUi {
         let wake = Arc::new(Notify::new());
         let worker_stop = Arc::clone(&stop);
         let worker_wake = Arc::clone(&wake);
+        let heartbeat = Arc::new(crate::readiness::Heartbeat::new());
+        let worker_heartbeat = Arc::clone(&heartbeat);
         let worker = thread::Builder::new()
             .name("prelude-host-ui".to_owned())
             .spawn(move || {
@@ -143,15 +146,21 @@ impl HostUi {
                     events_tx,
                     worker_wake,
                 );
-                run_host_ui(ui, &worker_stop);
+                run_host_ui(ui, &worker_stop, &worker_heartbeat);
             })
             .map_err(|error| format!("starting the host settings UI failed: {error}"))?;
         Ok(Self {
             events,
             stop,
             wake,
+            heartbeat,
             worker: Some(worker),
         })
+    }
+
+    /// Whether the UI worker loop has run recently; feeds the boot readiness gate.
+    pub fn heartbeat_fresh(&self) -> bool {
+        self.heartbeat.is_fresh()
     }
 
     pub fn take_events(&self) -> Vec<HostUiEvent> {
@@ -192,9 +201,14 @@ impl OverlaySurface for LinuxDisplayHandle {
     }
 }
 
-fn run_host_ui(mut ui: SettingsUi<impl OverlaySurface>, stop: &AtomicBool) {
+fn run_host_ui(
+    mut ui: SettingsUi<impl OverlaySurface>,
+    stop: &AtomicBool,
+    heartbeat: &crate::readiness::Heartbeat,
+) {
     let mut input = None;
     while !stop.load(Ordering::Acquire) {
+        heartbeat.beat();
         if input.is_none() {
             match LinuxInputBackend::discover(LinuxInputConfig::default()) {
                 Ok(backend) => {

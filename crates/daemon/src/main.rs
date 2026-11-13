@@ -233,8 +233,24 @@ async fn main() -> Result<()> {
     #[cfg(all(target_os = "linux", feature = "linux-media"))]
     let mut logged_audio_status: Option<AudioRuntimeSnapshot> = None;
     let mut logged_failures = BTreeMap::<String, String>::new();
+    let mut readiness =
+        preluded::readiness::Readiness::new(preluded::readiness::READY_MARKER.into());
+    let mut readiness_error_logged = false;
     loop {
         let snapshot = daemon.poll()?;
+        #[cfg(all(target_os = "linux", feature = "linux-media"))]
+        let essentials_ok = host_ui.as_ref().is_none_or(HostUi::heartbeat_fresh);
+        #[cfg(not(all(target_os = "linux", feature = "linux-media")))]
+        let essentials_ok = true;
+        match readiness.tick(std::time::Instant::now(), essentials_ok) {
+            Ok(true) => info!("preluded is ready; the boot slot can be marked good"),
+            Ok(false) => {}
+            Err(error) if !readiness_error_logged => {
+                readiness_error_logged = true;
+                warn!(%error, "could not write the readiness marker");
+            }
+            Err(_) => {}
+        }
         let failures = snapshot
             .health
             .components()
