@@ -791,4 +791,24 @@ if 'SYSTEMD_AUTO_ENABLE:${PN} = "disable"' not in text(
 ):
     fail("the system dnsmasq instance would conflict with the projection access point")
 
+# OTA: every image records its flavour so the updater picks the matching
+# bundle, and images built without a public key ship with OTA disabled.
+image_base = text("meta-prelude/recipes-core/images/prelude-image-base.inc")
+for image_recipe, flavour in (
+    ("prelude-dev-image.bb", "dev"),
+    ("prelude-prod-image.bb", "prod"),
+):
+    recipe_text = text(f"meta-prelude/recipes-core/images/{image_recipe}")
+    declared = re.search(r'^PRELUDE_FLAVOUR \??= "(\w+)"', recipe_text, re.MULTILINE)
+    inherited = re.search(r'^PRELUDE_FLAVOUR \?\?= "(\w+)"', image_base, re.MULTILINE)
+    effective = declared.group(1) if declared else (inherited.group(1) if inherited else None)
+    if effective != flavour:
+        fail(f"{image_recipe} does not record PRELUDE_FLAVOUR = {flavour}")
+if 'PRELUDE_OTA_ENABLED = "0"' not in text(
+    "meta-prelude/recipes-core/images/prelude-usb-host-test-image.bb"
+):
+    fail("the USB host test image must never accept OTA updates")
+if "prelude_write_ota_markers" not in image_base or "ota-disabled" not in image_base:
+    fail("images do not write the flavour and OTA availability markers")
+
 print("prelude image layer static checks passed")

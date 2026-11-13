@@ -3,6 +3,9 @@ DESCRIPTION = "USB-recoverable development image that performs one bounded host-
 LICENSE = "GPL-3.0-only"
 
 SUPERBIRD_ROOTFS_TYPE = "squashfs-lz4"
+# Adapter qualification image: never offer or accept OTA updates.
+PRELUDE_FLAVOUR = "dev"
+PRELUDE_OTA_ENABLED = "0"
 
 require prelude-image-base.inc
 

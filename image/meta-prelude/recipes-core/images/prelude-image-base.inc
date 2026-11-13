@@ -21,6 +21,25 @@ prelude_validate_weston_modules() {
 }
 ROOTFS_POSTPROCESS_COMMAND += "prelude_validate_weston_modules; "
 
+# OTA: record which bundle flavour this image takes, and disable updates on
+# images built without a signing public key (or images that must never update).
+PRELUDE_FLAVOUR ??= "prod"
+PRELUDE_OTA_ENABLED ??= "1"
+PRELUDE_OTA_PUBLIC_KEY ??= ""
+prelude_write_ota_markers() {
+    case "${PRELUDE_FLAVOUR}" in
+        prod|dev) ;;
+        *) bbfatal "PRELUDE_FLAVOUR must be prod or dev" ;;
+    esac
+    install -d "${IMAGE_ROOTFS}${sysconfdir}/prelude"
+    printf '%s\n' "${PRELUDE_FLAVOUR}" > "${IMAGE_ROOTFS}${sysconfdir}/prelude/flavour"
+    rm -f "${IMAGE_ROOTFS}${sysconfdir}/prelude/ota-disabled"
+    if [ "${PRELUDE_OTA_ENABLED}" != "1" ] || [ -z "${PRELUDE_OTA_PUBLIC_KEY}" ]; then
+        : > "${IMAGE_ROOTFS}${sysconfdir}/prelude/ota-disabled"
+    fi
+}
+ROOTFS_POSTPROCESS_COMMAND += "prelude_write_ota_markers; "
+
 # A scheduled trial must be consumed automatically on the next boot. Keep the
 # unit payload and its boot enablement coupled to every image variant.
 prelude_validate_host_trial_boot_unit() {

@@ -3,6 +3,7 @@ DESCRIPTION = "USB-recoverable wired and wireless CarPlay and Android Auto devel
 LICENSE = "GPL-3.0-only"
 
 SUPERBIRD_ROOTFS_TYPE = "squashfs-lz4"
+PRELUDE_FLAVOUR = "dev"
 
 require prelude-image-base.inc
 
