@@ -36,6 +36,7 @@ mod status_screen;
 mod usb_monitor;
 mod wired_runtime;
 mod wireless_carplay;
+pub mod wireless_identity;
 mod wireless_runtime;
 
 pub use android_auto_runtime::AndroidAutoRuntime;

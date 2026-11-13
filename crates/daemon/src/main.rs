@@ -49,9 +49,15 @@ async fn main() -> Result<()> {
         .config
         .map_or_else(|| Ok(DaemonConfig::default()), DaemonConfig::load)?;
     #[cfg(not(all(target_os = "linux", feature = "linux-media")))]
-    let config = arguments
+    let mut config = arguments
         .config
         .map_or_else(|| Ok(DaemonConfig::default()), DaemonConfig::load)?;
+    // Keep the access point's country and configured passphrase across
+    // over-the-air updates; see `wireless_identity`.
+    if config.wireless.enabled {
+        let identity = preluded::wireless_identity::reconcile(&config.wireless, &config.state_dir);
+        preluded::wireless_identity::apply(&identity, &mut config.wireless);
+    }
     #[cfg(all(target_os = "linux", feature = "linux-media"))]
     let settings_base_config = config.clone();
     #[cfg(all(target_os = "linux", feature = "linux-media"))]
