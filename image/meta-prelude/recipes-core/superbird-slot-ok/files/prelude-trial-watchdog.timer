@@ -1,0 +1,10 @@
+[Unit]
+Description=Check an OTA trial boot five minutes after startup
+
+[Timer]
+OnBootSec=5min
+AccuracySec=5s
+Unit=prelude-trial-watchdog.service
+
+[Install]
+WantedBy=timers.target

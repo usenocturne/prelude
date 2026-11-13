@@ -37,6 +37,9 @@ const MAX20332_ADDRESS: u16 = 0x35;
 const HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(15);
 const MAXIMUM_MAX20332_SNAPSHOT_BYTES: u64 = 128;
 const AUDIO_ROUTE_STATE: &str = "/var/lib/prelude/audio-route";
+/// Boot-scoped (tmpfs) marker telling the OTA trial watchdog that this boot
+/// deliberately stayed in USB device recovery, so it must not reboot it.
+const RECOVERY_BOOT_MARKER: &str = "/run/prelude/recovery-boot";
 const DAEMON_CONFIG: &str = "/etc/prelude/config.toml";
 const INITIAL_BACKLIGHT_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(target_os = "linux")]
@@ -305,6 +308,7 @@ fn run(arguments: Arguments) -> Result<()> {
             let preparation = transaction.prepare_host_boot()?;
             match preparation {
                 HostBootOutcome::NotConfirmed => {
+                    note_recovery_boot();
                     let recovery = finish_prepared_device_recovery(&paths, &transaction);
                     if let Err(error) = recovery {
                         let _ = schedule_device_recovery();
@@ -342,6 +346,7 @@ fn run(arguments: Arguments) -> Result<()> {
             let transaction = manager.begin_transaction()?;
             match automatic_host_bypass_requested() {
                 Ok(true) => {
+                    note_recovery_boot();
                     finish_device_recovery(&paths, &transaction)?;
                     println!(
                         "automatic USB host mode bypassed for this boot because Back was held during startup"
@@ -350,6 +355,7 @@ fn run(arguments: Arguments) -> Result<()> {
                 }
                 Ok(false) => {}
                 Err(error) => {
+                    note_recovery_boot();
                     finish_device_recovery(&paths, &transaction)?;
                     println!(
                         "automatic USB host mode bypassed for this boot because the startup button could not be read: {error:#}"
@@ -360,6 +366,7 @@ fn run(arguments: Arguments) -> Result<()> {
             let preparation = transaction.prepare_automatic_host_boot()?;
             match preparation {
                 HostBootOutcome::NotConfirmed => {
+                    note_recovery_boot();
                     let recovery = finish_prepared_device_recovery(&paths, &transaction);
                     if let Err(error) = recovery {
                         let _ = schedule_device_recovery();
@@ -566,6 +573,20 @@ fn automatic_host_bypass_requested() -> Result<bool> {
         AUTOMATIC_HOST_BYPASS_SAMPLES,
         AUTOMATIC_HOST_BYPASS_SAMPLE_INTERVAL,
     )
+}
+
+fn mark_recovery_boot(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(path, b"recovery\n").with_context(|| format!("write {}", path.display()))
+}
+
+/// Recovery must proceed even if the exemption marker cannot be written.
+fn note_recovery_boot() {
+    if let Err(error) = mark_recovery_boot(Path::new(RECOVERY_BOOT_MARKER)) {
+        eprintln!("could not mark this boot as USB recovery: {error:#}");
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1522,6 +1543,15 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn mark_recovery_boot_creates_marker() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let marker = directory.path().join("run/prelude/recovery-boot");
+        mark_recovery_boot(&marker).expect("mark recovery boot");
+        assert!(marker.is_file());
+        mark_recovery_boot(&marker).expect("marking twice is harmless");
+    }
 
     #[test]
     fn automatic_host_bypass_requires_a_continuous_hold() {

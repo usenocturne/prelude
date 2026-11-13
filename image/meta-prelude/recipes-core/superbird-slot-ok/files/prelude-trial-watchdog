@@ -1,0 +1,70 @@
+#!/bin/sh
+# OTA trial-boot watchdog.
+#
+# U-Boot falls back to the previous slot only after a new slot fails to boot
+# three times. A slot that boots Linux but whose preluded never becomes ready
+# would otherwise sit on its trial forever without using up those attempts.
+# Five minutes after boot this reboots such a trial so the counter runs down,
+# and clears pending-update markers that no longer describe the running slot.
+set -eu
+
+run_dir=${PRELUDE_RUN_DIR:-/run/prelude}
+state_dir=${PRELUDE_STATE_DIR:-/var/lib/prelude}
+cmdline=${PRELUDE_CMDLINE:-/proc/cmdline}
+fw_printenv=${PRELUDE_FW_PRINTENV:-fw_printenv}
+systemctl=${PRELUDE_SYSTEMCTL:-systemctl}
+pending="$state_dir/pending-update"
+
+log() {
+    echo "prelude-trial-watchdog: $*"
+}
+
+if [ -e "$run_dir/ready" ]; then
+    log "preluded is ready; nothing to do"
+    exit 0
+fi
+if [ -e "$run_dir/recovery-boot" ]; then
+    log "this boot stayed in USB recovery; leaving it alone"
+    exit 0
+fi
+if [ ! -f "$pending" ]; then
+    exit 0
+fi
+
+running_slot=""
+for arg in $(cat "$cmdline"); do
+    case "$arg" in
+        superbird.slot=*) running_slot=${arg#superbird.slot=} ;;
+    esac
+done
+case "$running_slot" in
+    a|b) ;;
+    *)
+        log "running slot is unknown; not acting"
+        exit 0
+        ;;
+esac
+
+pending_slot=$(sed -n 's/^slot=\([ab]\)$/\1/p' "$pending" | head -n 1)
+case "$pending_slot" in
+    a|b) ;;
+    *)
+        log "pending-update marker is malformed; removing it"
+        rm -f "$pending"
+        exit 0
+        ;;
+esac
+
+if [ "$pending_slot" != "$running_slot" ]; then
+    active=$("$fw_printenv" -n slot_active 2>/dev/null || true)
+    if [ "$active" = "$pending_slot" ]; then
+        log "U-Boot fell back from slot $pending_slot to slot $running_slot"
+    else
+        log "the update to slot $pending_slot was never activated"
+    fi
+    rm -f "$pending"
+    exit 0
+fi
+
+log "slot $running_slot is on its update trial and preluded never became ready; rebooting"
+exec "$systemctl" reboot

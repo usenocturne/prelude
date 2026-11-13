@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT_DIR = ROOT / "meta-prelude/recipes-core/prelude/files"
 HOST_TEST_UNIT_DIR = ROOT / "meta-prelude/recipes-core/prelude-host-test/files"
 TOPOLOGY_UNIT_DIR = ROOT / "meta-prelude/recipes-core/prelude-topology/files"
+SLOT_OK_UNIT_DIR = ROOT / "meta-prelude/recipes-core/superbird-slot-ok/files"
 
 
 def parse_unit(
@@ -200,5 +201,32 @@ def visit(name: str) -> None:
 
 for unit_name in units:
     visit(unit_name)
+
+# OTA health gate: the slot is marked good only once preluded is ready, exactly
+# once per boot, and a failed trial boot is rebooted so U-Boot can fall back.
+slot_ok_path = parse_unit("prelude-slot-ok.path", SLOT_OK_UNIT_DIR)
+assert values(slot_ok_path, "Path", "PathExists") == ["/run/prelude/ready"]
+assert values(slot_ok_path, "Path", "Unit") == ["superbird-slot-ok.service"]
+assert "multi-user.target" in words(slot_ok_path, "Install", "WantedBy")
+slot_ok_dropin = parse_unit("prelude-slot-ok.conf", SLOT_OK_UNIT_DIR)
+assert values(slot_ok_dropin, "Service", "RemainAfterExit") == ["yes"]
+assert values(slot_ok_dropin, "Service", "ExecStartPost") == [
+    "/bin/rm -f /var/lib/prelude/pending-update"
+]
+watchdog_timer = parse_unit("prelude-trial-watchdog.timer", SLOT_OK_UNIT_DIR)
+assert values(watchdog_timer, "Timer", "OnBootSec") == ["5min"]
+assert values(watchdog_timer, "Timer", "Unit") == ["prelude-trial-watchdog.service"]
+watchdog_service = parse_unit("prelude-trial-watchdog.service", SLOT_OK_UNIT_DIR)
+assert values(watchdog_service, "Unit", "ConditionPathExists") == [
+    "/var/lib/prelude/pending-update"
+]
+assert values(watchdog_service, "Service", "ExecStart") == [
+    "/usr/libexec/prelude-trial-watchdog"
+]
+slot_ok_append = (
+    ROOT / "meta-prelude/recipes-core/superbird-slot-ok/superbird-slot-ok.bbappend"
+).read_text(encoding="utf-8")
+assert "superbird-slot-ok.timer" not in slot_ok_append.split("SYSTEMD_SERVICE:${PN} =", 1)[1].splitlines()[0]
+assert "ln -sf /dev/null ${D}${sysconfdir}/systemd/system/superbird-slot-ok.timer" in slot_ok_append
 
 print("prelude systemd unit checks passed")

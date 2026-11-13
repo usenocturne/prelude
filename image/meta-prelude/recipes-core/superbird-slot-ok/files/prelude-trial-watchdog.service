@@ -1,0 +1,7 @@
+[Unit]
+Description=Reboot an OTA trial boot whose preluded never became ready
+ConditionPathExists=/var/lib/prelude/pending-update
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/prelude-trial-watchdog

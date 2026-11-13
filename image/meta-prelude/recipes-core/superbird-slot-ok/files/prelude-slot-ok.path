@@ -1,0 +1,11 @@
+[Unit]
+Description=Mark the A/B slot healthy once preluded reports ready
+
+[Path]
+# preluded writes this tmpfs marker only after its essential workers have run
+# continuously for the stability window (see crates/daemon/src/readiness.rs).
+PathExists=/run/prelude/ready
+Unit=superbird-slot-ok.service
+
+[Install]
+WantedBy=multi-user.target
