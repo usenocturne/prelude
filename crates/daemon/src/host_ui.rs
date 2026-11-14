@@ -26,6 +26,7 @@ use crate::{
 };
 
 mod equalizer_ui;
+mod keyboard;
 use equalizer_ui::EqualizerUi;
 
 const DISPLAY_WIDTH: usize = 800;
