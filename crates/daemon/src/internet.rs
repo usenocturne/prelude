@@ -31,12 +31,17 @@ use crate::{WirelessConfig, saved_networks};
 pub const REACHABILITY_HOST: &str = "api.github.com";
 const REACHABILITY_PORT: u16 = 443;
 const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(5);
-const PARK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longer than the worst-case access point start, so a request made while
+/// the access point is still coming up waits for it instead of failing.
+const PARK_TIMEOUT: Duration = Duration::from_secs(20);
 const ONLINE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 const LEASE_TIMEOUT: Duration = Duration::from_secs(15);
 const CLIENT_RUN_DIR: &str = "/run/prelude/client";
+/// How long the link may be down (roaming, a hotspot hiccup) before the
+/// worker reports the connection lost.
+const LINK_LOSS_GRACE: Duration = Duration::from_secs(6);
 
 /// Hand-off between the internet worker and the access point supervisor.
 #[derive(Debug, Clone, Default)]
@@ -47,6 +52,8 @@ pub struct ClientGate {
 
 impl ClientGate {
     pub fn request(&self) {
+        // A park left over from an earlier request does not count.
+        self.parked.store(false, Ordering::Release);
         self.requested.store(true, Ordering::Release);
     }
 
@@ -88,6 +95,7 @@ pub enum Route {
 pub enum InternetError {
     NoAdapter,
     AdapterRemoved,
+    ConnectionLost,
     WrongPassword,
     NotFound,
     Unsupported,
@@ -102,6 +110,7 @@ impl InternetError {
         match self {
             Self::NoAdapter => "Connect a USB Wi-Fi adapter",
             Self::AdapterRemoved => "Wi-Fi adapter removed",
+            Self::ConnectionLost => "Wi-Fi connection lost",
             Self::WrongPassword => "Wrong password",
             Self::NotFound => "Network not found",
             Self::Unsupported => "This network's security is not supported",
@@ -137,7 +146,8 @@ pub enum InternetCommand {
     JoinSaved {
         ssid: Vec<u8>,
     },
-    /// Wired route if one exists, otherwise the first saved network in range.
+    /// A wired route that reaches the internet if there is one, otherwise
+    /// the first saved network in range.
     Connect,
     Release,
 }
@@ -393,7 +403,9 @@ impl Worker {
     }
 
     fn connect(&mut self) -> Result<(), Stop> {
-        if let Some(interface) = self.backend.wired_route() {
+        if let Some(interface) = self.backend.wired_route()
+            && self.backend.reachable()
+        {
             self.close();
             self.set(InternetState::Online {
                 route: Route::Wired { interface },
@@ -426,7 +438,16 @@ impl Worker {
         self.link()?;
         let ssid = String::from_utf8_lossy(&credential.ssid).into_owned();
         self.set(InternetState::Joining { ssid: ssid.clone() });
-        self.link()?.join(credential)?;
+        if let Err(error) = self.link()?.join(credential) {
+            if error == InternetError::WrongPassword {
+                // The password changed: drop the stored one so choosing the
+                // network again asks for it.
+                if let Err(error) = saved_networks::forget(&self.state_dir, &credential.ssid) {
+                    warn!(%error, "could not forget the Wi-Fi network");
+                }
+            }
+            return Err(error.into());
+        }
         self.interrupted()?;
         let address = self.link()?.lease()?;
         self.interrupted()?;
@@ -550,7 +571,11 @@ impl ClientLink for StationLink {
     }
 
     fn check(&mut self) -> Result<(), InternetError> {
-        self.station.check().map_err(link_error)
+        match self.station.online(LINK_LOSS_GRACE) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(InternetError::ConnectionLost),
+            Err(error) => Err(link_error(error)),
+        }
     }
 }
 
@@ -766,7 +791,10 @@ mod tests {
 
     #[test]
     fn wired_route_skips_wifi() {
-        let rig = Rig::new(Fake::default().with(|script| script.wired = Some("eth0".to_owned())));
+        let rig = Rig::new(Fake::default().with(|script| {
+            script.wired = Some("eth0".to_owned());
+            script.reachable = true;
+        }));
         rig.internet.send(InternetCommand::Connect);
         let state = rig.settle(terminal);
         assert!(matches!(
@@ -775,6 +803,61 @@ mod tests {
         ));
         assert!(rig.fake.calls().is_empty());
         assert!(!rig.gate.requested());
+    }
+
+    #[test]
+    fn dead_wired_route_falls_back_to_wifi() {
+        let rig = Rig::new(Fake::default().with(|script| script.wired = Some("eth0".to_owned())));
+        rig.internet.send(InternetCommand::Connect);
+        assert_eq!(
+            rig.settle(terminal),
+            InternetState::Failed(InternetError::NoSavedNetwork),
+            "a wired route that cannot reach the internet is not online"
+        );
+    }
+
+    #[test]
+    fn wrong_password_forgets_the_saved_network() {
+        let rig = Rig::new(Fake::default().with(|script| {
+            script.join = Some(InternetError::WrongPassword);
+            script.reachable = true;
+        }));
+        saved_networks::remember(
+            rig.state.path(),
+            saved_networks::SavedNetwork {
+                ssid: b"Home".to_vec(),
+                psk: Some([7; 32]),
+            },
+        )
+        .expect("remember");
+        rig.internet.send(InternetCommand::JoinSaved {
+            ssid: b"Home".to_vec(),
+        });
+        assert_eq!(
+            rig.settle(terminal),
+            InternetState::Failed(InternetError::WrongPassword)
+        );
+        rig.wait_released();
+        assert!(
+            saved_networks::load(rig.state.path()).is_empty(),
+            "a changed password must be typed again, so the old one is dropped"
+        );
+    }
+
+    #[test]
+    fn losing_the_connection_while_online_is_reported() {
+        let rig = Rig::new(Fake::default().with(|script| script.reachable = true));
+        rig.internet.send(InternetCommand::Join {
+            ssid: b"Home".to_vec(),
+            passphrase: None,
+        });
+        rig.settle(|state| matches!(state, InternetState::Online { .. }));
+        rig.fake.0.lock().expect("script").check = Some(InternetError::ConnectionLost);
+        assert_eq!(
+            rig.settle(|state| matches!(state, InternetState::Failed(_))),
+            InternetState::Failed(InternetError::ConnectionLost)
+        );
+        rig.wait_released();
     }
 
     #[test]
@@ -981,6 +1064,24 @@ mod tests {
     }
 
     #[test]
+    fn a_new_request_does_not_see_a_stale_park() {
+        let gate = ClientGate::default();
+        gate.request();
+        gate.set_parked(true);
+        gate.release();
+        gate.request();
+        assert!(
+            !gate.wait_parked(Duration::from_millis(30)),
+            "the supervisor has not parked for this request yet"
+        );
+    }
+
+    #[test]
+    fn park_timeout_outlasts_an_access_point_start() {
+        assert!(PARK_TIMEOUT > prelude_wireless::access_point::HOSTAPD_START_TIMEOUT);
+    }
+
+    #[test]
     fn error_messages_are_fixed_copy() {
         assert_eq!(
             InternetError::NoAdapter.message(),
@@ -991,6 +1092,10 @@ mod tests {
             "Wi-Fi adapter removed"
         );
         assert_eq!(InternetError::WrongPassword.message(), "Wrong password");
+        assert_eq!(
+            InternetError::ConnectionLost.message(),
+            "Wi-Fi connection lost"
+        );
         assert_eq!(InternetError::NotFound.message(), "Network not found");
         assert_eq!(
             InternetError::Unsupported.message(),

@@ -826,8 +826,13 @@ fn wireless_projection_hold(
 }
 
 fn sleep_unless_stopped(stop: &AtomicBool, duration: Duration) {
+    sleep_unless(stop, || false, duration);
+}
+
+/// Sleeps for `duration`, returning early on stop or once `wake` is true.
+fn sleep_unless(stop: &AtomicBool, wake: impl Fn() -> bool, duration: Duration) {
     let deadline = Instant::now() + duration;
-    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+    while !stop.load(Ordering::Relaxed) && !wake() && Instant::now() < deadline {
         thread::sleep(SUPERVISOR_POLL);
     }
 }
@@ -940,7 +945,9 @@ fn supervise_access_point(
         if usb_projection.load(Ordering::Acquire) || client_gate.requested() {
             continue;
         }
-        sleep_unless_stopped(stop, ACCESS_POINT_RETRY);
+        // Wake for a client-mode request so the hand-off does not wait out
+        // the retry delay.
+        sleep_unless(stop, || client_gate.requested(), ACCESS_POINT_RETRY);
     }
 }
 
@@ -1712,6 +1719,16 @@ mod tests {
     use std::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn retry_sleep_wakes_when_client_mode_is_requested() {
+        let stop = AtomicBool::new(false);
+        let gate = ClientGate::default();
+        gate.request();
+        let started = Instant::now();
+        sleep_unless(&stop, || gate.requested(), Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     fn connected_pair() -> (TcpStream, SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

@@ -72,6 +72,7 @@ pub struct Station {
     control: ControlSocket,
     supplicant: Child,
     dhcp: Option<Child>,
+    watch: LinkWatch,
 }
 
 impl Station {
@@ -105,6 +106,7 @@ impl Station {
             control,
             supplicant,
             dhcp: None,
+            watch: LinkWatch::default(),
         };
         let deadline = Instant::now() + CONTROL_SOCKET_TIMEOUT;
         while !socket.exists() {
@@ -191,6 +193,15 @@ impl Station {
             }
             thread::sleep(POLL);
         }
+    }
+
+    /// Whether the client link is still up: associated and leased. Short
+    /// drops within `grace` still count as up. Errors as [`Station::check`].
+    pub fn online(&mut self, grace: Duration) -> Result<bool> {
+        self.check()?;
+        let associated = wpa_state_completed(&self.control.request("STATUS")?);
+        let leased = self.config.run_dir.join("lease").exists();
+        Ok(!self.watch.lost(associated, leased, Instant::now(), grace))
     }
 
     pub fn check(&mut self) -> Result<()> {
@@ -417,6 +428,32 @@ pub fn derive_psk(ssid: &[u8], passphrase: &str) -> [u8; 32] {
     psk
 }
 
+/// Whether `wpa_supplicant`'s `STATUS` reply says the link is up.
+pub fn wpa_state_completed(status: &str) -> bool {
+    status
+        .lines()
+        .any(|line| line.trim() == "wpa_state=COMPLETED")
+}
+
+/// Tracks how long a client link has been down.
+#[derive(Debug, Default)]
+pub struct LinkWatch {
+    down_since: Option<Instant>,
+}
+
+impl LinkWatch {
+    /// `true` once the link has been unassociated or without a lease for
+    /// longer than `grace`.
+    pub fn lost(&mut self, associated: bool, leased: bool, now: Instant, grace: Duration) -> bool {
+        if associated && leased {
+            self.down_since = None;
+            return false;
+        }
+        let since = *self.down_since.get_or_insert(now);
+        now.saturating_duration_since(since) > grace
+    }
+}
+
 pub fn passphrase_is_valid(passphrase: &str) -> bool {
     (8..=63).contains(&passphrase.len())
         && passphrase.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
@@ -613,6 +650,33 @@ mod tests {
             ),
             JoinProgress::WrongPassword
         );
+    }
+
+    #[test]
+    fn wpa_state_completed_reads_status() {
+        assert!(wpa_state_completed(
+            "bssid=aa\nssid=Home\nwpa_state=COMPLETED\n"
+        ));
+        assert!(!wpa_state_completed("wpa_state=SCANNING\n"));
+        assert!(!wpa_state_completed("wpa_state=DISCONNECTED\n"));
+        assert!(!wpa_state_completed(""));
+    }
+
+    #[test]
+    fn link_watch_allows_brief_drops_and_reports_lasting_loss() {
+        let grace = Duration::from_secs(6);
+        let start = Instant::now();
+        let mut watch = LinkWatch::default();
+        assert!(!watch.lost(true, true, start, grace));
+        assert!(!watch.lost(false, true, start + Duration::from_secs(1), grace));
+        assert!(!watch.lost(false, true, start + Duration::from_secs(6), grace));
+        assert!(watch.lost(false, true, start + Duration::from_secs(8), grace));
+        // Back before the grace ran out resets the clock.
+        let mut watch = LinkWatch::default();
+        assert!(!watch.lost(true, false, start, grace));
+        assert!(!watch.lost(true, true, start + Duration::from_secs(5), grace));
+        assert!(!watch.lost(true, false, start + Duration::from_secs(10), grace));
+        assert!(watch.lost(true, false, start + Duration::from_secs(17), grace));
     }
 
     #[test]

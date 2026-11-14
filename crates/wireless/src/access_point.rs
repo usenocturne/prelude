@@ -12,7 +12,9 @@ use std::{
 
 use crate::{Error, Result, control::ControlSocket};
 
-const HOSTAPD_START_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest an access point start can take; the client-mode hand-off waits
+/// longer than this for the supervisor to park.
+pub const HOSTAPD_START_TIMEOUT: Duration = Duration::from_secs(15);
 pub const CHANNELS_2GHZ: [u8; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 pub const CHANNELS_5GHZ: [u8; 9] = [36, 40, 44, 48, 149, 153, 157, 161, 165];
 pub const FALLBACK_2GHZ_CHANNEL: u8 = 6;
