@@ -41,7 +41,7 @@ marker reset it.
 | 2 Signature rejection | Pass | Unsigned: `description file name not the first of the list ... sw-description.sig`. Other key: `EVP_DigestVerifyFinal failed`. Image altered: signature `Verified OK`, then `HASH mismatch`. Description altered: `EVP_DigestVerifyFinal failed`. `slot_active` unchanged each time. |
 | 3 Broken daemon fallback | Pass | Two normal boots of 1.0.6-test on slot a: watchdog at 300 s logged `slot a is on its update trial and preluded never became ready; rebooting`. U-Boot then booted b (`slot_active=b`, `slot_a_tries=0`); b reached ready and was marked healthy; pending marker removed. |
 | 4 Recovery not looped | Pass | 1.0.6-test booted with Back held: `/run/prelude/recovery-boot` present, watchdog logged `this boot stayed in USB recovery; leaving it alone`, no reboot after 330 s, ADB usable. |
-| 5 Identity preserved | Pass, partial | After moving from the CA build to the US-default bundle, `wireless-identity.toml` kept `country = "CA"` and the passphrase while `/etc/prelude/config-dev.toml` said `US`. A phone reconnect was not tested because the adapter could not host the 5 GHz access point. |
+| 5 Identity preserved | Pass | After moving from the CA build to the US-default bundle, `wireless-identity.toml` kept `country = "CA"` and the passphrase while `/etc/prelude/config-dev.toml` said `US`. Phone reconnect confirmed on 2026-11-14 (below). |
 | 6a Power cut during image write | Pass | Cut while `system.img` was streaming to root_b (log ends at `Installing STREAM system.img`). Booted slot a, `slot_active=a` unchanged, a marked healthy, stale pending marker removed. |
 | 6b Power cut at boot-environment commit | Not run | The window is a single small FAT write and cannot be hit by hand. Covered by the desk check above. |
 | 6c Power cut after install, before reboot | Pass | Install finished (34 s), power pulled, cold boot came up on the new slot a, reached ready and was marked healthy; pending marker removed. |
@@ -65,3 +65,21 @@ marker reset it.
    this adbd; use `adb shell systemctl reboot`.
 5. Unrelated to OTA: `/var/lib/prelude` accumulates `.daemon-heartbeat.*.tmp`
    files across boots.
+
+## Retest, 2026-11-14
+
+A TP-Link Nano AC600 (RTL8811AU, `rtw88_8821au`) replaced the 2.4 GHz-only
+adapter. It hosts the access point on both 2.4 and 5 GHz; DHCP and root SSH
+over Wi-Fi worked, so this round ran entirely over Wi-Fi.
+
+Bundle E, `prelude-update-prod` 1.0.7-test, adds the final-review fixes:
+non-trial boots are marked good after 60 s, the persisted wireless identity is
+validated, and swupdate is masked on keyless images.
+
+| Check | Result | Evidence |
+|---|---|---|
+| OTA over Wi-Fi | Pass | Copied with `scp`, installed to slot b with `swupdate -i`, `slot_active=b`, `slot_b_tries=3`. |
+| Trial boot gated on readiness | Pass | `preluded is ready` at 53 s, `slot b healthy, reset slot_b_tries=3`, pending marker removed. The 60 s time unit ran afterwards and changed nothing. |
+| Boot without preluded marked good by time | Pass | `preluded.service` masked on slot b and `slot_b_tries=2`. No preluded output in that boot; at 62 s `prelude-slot-ok-time.service` ran and logged `slot b healthy, reset slot_b_tries=3`. Before the fix this boot was never marked good. |
+| Fallback from a slot without preluded | Pass | preluded hosts the access point and UI, so that boot had no Wi-Fi. Three short boots exhausted `slot_b_tries` and U-Boot returned to slot a (1.0.5-test). preluded was unmasked on root_b from slot a. |
+| Phone reconnect after OTA | Pass | On 1.0.7-test, slot b, the paired phone reconnected without re-pairing. Pairing records and the CA identity carried over. |
