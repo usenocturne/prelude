@@ -49,6 +49,18 @@ impl WirelessIdentity {
             passphrase: config.passphrase.clone(),
         }
     }
+
+    /// Mirrors the access point's own validation so a bad value can never be
+    /// applied and stop the daemon at startup.
+    fn is_valid(&self) -> bool {
+        let country_ok =
+            self.country.len() == 2 && self.country.bytes().all(|byte| byte.is_ascii_uppercase());
+        let passphrase_ok = self.passphrase.as_ref().is_none_or(|passphrase| {
+            (8..=63).contains(&passphrase.len())
+                && passphrase.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        });
+        country_ok && passphrase_ok
+    }
 }
 
 /// Returns the persisted identity, seeding it from `config` on first use.
@@ -71,7 +83,11 @@ pub fn reconcile(config: &WirelessConfig, state_dir: &Path) -> WirelessIdentity 
                 .and_then(|input| {
                     toml::from_str::<WirelessIdentity>(&input).map_err(|error| error.to_string())
                 }) {
-                Ok(identity) => identity,
+                Ok(identity) if identity.is_valid() => identity,
+                Ok(_) => {
+                    warn!("persisted wireless identity has an invalid value; using configuration");
+                    WirelessIdentity::from_config(config)
+                }
                 Err(error) => {
                     warn!(%error, "persisted wireless identity is invalid; using configuration");
                     WirelessIdentity::from_config(config)
@@ -80,6 +96,10 @@ pub fn reconcile(config: &WirelessConfig, state_dir: &Path) -> WirelessIdentity 
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let identity = WirelessIdentity::from_config(config);
+            if !identity.is_valid() {
+                warn!("configured wireless identity is invalid; not persisting it");
+                return identity;
+            }
             if let Err(error) = persist(&identity, state_dir) {
                 warn!(%error, "could not persist wireless identity");
             }
@@ -197,6 +217,46 @@ mod tests {
         assert_eq!(identity.country, "CA");
         assert_eq!(identity.passphrase.as_deref(), Some("fallback-pass"));
         assert_eq!(fs::read_to_string(&path).expect("identity"), "not = [valid");
+    }
+
+    fn write_identity(state: &Path, contents: &str) {
+        let path = state.join(IDENTITY_FILE);
+        fs::write(&path, contents).expect("write identity");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("identity mode");
+    }
+
+    #[test]
+    fn parseable_invalid_identity_falls_back() {
+        for contents in [
+            "country = \"ca\"\n",
+            "country = \"\"\n",
+            "country = \"CAN\"\n",
+            "country = \"CA\"\npassphrase = \"short\"\n",
+            "country = \"CA\"\npassphrase = \"bad\\u0001passphrase\"\n",
+        ] {
+            let state = tempfile::tempdir().expect("temporary state directory");
+            write_identity(state.path(), contents);
+
+            let identity = reconcile(&config("US", None), state.path());
+            assert_eq!(identity.country, "US", "{contents:?}");
+            assert_eq!(identity.passphrase, None, "{contents:?}");
+            assert_eq!(
+                fs::read_to_string(state.path().join(IDENTITY_FILE)).expect("identity kept"),
+                contents,
+                "invalid state must not be overwritten"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_config_is_not_seeded() {
+        let state = tempfile::tempdir().expect("temporary state directory");
+        reconcile(&config("us", None), state.path());
+        assert!(!state.path().join(IDENTITY_FILE).exists());
+
+        let identity = reconcile(&config("US", None), state.path());
+        assert_eq!(identity.country, "US");
+        assert!(state.path().join(IDENTITY_FILE).is_file());
     }
 
     #[test]
