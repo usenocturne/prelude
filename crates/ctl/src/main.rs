@@ -15,7 +15,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use platform_superbird::{
     AudioRoutePreference, HeartbeatStamp, HeartbeatStampError, HostBootOutcome, Max20332Error,
     Max20332RegisterSnapshot, PlatformPaths, ProcessRoleCommand, UsbRole, UsbRoleManager,
-    UsbRoleTransaction, apply_initial_backlight, process_output_with_timeout,
+    UsbRoleTransaction, apply_initial_backlight, apply_manual_backlight,
+    process_output_with_timeout,
 };
 #[cfg(target_os = "linux")]
 use platform_superbird::{GpioKey, LinuxGpioKeyReader, LinuxInputConfig};
@@ -479,12 +480,21 @@ fn initial_backlight(config_path: &Path) -> Result<()> {
     let config = DaemonConfig::load(config_path)?;
     let defaults = RuntimeSettings::from_config(&config);
     let settings = RuntimeSettings::load(&config.state_dir, defaults).unwrap_or(defaults);
-    let ambient = &config.platform.ambient_light;
-    if !ambient.enabled || !settings.auto_brightness {
-        println!("automatic brightness is off; leaving the backlight unchanged");
+    let mut ambient = config.platform.ambient_light.clone();
+    if !ambient.enabled {
+        println!("backlight control is off; leaving the backlight unchanged");
         return Ok(());
     }
-    let applied = apply_initial_backlight(ambient, INITIAL_BACKLIGHT_TIMEOUT)?;
+    if !settings.auto_brightness {
+        ambient.brightness_percent = settings.brightness_percent;
+        let applied = apply_manual_backlight(&ambient, INITIAL_BACKLIGHT_TIMEOUT)?;
+        println!(
+            "backlight set to {}/{} for manual brightness {}%",
+            applied.brightness, applied.max_brightness, ambient.brightness_percent
+        );
+        return Ok(());
+    }
+    let applied = apply_initial_backlight(&ambient, INITIAL_BACKLIGHT_TIMEOUT)?;
     println!(
         "backlight set to {}/{} for ambient light {}",
         applied.brightness, applied.max_brightness, applied.raw

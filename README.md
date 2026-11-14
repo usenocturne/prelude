@@ -93,6 +93,12 @@ Prelude supports both wired and wireless connections.
 
 Open **Settings → Preset buttons** to choose what each of the four top buttons does, numbered left to right. The options are previous track, play/pause, next track, mute, home, back, voice assistant (Siri or Google Assistant), answer call, end call, or nothing. Every option works on both CarPlay and Android Auto. The new mapping applies as soon as settings close.
 
+To stop the four buttons from doing anything, turn off the **Preset buttons** switch at the top of that page. Your assignments are kept for when you turn it back on.
+
+### Brightness
+
+Turn off **Settings → Auto brightness** to set the screen brightness yourself with the **Brightness** slider that appears below it. The level is kept across restarts.
+
 ### Equalizer
 
 Open **Settings → Equalizer** to adjust the ten bands (31.25 Hz to 16 kHz) and preamp.
