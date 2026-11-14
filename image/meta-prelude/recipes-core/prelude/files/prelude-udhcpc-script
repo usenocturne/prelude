@@ -27,8 +27,12 @@ case "${1:-}" in
         clear_lease
         ;;
     bound|renew)
-        ip addr flush dev "$iface"
-        ip addr add "${ip}/${mask}" dev "$iface"
+        # A renewal that keeps the address must not drop it: that would cut
+        # open connections, such as an update download, every renewal.
+        if [ "$1" = bound ] || ! ip -4 addr show dev "$iface" | grep -qF " ${ip}/${mask} "; then
+            ip addr flush dev "$iface"
+            ip addr add "${ip}/${mask}" dev "$iface"
+        fi
         gateway=""
         for candidate in ${router:-}; do
             gateway=$candidate

@@ -12,6 +12,9 @@ for tool in ip resolvectl; do
     cat > "$test_dir/bin/$tool" <<FAKE
 #!/bin/sh
 echo "$tool \$*" >> "\$CT_TEST_LOG"
+if [ "$tool \$*" = "ip -4 addr show dev wlan0" ]; then
+    printf '%s\n' "\${CT_CURRENT_ADDR:-}"
+fi
 FAKE
     chmod +x "$test_dir/bin/$tool"
 done
@@ -65,6 +68,17 @@ expect_full_lease bound_applies_lease
 reset; full_lease
 "$hook" renew
 expect_full_lease renew_reapplies
+
+# renew_keeps_unchanged_address: a renewal with the same address must not
+# drop it, or every renewal interrupts open connections (downloads).
+reset; full_lease
+export CT_CURRENT_ADDR="    inet 192.168.1.23/24 brd 192.168.1.255 scope global wlan0"
+"$hook" renew
+not_logged renew_keeps_unchanged_address "ip addr flush"
+not_logged renew_keeps_unchanged_address "ip addr add"
+logged renew_keeps_unchanged_address "ip route replace default via 192.168.1.1 dev wlan0"
+logged renew_keeps_unchanged_address "resolvectl dns wlan0 1.1.1.1 8.8.8.8"
+unset CT_CURRENT_ADDR
 
 # deconfig_clears
 reset; printf 'address=x\n' > "$lease"
