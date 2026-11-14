@@ -36,6 +36,11 @@ prelude_write_ota_markers() {
     rm -f "${IMAGE_ROOTFS}${sysconfdir}/prelude/ota-disabled"
     if [ "${PRELUDE_OTA_ENABLED}" != "1" ] || [ -z "${PRELUDE_OTA_PUBLIC_KEY}" ]; then
         : > "${IMAGE_ROOTFS}${sysconfdir}/prelude/ota-disabled"
+        # swupdate requires a public key once signing is enabled; without one it
+        # would fail to start on every boot.
+        install -d "${IMAGE_ROOTFS}${sysconfdir}/systemd/system"
+        ln -sf /dev/null "${IMAGE_ROOTFS}${sysconfdir}/systemd/system/swupdate.service"
+        ln -sf /dev/null "${IMAGE_ROOTFS}${sysconfdir}/systemd/system/swupdate.socket"
     fi
 }
 ROOTFS_POSTPROCESS_COMMAND += "prelude_write_ota_markers; "

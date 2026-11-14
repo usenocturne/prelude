@@ -847,6 +847,11 @@ if 'PRELUDE_OTA_ENABLED = "0"' not in text(
     "meta-prelude/recipes-core/images/prelude-usb-host-test-image.bb"
 ):
     fail("the USB host test image must never accept OTA updates")
+# swupdate is built with CONFIG_SIGNED_IMAGES and cannot start without a key, so
+# images with OTA disabled must not try to start it on every boot.
+for unit in ("swupdate.service", "swupdate.socket"):
+    if f'ln -sf /dev/null "${{IMAGE_ROOTFS}}${{sysconfdir}}/systemd/system/{unit}"' not in image_base:
+        fail(f"images with OTA disabled must mask {unit}")
 if "prelude_write_ota_markers" not in image_base or "ota-disabled" not in image_base:
     fail("images do not write the flavour and OTA availability markers")
 
