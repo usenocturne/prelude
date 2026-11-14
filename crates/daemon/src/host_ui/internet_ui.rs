@@ -254,7 +254,16 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 let (summary, color) = match &self.internet_state {
                     InternetState::Online { .. } => ("Online".to_owned(), GREEN),
                     InternetState::Failed(error) => (error.message().to_owned(), SECONDARY),
-                    _ => ("Off".to_owned(), SECONDARY),
+                    // "Off" read as "Wi-Fi is broken"; name the network instead.
+                    _ => (
+                        saved_networks::load(&self.state_dir).first().map_or_else(
+                            || "Not connected".to_owned(),
+                            |saved| {
+                                format!("{} · not connected", String::from_utf8_lossy(&saved.ssid))
+                            },
+                        ),
+                        SECONDARY,
+                    ),
                 };
                 RowView::new("Internet", Trailing::Link(summary, color))
             }

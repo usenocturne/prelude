@@ -2467,6 +2467,31 @@ mod tests {
     }
 
     #[test]
+    fn internet_row_names_the_network_instead_of_off() {
+        let mut harness = Harness::new().with_internet();
+        let summary = |harness: &Harness| trailing_value(&harness.ui.row_view(Item::Internet));
+        assert_eq!(summary(&harness), "Not connected");
+        crate::saved_networks::remember(
+            &harness.ui.state_dir,
+            crate::saved_networks::SavedNetwork {
+                ssid: b"Vegasector".to_vec(),
+                psk: None,
+            },
+        )
+        .expect("remember");
+        assert_eq!(summary(&harness), "Vegasector · not connected");
+        harness.set_internet(InternetState::Online {
+            route: Route::Wifi {
+                ssid: "Vegasector".to_owned(),
+            },
+            address: "10.10.0.200".to_owned(),
+        });
+        assert_eq!(summary(&harness), "Online");
+        harness.set_internet(InternetState::Failed(InternetError::WrongPassword));
+        assert_eq!(summary(&harness), "Wrong password");
+    }
+
+    #[test]
     fn internet_row_sits_between_wifi_and_support() {
         let harness = Harness::new().with_internet();
         let items: Vec<Item> = harness
