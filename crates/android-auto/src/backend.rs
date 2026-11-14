@@ -1,4 +1,4 @@
-use std::{fmt::Debug, time::Duration};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use crate::{
     ConfigurationDescriptor, EndpointDescriptor, InterfaceDescriptor, Result, TransferKind,
@@ -76,8 +76,8 @@ pub trait UsbBackend: Debug + Send {
 #[derive(Debug, Default)]
 pub struct RusbBackend;
 
-#[derive(Debug)]
-pub struct RusbHandle(rusb::DeviceHandle<rusb::GlobalContext>);
+#[derive(Debug, Clone)]
+pub struct RusbHandle(Arc<rusb::DeviceHandle<rusb::GlobalContext>>);
 
 impl UsbBackend for RusbBackend {
     type Handle = RusbHandle;
@@ -179,7 +179,7 @@ impl UsbBackend for RusbBackend {
             {
                 return Err(rusb::Error::NoDevice);
             }
-            return device.open().map(RusbHandle);
+            return device.open().map(|handle| RusbHandle(Arc::new(handle)));
         }
         Err(rusb::Error::NoDevice)
     }

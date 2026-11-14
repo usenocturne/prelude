@@ -4,6 +4,9 @@ use crate::{
     ProjectionDevice, ProjectionDeviceDiscovery, ProjectionMode, Result, VideoBackend,
 };
 use prelude_control::{ImplementationStatus, ProjectionCapabilities};
+use std::time::{Duration, Instant};
+
+const USB_RESTART_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeProbe {
@@ -92,6 +95,7 @@ pub struct Daemon<D, P> {
     projection: P,
     devices: Vec<ProjectionDevice>,
     usb_session: bool,
+    usb_restart_until: Option<Instant>,
     health: HealthRegistry,
     diagnostics: Diagnostics,
     heartbeat: HeartbeatWriter,
@@ -112,6 +116,7 @@ impl<D: ProjectionDeviceDiscovery, P: ProjectionRuntime> Daemon<D, P> {
             projection,
             devices: Vec::new(),
             usb_session: false,
+            usb_restart_until: None,
             health: HealthRegistry::default(),
             diagnostics: Diagnostics::new(256),
             heartbeat,
@@ -123,7 +128,14 @@ impl<D: ProjectionDeviceDiscovery, P: ProjectionRuntime> Daemon<D, P> {
         let projection_required = self.config.projection.mode != ProjectionMode::Disabled;
         match self.discovery.scan() {
             Ok(mut devices) => {
-                self.usb_session = self.projection.holds_usb_session();
+                let holds_usb_session = self.projection.holds_usb_session();
+                if holds_usb_session {
+                    self.usb_restart_until = None;
+                }
+                self.usb_session = holds_usb_session
+                    || self
+                        .usb_restart_until
+                        .is_some_and(|until| Instant::now() < until);
                 if self.usb_session {
                     devices.retain(|device| !device.is_wireless());
                 }
@@ -332,6 +344,7 @@ impl<D: ProjectionDeviceDiscovery, P: ProjectionRuntime> Daemon<D, P> {
         if self.devices.iter().any(|device| !device.is_wireless()) {
             self.devices.clear();
             self.usb_session = false;
+            self.usb_restart_until = None;
             self.stop()?;
         }
         Ok(())
@@ -383,6 +396,11 @@ impl<D: ProjectionDeviceDiscovery, P: ProjectionRuntime> Daemon<D, P> {
         }
         self.config = config;
         self.projection = projection;
+        self.devices
+            .retain(|device| !matches!(device, ProjectionDevice::AndroidAuto(_)));
+        if self.usb_session {
+            self.usb_restart_until = Some(Instant::now() + USB_RESTART_GRACE);
+        }
         Ok(())
     }
 
@@ -808,6 +826,79 @@ mod tests {
         daemon.poll().expect("poll");
         assert!(daemon.projecting_over_usb());
         assert!(!daemon.has_wireless_phone());
+    }
+
+    #[derive(Debug)]
+    struct SwitchableUsbRuntime(Arc<AtomicBool>);
+
+    impl ProjectionRuntime for SwitchableUsbRuntime {
+        fn probe(&mut self) -> RuntimeProbe {
+            UnsupportedProjectionRuntime.probe()
+        }
+
+        fn start(&mut self, _device: &ProjectionDevice) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn holds_usb_session(&mut self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn android_auto_candidate() -> ProjectionDevice {
+        ProjectionDevice::AndroidAuto(prelude_android_auto::AoapCandidate {
+            device: prelude_android_auto::UsbDeviceSnapshot {
+                topology: prelude_android_auto::UsbTopology {
+                    bus: 1,
+                    port_path: vec![1],
+                },
+                address: 3,
+                vendor_id: 0x18d1,
+                product_id: 0x2d00,
+                device_class: 0,
+                active_configuration: Some(1),
+                configurations: Vec::new(),
+            },
+            mode: prelude_android_auto::AoapMode::Accessory,
+        })
+    }
+
+    #[test]
+    fn runtime_replacement_keeps_the_usb_claim_while_the_wired_session_restarts() {
+        let (_state_directory, config) = test_config();
+        let holds = Arc::new(AtomicBool::new(true));
+        let mut daemon = Daemon::new(
+            config.clone(),
+            FixedDiscovery(vec![android_auto_candidate()]),
+            SwitchableUsbRuntime(Arc::clone(&holds)),
+        )
+        .expect("daemon");
+        daemon.poll().expect("poll");
+        assert!(daemon.projecting_over_usb());
+        assert!(daemon.has_discovered_phone());
+
+        let restarted = Arc::new(AtomicBool::new(false));
+        daemon
+            .replace_projection_runtime(config, SwitchableUsbRuntime(Arc::clone(&restarted)))
+            .expect("replace runtime");
+        assert!(!daemon.has_discovered_phone());
+        assert!(daemon.projecting_over_usb());
+        daemon.poll().expect("poll");
+        assert!(daemon.projecting_over_usb());
+
+        restarted.store(true, Ordering::SeqCst);
+        daemon.poll().expect("poll");
+        assert!(daemon.projecting_over_usb());
+        assert_eq!(daemon.usb_restart_until, None);
+
+        restarted.store(false, Ordering::SeqCst);
+        daemon.usb_restart_until = Some(Instant::now());
+        daemon.poll().expect("poll");
+        assert!(!daemon.projecting_over_usb());
     }
 
     #[derive(Debug)]

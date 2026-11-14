@@ -4,6 +4,7 @@ mod audio;
 mod audio_wire;
 mod backend_plan;
 mod backpressure;
+mod decoder_flush;
 mod device_discovery;
 #[cfg(all(target_os = "linux", feature = "linux-backend"))]
 mod display_runtime;
@@ -20,6 +21,7 @@ mod screen_wire;
 mod session;
 mod timing_wire;
 mod video;
+mod video_latency;
 #[cfg(all(target_os = "linux", feature = "linux-backend"))]
 mod wayland_presenter;
 mod wire_crypto;
@@ -90,3 +92,4 @@ pub use video::{
     DecodedVideoFrame, EncodedVideoFrame, H264AccessUnit, UnsupportedVideoDecoder,
     UnsupportedVideoRenderer, VideoDecoder, VideoFormat, VideoRenderer,
 };
+pub use video_latency::{DecodedFrame, DurationStats, VideoLatencyProbe, VideoLatencyWindow};

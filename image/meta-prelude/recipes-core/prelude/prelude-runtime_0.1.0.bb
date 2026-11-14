@@ -8,6 +8,9 @@ require recipes-core/prelude-monorepo.inc
 SRC_URI += " \
     file://preluded.service \
     file://prelude-backlight.service \
+    file://99-zz-prelude-backlight.rules \
+    file://99-prelude-usb-power.rules \
+    file://mt76_usb.conf \
     file://prelude-usb-host.service \
     file://prelude-host-trial-next-boot.service \
     file://prelude-host-health.service \
@@ -83,6 +86,16 @@ do_install() {
     # level saved at the last clean shutdown (often the dark-cabin floor).
     install -d ${D}${sysconfdir}/systemd/system
     ln -sf /dev/null ${D}${sysconfdir}/systemd/system/systemd-backlight@backlight:backlight.service
+    # Sort after 99-systemd.rules so ALS brightness CHANGE uevents do not enqueue
+    # the masked systemd-backlight unit (and fill the journal).
+    install -d ${D}${sysconfdir}/udev/rules.d
+    install -m 0644 ${UNPACKDIR}/99-zz-prelude-backlight.rules \
+        ${D}${sysconfdir}/udev/rules.d/
+    install -m 0644 ${UNPACKDIR}/99-prelude-usb-power.rules \
+        ${D}${sysconfdir}/udev/rules.d/
+    install -d ${D}${sysconfdir}/modprobe.d
+    install -m 0644 ${UNPACKDIR}/mt76_usb.conf \
+        ${D}${sysconfdir}/modprobe.d/
     install -m 0644 ${UNPACKDIR}/prelude-usb-host.service ${D}${systemd_system_unitdir}/
     install -m 0644 ${UNPACKDIR}/prelude-host-trial-next-boot.service ${D}${systemd_system_unitdir}/
     install -m 0644 ${UNPACKDIR}/prelude-host-health.service ${D}${systemd_system_unitdir}/
@@ -172,6 +185,7 @@ SUMMARY:${PN}-dev-config = "Experimental projection configuration and provisioni
 # according to the image policy. The tmpfiles fragment is runtime configuration.
 FILES:${PN}:append = " \
     ${sysconfdir}/systemd/system/systemd-backlight@backlight:backlight.service \
+    ${sysconfdir}/udev/rules.d/99-zz-prelude-backlight.rules \
     ${nonarch_libdir}/tmpfiles.d/prelude.conf \
     ${datadir}/prelude/*.nv12 \
     ${systemd_system_unitdir}/preluded.service.d/30-wireless.conf \

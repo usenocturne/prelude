@@ -21,7 +21,8 @@ use platform_superbird::{
 };
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 use prelude_android_auto::{
-    AccessoryIdentity, AoapCandidate, AoapTimeouts, RusbBackend, open_accessory,
+    AccessoryIdentity, AoapCandidate, AoapTimeouts, RusbBackend, RusbHandle, UsbAoapTransport,
+    open_accessory,
 };
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 use prelude_android_auto_protocol::{
@@ -56,6 +57,11 @@ use prelude_media::{
     VideoSynchronizationTelemetry, VideoSynchronizationTelemetrySnapshot,
 };
 
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+use crate::android_auto_latency::{
+    ConnectionState, LoopWindow, SecondCounts, TcpCounters, TcpRecoveryCounters,
+    VideoArrivalWindow, render_list,
+};
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 use crate::first_video::{FirstVideoAction, FirstVideoWatchdog};
 use crate::hands_free::HandsFree;
@@ -97,6 +103,8 @@ pub const MAX_ANDROID_AUTO_WORKER_STOP_WAIT: Duration = Duration::from_secs(5);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(10);
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 const VIDEO_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+const TRANSPORT_OR_INPUT_WAIT: Duration = Duration::from_millis(10);
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 const WIRELESS_PING_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -625,11 +633,16 @@ impl ProjectionRuntime for AndroidAutoRuntime {
             let transport = match device {
                 ProjectionDevice::AndroidAuto(candidate) => WorkerTransport::Usb(candidate.clone()),
                 ProjectionDevice::WirelessAndroidAuto(phone) => {
+                    let peer = phone.peer().to_owned();
                     let (stream, lease) = phone.claim().ok_or(Error::NotReady {
                         component: "wireless Android Auto phone",
                         state: "connection_already_claimed",
                     })?;
-                    WorkerTransport::Wireless { stream, lease }
+                    WorkerTransport::Wireless {
+                        stream,
+                        lease,
+                        peer,
+                    }
                 }
                 ProjectionDevice::CarPlay(_) | ProjectionDevice::WirelessCarPlay(_) => {
                     return Err(Error::Unsupported(
@@ -792,8 +805,12 @@ impl Drop for AndroidAutoRuntime {
     }
 }
 
+fn option_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |count| count.to_string())
+}
+
 fn idle_probe(failure: Option<&RuntimeFailure>, retry: &RetrySchedule) -> RuntimeProbe {
-    let (state, detail) = if let Some(failure) = failure {
+    let (state, transport_detail) = if let Some(failure) = failure {
         (HealthState::Failed, failure.detail.clone())
     } else if let Some(remaining) = retry.remaining(Instant::now()) {
         (
@@ -809,11 +826,17 @@ fn idle_probe(failure: Option<&RuntimeFailure>, retry: &RetrySchedule) -> Runtim
             "Android Auto is waiting for a positively identified Android phone".to_owned(),
         )
     };
+    let detail = if matches!(state, HealthState::Failed) {
+        transport_detail.clone()
+    } else {
+        "Android Auto is fail-closed until authenticated AAP and every configured media backend are live"
+            .to_owned()
+    };
     RuntimeProbe {
         state,
-        detail: "Android Auto is fail-closed until AOAP, authenticated AAP, and every configured media backend are live".to_owned(),
+        detail,
         transport_state: state,
-        transport_detail: detail,
+        transport_detail,
         link_state: HealthState::NotReady,
         link_detail: "Android Auto Protocol is not connected".to_owned(),
         control_state: HealthState::NotReady,
@@ -1048,25 +1071,64 @@ impl H264Adapter {
         annex_b: &[u8],
     ) -> std::result::Result<AdaptedVideo, String> {
         let units = annex_b_units(annex_b)?;
+        let mut rewritten_units: Vec<Vec<u8>> = Vec::with_capacity(units.len());
         let mut parameter_sets_changed = false;
         for unit in &units {
-            match unit.first().map(|byte| byte & 0x1f) {
-                Some(7) if self.sps.as_deref() != Some(*unit) => {
-                    self.sps = Some((*unit).to_vec());
+            let owned = match unit.first().map(|byte| byte & 0x1f) {
+                Some(7) => match crate::h264_sps::force_low_latency_sps(unit) {
+                    Ok(rewritten) => {
+                        if self.sps.as_deref() != Some(rewritten.as_slice()) {
+                            tracing::info!(
+                                original_bytes = unit.len(),
+                                rewritten_bytes = rewritten.len(),
+                                forced_max_num_reorder_frames = 0u8,
+                                forced_max_dec_frame_buffering = 1u8,
+                                original = %crate::android_auto_latency::hexadecimal(unit),
+                                rewritten = %crate::android_auto_latency::hexadecimal(&rewritten),
+                                previous = %self
+                                    .sps
+                                    .as_deref()
+                                    .map(crate::android_auto_latency::hexadecimal)
+                                    .unwrap_or_default(),
+                                "rewrote Android Auto SPS for low-latency VDEC bitstream restrictions"
+                            );
+                        }
+                        rewritten
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "keeping original Android Auto SPS; low-latency rewrite failed"
+                        );
+                        unit.to_vec()
+                    }
+                },
+                _ => unit.to_vec(),
+            };
+            match owned.first().map(|byte| byte & 0x1f) {
+                Some(7) if self.sps.as_deref() != Some(owned.as_slice()) => {
+                    self.sps = Some(owned.clone());
                     parameter_sets_changed = true;
                 }
-                Some(8) if self.pps.as_deref() != Some(*unit) => {
-                    self.pps = Some((*unit).to_vec());
+                Some(8) if self.pps.as_deref() != Some(owned.as_slice()) => {
+                    self.pps = Some(owned.clone());
                     parameter_sets_changed = true;
                 }
                 Some(_) | None => {}
             }
+            rewritten_units.push(owned);
         }
 
         let configuration = if parameter_sets_changed || self.configuration.is_none() {
             match (&self.sps, &self.pps) {
                 (Some(sps), Some(pps)) => {
                     let configuration = h264_avcc(sps, pps)?;
+                    tracing::info!(
+                        sps = %crate::android_auto_latency::hexadecimal(sps),
+                        pps = %crate::android_auto_latency::hexadecimal(pps),
+                        replaces_active_configuration = self.configuration.is_some(),
+                        "Android Auto H.264 parameter sets changed"
+                    );
                     self.configuration = Some(configuration.clone());
                     Some(configuration)
                 }
@@ -1076,14 +1138,14 @@ impl H264Adapter {
             None
         };
 
-        let has_picture = units.iter().any(|unit| {
+        let has_picture = rewritten_units.iter().any(|unit| {
             unit.first()
                 .is_some_and(|byte| matches!(byte & 0x1f, 1..=5))
         });
         let frame = if has_picture && self.configuration.is_some() {
             let mut data = Vec::with_capacity(annex_b.len());
-            let mut descriptors = Vec::with_capacity(units.len());
-            for unit in units {
+            let mut descriptors = Vec::with_capacity(rewritten_units.len());
+            for unit in &rewritten_units {
                 let length = u32::try_from(unit.len())
                     .map_err(|_| "H.264 NAL unit exceeds the 32-bit AVCC bound".to_owned())?;
                 data.extend_from_slice(&length.to_be_bytes());
@@ -1524,6 +1586,14 @@ fn apply_local_mute(
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
+fn android_auto_video_config() -> LinuxVideoBackendConfig {
+    LinuxVideoBackendConfig {
+        low_latency: true,
+        ..LinuxVideoBackendConfig::default()
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
 struct LiveMedia {
     video: Option<LinuxVideoBackend>,
     video_configuration: Option<VideoCodecConfiguration>,
@@ -1547,6 +1617,19 @@ struct LiveMedia {
     audio_diagnostic_started: Instant,
     media_busy: Duration,
     media_busy_max: Duration,
+    last_media_busy_max: Duration,
+    video_arrivals: VideoArrivalWindow,
+    loop_window: LoopWindow,
+    next_latency_diagnostic: Instant,
+    tcp_counters: Option<TcpCounters>,
+    input_waits_with_transport: bool,
+    tcp_recovery: Option<TcpRecoveryCounters>,
+    tcp_seconds: SecondCounts,
+    radio_peer: Option<String>,
+    radio_station: Option<(String, String)>,
+    radio_report: Option<thread::JoinHandle<()>>,
+    last_radio_report: Option<Instant>,
+    link_ports: Option<(u16, u16)>,
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
@@ -1589,7 +1672,7 @@ impl LiveMedia {
                     .to_owned(),
             );
         }
-        let video_config = LinuxVideoBackendConfig::default();
+        let video_config = android_auto_video_config();
         LinuxVideoBackend::preflight_with_display(video_config, display.as_ref())
             .map_err(|error| format!("Android Auto video preflight failed: {error}"))?;
         let streams = [
@@ -1682,7 +1765,30 @@ impl LiveMedia {
             audio_diagnostic_started: Instant::now(),
             media_busy: Duration::ZERO,
             media_busy_max: Duration::ZERO,
+            last_media_busy_max: Duration::ZERO,
+            video_arrivals: VideoArrivalWindow::default(),
+            loop_window: LoopWindow::default(),
+            next_latency_diagnostic: Instant::now() + VIDEO_DIAGNOSTIC_INTERVAL,
+            tcp_counters: TcpCounters::read(),
+            input_waits_with_transport: false,
+            tcp_recovery: TcpRecoveryCounters::read(),
+            tcp_seconds: SecondCounts::default(),
+            radio_peer: None,
+            radio_station: None,
+            radio_report: None,
+            last_radio_report: None,
+            link_ports: None,
         })
+    }
+
+    fn wait_for_transport_or_input(
+        &mut self,
+        transport: &TransportReadiness,
+    ) -> std::result::Result<bool, String> {
+        use std::os::fd::AsFd;
+        self.input
+            .wait_with(transport.as_fd(), TRANSPORT_OR_INPUT_WAIT)
+            .map_err(|error| format!("waiting for Android Auto input or the phone failed: {error}"))
     }
 
     fn handle_event<T: std::io::Read + std::io::Write + Send>(
@@ -1734,7 +1840,16 @@ impl LiveMedia {
         annex_b: &[u8],
         session: &mut Session<T>,
     ) -> std::result::Result<(), String> {
-        let adapted = self.video_adapter.adapt(timestamp, annex_b)?;
+        let arrived_at = Instant::now();
+        self.video_arrivals
+            .record(arrived_at, timestamp, annex_b.len());
+        let timestamp_ns = timestamp.map(|micros| micros.saturating_mul(1_000));
+        let adapted = self.video_adapter.adapt(timestamp_ns, annex_b)?;
+        if let Some(frame) = adapted.frame.as_ref() {
+            self.video_telemetry
+                .latency()
+                .record_arrival(frame.nonce_counter, arrived_at);
+        }
         if let Some(configuration) = adapted.configuration {
             if let Some(video) = self.video.as_ref() {
                 video
@@ -1745,7 +1860,7 @@ impl LiveMedia {
             } else {
                 self.video = Some(
                     LinuxVideoBackend::start_with_display(
-                        LinuxVideoBackendConfig::default(),
+                        android_auto_video_config(),
                         configuration.clone(),
                         self.video_telemetry.clone(),
                         self.display.clone(),
@@ -1954,10 +2069,24 @@ impl LiveMedia {
             }
         }
 
-        let batch = self
-            .input
-            .poll()
-            .map_err(|error| format!("polling Android Auto input failed: {error}"))?;
+        let input_poll_started = Instant::now();
+        if self.tcp_seconds.due(input_poll_started)
+            && let Some(counters) = TcpCounters::read()
+        {
+            let connection = self
+                .link_ports
+                .and_then(|(local, remote)| ConnectionState::read(local, remote));
+            self.tcp_seconds
+                .record(input_poll_started, counters, connection);
+        }
+        let batch = if self.input_waits_with_transport {
+            self.input.poll_ready()
+        } else {
+            self.input.poll()
+        }
+        .map_err(|error| format!("polling Android Auto input failed: {error}"))?;
+        self.loop_window
+            .record_input_wait(input_poll_started.elapsed());
         for event in &batch.events {
             self.last_input_timestamp = self.last_input_timestamp.max(event.timestamp.0);
         }
@@ -2165,8 +2294,263 @@ impl LiveMedia {
         self.poll_call();
         self.log_audio_diagnostic();
         self.log_video_diagnostic();
+        self.log_latency_diagnostic(session);
         self.refresh_status();
         Ok(())
+    }
+
+    fn report_radio(&mut self) {
+        if self
+            .radio_report
+            .as_ref()
+            .is_some_and(|report| !report.is_finished())
+        {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_radio_report
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(60))
+        {
+            return;
+        }
+        self.last_radio_report = Some(now);
+        let first_report = self.radio_station.is_none();
+        if first_report {
+            self.radio_station = self.radio_peer.as_deref().and_then(|peer| {
+                let address = peer
+                    .rsplit_once(':')
+                    .map_or(peer, |(host, _)| host)
+                    .parse()
+                    .ok()?;
+                let interface = prelude_wireless::access_point::detect_interface()?;
+                let station = prelude_wireless::access_point::station_for(&interface, address)?;
+                Some((interface, station))
+            });
+        }
+        let Some((interface, station)) = self.radio_station.clone() else {
+            return;
+        };
+        self.radio_report = thread::Builder::new()
+            .name("aa-radio-report".to_owned())
+            .spawn(move || {
+                use prelude_wireless::access_point::{
+                    radio_debug_names, radio_debug_summary, station_link_summary,
+                };
+                if first_report {
+                    tracing::info!(
+                        files = radio_debug_names(&interface, &station).as_deref(),
+                        "Android Auto latency diagnostic: radio debug files"
+                    );
+                }
+                tracing::info!(
+                    station = station_link_summary(&interface, &station).as_deref(),
+                    driver = radio_debug_summary(&interface, &station).as_deref(),
+                    "Android Auto latency diagnostic: radio"
+                );
+            })
+            .ok();
+    }
+
+    fn log_latency_diagnostic<T: std::io::Read + std::io::Write + Send>(
+        &mut self,
+        session: &mut Session<T>,
+    ) {
+        let now = Instant::now();
+        if now < self.next_latency_diagnostic {
+            return;
+        }
+        self.next_latency_diagnostic = now + VIDEO_DIAGNOSTIC_INTERVAL;
+        let millis = |micros: u64| micros as f64 / 1_000.0;
+        let optional_millis = |micros: Option<u64>| micros.map(millis);
+
+        let link = session.take_link_window();
+        let loop_window = mem::take(&mut self.loop_window);
+        let tcp_now = TcpCounters::read();
+        let tcp = tcp_now
+            .zip(self.tcp_counters)
+            .map(|(now, before)| now.since(before));
+        self.tcp_counters = tcp_now;
+        let recovery_now = TcpRecoveryCounters::read();
+        let recovery = recovery_now
+            .zip(self.tcp_recovery)
+            .map(|(now, before)| now.since(before));
+        self.tcp_recovery = recovery_now;
+        let seconds = self.tcp_seconds.take();
+        let samples = |count: u64| {
+            usize::try_from(count)
+                .unwrap_or(usize::MAX)
+                .min(prelude_android_auto_protocol::LINK_SAMPLES)
+        };
+        let ping_round_trips: Vec<String> = link.ping_round_trip_micros
+            [..samples(link.ping_round_trips)]
+            .iter()
+            .map(|micros| format!("{:.1}", millis(*micros)))
+            .collect();
+        let phone_ping_gaps = samples(link.phone_ping_gaps);
+        let phone_ping_arrival_gaps: Vec<String> = link.phone_ping_arrival_gap_micros
+            [..phone_ping_gaps]
+            .iter()
+            .map(|micros| format!("{:.1}", millis(*micros)))
+            .collect();
+        tracing::info!(
+            ping_round_trips_ms = %render_list(&ping_round_trips),
+            phone_pings = link.phone_pings,
+            phone_ping_arrival_gaps_ms = %render_list(&phone_ping_arrival_gaps),
+            phone_ping_timestamp_gaps = %render_list(&link.phone_ping_timestamp_gap[..phone_ping_gaps]),
+            tcp_received_by_second = %seconds.received,
+            tcp_retransmitted_by_second = %seconds.retransmitted,
+            tcp_retransmission_timeouts_ms_by_second = %seconds.retransmission_timeouts_ms,
+            tcp_unacknowledged_bytes_by_second = %seconds.unacknowledged_bytes,
+            tcp_backoffs_by_second = %seconds.backoffs,
+            tcp_timeouts = recovery.map(|tcp| tcp.timeouts),
+            tcp_loss_probes = recovery.map(|tcp| tcp.loss_probes),
+            tcp_fast_retransmits = recovery.map(|tcp| tcp.fast_retransmits),
+            tcp_needless_retransmits_reported =
+                recovery.map(|tcp| tcp.needless_retransmits_reported),
+            tcp_duplicates_received = recovery.map(|tcp| tcp.duplicates_received),
+            tcp_out_of_order_received = recovery.map(|tcp| tcp.out_of_order_received),
+            tcp_delayed_acknowledgements = recovery.map(|tcp| tcp.delayed_acknowledgements),
+            "Android Auto latency diagnostic: link detail"
+        );
+        if self.radio_peer.is_some()
+            && let Some((usb, examples)) = crate::usb_monitor::take_window()
+        {
+            use crate::usb_monitor::render_millis;
+
+            if let Some(examples) = examples {
+                tracing::info!(%examples, "Android Auto latency diagnostic: usb event examples");
+            }
+            tracing::info!(
+                events = usb.events,
+                unparsed = usb.unparsed,
+                refused = usb.refused,
+                out_submitted = usb.out_submitted,
+                out_completed = usb.out_completed,
+                out_failed = usb.out_failed,
+                out_bytes = usb.out_bytes,
+                out_latency_avg_ms = optional_millis(usb.out_latency_average()),
+                out_latency_max_ms = millis(usb.out_latency_maximum),
+                out_in_flight_max = usb.out_in_flight_maximum,
+                out_gap_max_ms = millis(usb.out_gap_maximum),
+                out_holds = usb.out_holds,
+                out_holds_ms = %render_millis(&usb.out_hold_samples),
+                out_resumed_after_control_ms = %render_millis(&usb.out_resumed_after_control),
+                in_completed = usb.in_completed,
+                in_failed = usb.in_failed,
+                in_bytes = usb.in_bytes,
+                in_gap_max_ms = millis(usb.in_gap_maximum),
+                in_pauses = usb.in_pauses,
+                in_resumed_after_control_ms = %render_millis(&usb.in_resumed_after_control),
+                control_transfers = usb.control_transfers,
+                control_failed = usb.control_failed,
+                control_latency_max_ms = millis(usb.control_latency_maximum),
+                control_bursts = usb.control_bursts,
+                control_burst_intervals_ms = %render_millis(&usb.control_burst_intervals),
+                control_burst_span_max_ms = millis(usb.control_burst_span_maximum),
+                failures = %usb.failures.join(", "),
+                endpoints = %usb.render_endpoints(),
+                "Android Auto latency diagnostic: usb"
+            );
+        }
+        self.report_radio();
+        tracing::info!(
+            loop_iterations = loop_window.iterations,
+            transport_wait_ms = loop_window.transport_wait.as_millis() as u64,
+            transport_wait_max_ms = loop_window.maximum_transport_wait.as_millis() as u64,
+            input_wait_ms = loop_window.input_wait.as_millis() as u64,
+            input_wait_max_ms = loop_window.maximum_input_wait.as_millis() as u64,
+            reads = link.reads,
+            read_bytes = link.read_bytes,
+            read_timeouts = link.read_timeouts,
+            pings_answered = link.ping_round_trips,
+            ping_min_ms = (link.ping_round_trips != 0).then(|| millis(link.ping_minimum_micros)),
+            ping_avg_ms = link
+                .ping_total_micros
+                .checked_div(link.ping_round_trips)
+                .map(millis),
+            ping_max_ms = (link.ping_round_trips != 0).then(|| millis(link.ping_maximum_micros)),
+            tcp_segments_received = tcp.map(|tcp| tcp.segments_received),
+            tcp_segments_sent = tcp.map(|tcp| tcp.segments_sent),
+            tcp_segments_retransmitted = tcp.map(|tcp| tcp.segments_retransmitted),
+            "Android Auto latency diagnostic: link"
+        );
+
+        let arrivals = self.video_arrivals;
+        self.video_arrivals.restart();
+        tracing::info!(
+            frames = arrivals.frames,
+            timestamped_frames = arrivals.timestamped_frames,
+            bytes = arrivals.bytes,
+            largest_frame_bytes = arrivals.largest_frame_bytes,
+            arrival_span_ms = arrivals.arrival_span().map(|span| span.as_millis() as u64),
+            phone_span_ms = optional_millis(arrivals.phone_span_micros()),
+            arrival_gap_max_ms = arrivals.maximum_arrival_gap.as_millis() as u64,
+            phone_gap_max_ms = millis(arrivals.maximum_phone_gap_micros),
+            arrival_gaps_ms = %arrivals.arrival_gaps.render(),
+            pauses = arrivals.pause_intervals.pauses,
+            resumption_intervals_ms = %arrivals.pause_intervals.render(),
+            phone_gaps_ms = %arrivals.phone_gaps.render(),
+            transit_delay_over_floor_min_ms = arrivals
+                .minimum_delay_over_floor_micros()
+                .map(|micros| micros as f64 / 1_000.0),
+            transit_delay_over_floor_max_ms = arrivals
+                .maximum_delay_over_floor_micros()
+                .map(|micros| micros as f64 / 1_000.0),
+            frames_assembled = link.video_frames,
+            reads_per_frame_avg = (link.video_frames != 0)
+                .then(|| link.video_reads_total as f64 / link.video_frames as f64),
+            reads_per_frame_max = link.video_reads_maximum,
+            assembly_avg_ms = link
+                .video_assembly_total_micros
+                .checked_div(link.video_frames)
+                .map(millis),
+            assembly_max_ms = millis(link.video_assembly_maximum_micros),
+            "Android Auto latency diagnostic: video arrival"
+        );
+
+        let pipeline = self.video_telemetry.latency().take_window(now);
+        let commit = self
+            .display
+            .as_ref()
+            .map(LinuxDisplayHandle::take_video_commit_stats)
+            .unwrap_or_default();
+        tracing::info!(
+            pushed_frames = pipeline.pushed_frames,
+            decoded_frames = pipeline.decoded_frames,
+            rendered_frames = pipeline.rendered_frames,
+            skipped_frames = pipeline.skipped_frames,
+            unmatched_outputs = pipeline.unmatched_outputs,
+            pipeline_restarts = pipeline.pipeline_restarts,
+            decoder_flush_pictures = pipeline.flush_pictures,
+            ingress_wait_avg_ms = optional_millis(pipeline.ingress_wait.average_micros()),
+            ingress_wait_max_ms = optional_millis(pipeline.ingress_wait.maximum()),
+            decode_min_ms = optional_millis(pipeline.decode.minimum()),
+            decode_avg_ms = optional_millis(pipeline.decode.average_micros()),
+            decode_max_ms = optional_millis(pipeline.decode.maximum()),
+            decoder_held_frames_min = pipeline.held_frames_minimum,
+            decoder_held_frames_max = pipeline.held_frames_maximum,
+            render_avg_ms = optional_millis(pipeline.render.average_micros()),
+            render_max_ms = optional_millis(pipeline.render.maximum()),
+            arrival_to_display_min_ms = optional_millis(pipeline.arrival_to_display.minimum()),
+            arrival_to_display_avg_ms =
+                optional_millis(pipeline.arrival_to_display.average_micros()),
+            arrival_to_display_max_ms = optional_millis(pipeline.arrival_to_display.maximum()),
+            display_commit_avg_ms = optional_millis(commit.average_micros()),
+            display_commit_max_ms = optional_millis(commit.maximum()),
+            in_flight_frames = pipeline.in_flight_frames,
+            oldest_in_flight_ms = optional_millis(pipeline.oldest_in_flight_micros),
+            "Android Auto latency diagnostic: video pipeline"
+        );
+
+        let touch = self.input.take_touch_wait();
+        tracing::info!(
+            raw_touch_events = touch.raw_events,
+            kernel_wait_avg_ms = touch.total_micros.checked_div(touch.raw_events).map(millis),
+            kernel_wait_max_ms = millis(touch.maximum_micros),
+            input_suppressed = self.input_suppressed,
+            "Android Auto latency diagnostic: touch"
+        );
     }
 
     fn poll_call(&mut self) {
@@ -2242,6 +2626,7 @@ impl LiveMedia {
         let busy = started.elapsed();
         self.media_busy += busy;
         self.media_busy_max = self.media_busy_max.max(busy);
+        self.last_media_busy_max = self.last_media_busy_max.max(busy);
     }
 
     fn log_audio_diagnostic(&mut self) {
@@ -2257,6 +2642,7 @@ impl LiveMedia {
             media_busy_max_ms = self.media_busy_max.as_millis() as u64,
             "Android Auto media loop diagnostic"
         );
+        self.last_media_busy_max = self.media_busy_max;
         self.media_busy = Duration::ZERO;
         self.media_busy_max = Duration::ZERO;
         for (ingress, (channel, sample_rate_hz, channels)) in self.audio_ingress.iter_mut().zip([
@@ -2281,6 +2667,27 @@ impl LiveMedia {
         }
     }
 
+    fn video_queue_depths(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let Some(video) = self.video.as_ref() else {
+            return (None, None, None);
+        };
+        let Ok(ingress) = video.ingress_stats() else {
+            return (None, None, None);
+        };
+        let presented_frames = self
+            .video_telemetry
+            .snapshot()
+            .ok()
+            .map(|snapshot| snapshot.presented_frames);
+        let queue_depth_cumulative =
+            presented_frames.map(|presented| ingress.queued_frames.saturating_sub(presented));
+        (
+            Some(ingress.queued_frames),
+            Some(ingress.live_depth),
+            queue_depth_cumulative,
+        )
+    }
+
     fn log_video_diagnostic(&mut self) {
         let now = Instant::now();
         if now < self.next_video_diagnostic {
@@ -2297,13 +2704,21 @@ impl LiveMedia {
             .ok()
             .map(|snapshot| snapshot.presented_frames);
         let progress = self.progress.lock().ok().map(|progress| *progress);
+        let queued_frames = ingress.map(|stats| stats.queued_frames);
+        let queue_depth_live = ingress.map(|stats| stats.live_depth);
+        let queue_depth_cumulative = match (queued_frames, presented_frames) {
+            (Some(queued), Some(presented)) => Some(queued.saturating_sub(presented)),
+            _ => None,
+        };
         tracing::info!(
             received_frames = progress.map(|progress| progress.video_frames),
             keyframe_requests = progress.map(|progress| progress.keyframe_requests),
-            queued_frames = ingress.map(|stats| stats.queued_frames),
+            queued_frames,
             replaced_frames = ingress.map(|stats| stats.replaced_frames),
             dropped_frames = ingress.map(|stats| stats.dropped_frames),
             presented_frames,
+            queue_depth_live,
+            queue_depth_cumulative,
             "Android Auto video diagnostic"
         );
     }
@@ -2458,6 +2873,7 @@ enum WorkerTransport {
     Wireless {
         stream: std::net::TcpStream,
         lease: crate::WirelessLease,
+        peer: String,
     },
 }
 
@@ -2475,6 +2891,35 @@ struct WorkerContext {
     ping_timeout: Duration,
     hands_free: Option<HandsFree>,
     presets: PresetBindings,
+    wireless_peer: Option<String>,
+    transport_readiness: Option<TransportReadiness>,
+}
+
+#[derive(Debug)]
+pub enum TransportReadiness {
+    Tcp(std::net::TcpStream),
+    #[cfg(target_os = "linux")]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl TransportReadiness {
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            Self::Tcp(stream) => stream.try_clone().map(Self::Tcp),
+            #[cfg(target_os = "linux")]
+            Self::Unix(stream) => stream.try_clone().map(Self::Unix),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::os::fd::AsFd for TransportReadiness {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        match self {
+            Self::Tcp(stream) => stream.as_fd(),
+            Self::Unix(stream) => stream.as_fd(),
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
@@ -2493,10 +2938,25 @@ fn run_worker(
     controls: Receiver<WorkerControl>,
     hands_free: Option<HandsFree>,
 ) -> std::result::Result<(), String> {
-    let ping_timeout = match &transport {
-        WorkerTransport::Usb(_) => Duration::from_millis(config.ping_timeout_ms),
-        WorkerTransport::Wireless { .. } => {
-            Duration::from_millis(config.ping_timeout_ms).max(WIRELESS_PING_TIMEOUT)
+    let wireless_peer = match &transport {
+        WorkerTransport::Usb(_) => None,
+        WorkerTransport::Wireless { peer, .. } => Some(peer.clone()),
+    };
+    let (ping_timeout, transport_readiness) = match &transport {
+        WorkerTransport::Usb(_) => (Duration::from_millis(config.ping_timeout_ms), None),
+        WorkerTransport::Wireless { stream, peer, .. } => {
+            let readiness = stream.try_clone().map(TransportReadiness::Tcp);
+            if let Err(error) = &readiness {
+                tracing::warn!(
+                    %peer,
+                    %error,
+                    "cannot watch the Android Auto socket for readiness; input and the phone will take turns waiting"
+                );
+            }
+            (
+                Duration::from_millis(config.ping_timeout_ms).max(WIRELESS_PING_TIMEOUT),
+                readiness.ok(),
+            )
         }
     };
     let context = WorkerContext {
@@ -2512,19 +2972,26 @@ fn run_worker(
         ping_timeout,
         hands_free,
         presets: platform.presets,
+        wireless_peer,
+        transport_readiness,
     };
     let result = match transport {
         WorkerTransport::Usb(candidate) => {
             run_usb_worker(&candidate, &context, &setup_cancellation)
         }
-        WorkerTransport::Wireless { stream, lease } => {
+        WorkerTransport::Wireless { stream, lease, .. } => {
             set_stage(&progress, WorkerStage::OpeningProtocol);
             let bluetooth_address = car_bluetooth_address(&context);
-            let result =
-                run_protocol(stream, &context, bluetooth_address).and_then(|(result, stream)| {
+            let readiness = context
+                .transport_readiness
+                .as_ref()
+                .and_then(|r| r.try_clone().ok());
+            let result = run_protocol(stream, &context, bluetooth_address, readiness).and_then(
+                |(result, stream)| {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     result
-                });
+                },
+            );
             if context.ended_by_phone.load(Ordering::Acquire) {
                 lease.ended_by_phone();
             }
@@ -2553,6 +3020,121 @@ fn car_bluetooth_address(context: &WorkerContext) -> Option<String> {
             hands_free
                 .wait_for_car_address(BLUETOOTH_READY_WAIT, || context.shutdown.is_requested())
         })
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+const USB_INBOUND_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+const USB_INBOUND_POLL: Duration = Duration::from_millis(100);
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+struct UsbInboundWorker {
+    reader: std::os::unix::net::UnixStream,
+    cancellation: prelude_android_auto::CancellationToken,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+impl Drop for UsbInboundWorker {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        let _ = self.reader.shutdown(std::net::Shutdown::Both);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+struct UsbPipedIo {
+    inbound: UsbInboundWorker,
+    outbound: prelude_android_auto::AoapIo<RusbHandle>,
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+impl std::io::Read for UsbPipedIo {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.inbound.reader.read(bytes)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+impl std::io::Write for UsbPipedIo {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.outbound.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.outbound.flush()
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+impl UsbPipedIo {
+    fn spawn(
+        transport: UsbAoapTransport<RusbHandle>,
+        cancellation: prelude_android_auto::CancellationToken,
+        read_timeout: Duration,
+        write_timeout: Duration,
+    ) -> std::result::Result<(Self, std::os::unix::net::UnixStream), String> {
+        use std::io::Write;
+
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair()
+            .map_err(|error| format!("creating the Android Auto USB pipe failed: {error}"))?;
+        let readiness = reader.try_clone().map_err(|error| {
+            format!("cloning the Android Auto USB readiness handle failed: {error}")
+        })?;
+        reader
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|error| format!("configuring the Android Auto USB pipe failed: {error}"))?;
+        let mut inbound = transport.try_clone().map_err(|error| {
+            format!("cloning the Android Auto USB transport for its inbound worker failed: {error}")
+        })?;
+        let worker_cancellation = cancellation.clone();
+        let handle = thread::Builder::new()
+            .name("aa-usb-rx".to_owned())
+            .spawn(move || {
+                let mut buffer = vec![0_u8; USB_INBOUND_BUFFER_BYTES];
+                loop {
+                    match inbound.read(&mut buffer, USB_INBOUND_POLL, &worker_cancellation) {
+                        Ok(length) => {
+                            if writer.write_all(&buffer[..length]).is_err() {
+                                break;
+                            }
+                        }
+                        Err(prelude_android_auto::Error::Timeout { .. }) => {}
+                        Err(prelude_android_auto::Error::Cancelled { .. }) => break,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "reading from the Android Auto USB accessory failed"
+                            );
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                format!("spawning the Android Auto USB inbound worker failed: {error}")
+            })?;
+        Ok((
+            Self {
+                inbound: UsbInboundWorker {
+                    reader,
+                    cancellation: cancellation.clone(),
+                    handle: Some(handle),
+                },
+                outbound: transport.into_io(cancellation, read_timeout, write_timeout),
+            },
+            readiness,
+        ))
+    }
+
+    fn into_transport(self) -> UsbAoapTransport<RusbHandle> {
+        let Self { inbound, outbound } = self;
+        drop(inbound);
+        outbound.into_transport()
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
@@ -2589,7 +3171,7 @@ fn run_usb_worker(
         ),
         ..AoapTimeouts::default()
     };
-    let mut transport = match open_accessory(
+    let transport = match open_accessory(
         &mut backend,
         candidate,
         &identity,
@@ -2607,23 +3189,25 @@ fn run_usb_worker(
 
     set_stage(progress, WorkerStage::OpeningProtocol);
     if shutdown.is_requested() {
-        transport.set_reset_on_close(false);
         transport.close().map_err(|error| {
             format!("releasing cancelled Android Auto USB transport failed: {error}")
         })?;
         return Ok(());
     }
     let io_cancellation = prelude_android_auto::CancellationToken::default();
-    let io = transport.into_io(
+    let (io, readiness) = UsbPipedIo::spawn(
+        transport,
         io_cancellation,
         Duration::from_millis(config.session_io_timeout_ms.min(250)),
         Duration::from_millis(config.usb_transfer_timeout_ms),
-    );
-    let (result, io) = run_protocol(io, context, bluetooth_address)?;
-    let mut transport = io.into_transport();
-    if result.is_ok() {
-        transport.set_reset_on_close(false);
-    }
+    )?;
+    let (result, io) = run_protocol(
+        io,
+        context,
+        bluetooth_address,
+        Some(TransportReadiness::Unix(readiness)),
+    )?;
+    let transport = io.into_transport();
     let transport_result = transport
         .close()
         .map_err(|error| format!("closing Android Auto USB transport failed: {error}"));
@@ -2635,6 +3219,7 @@ fn run_protocol<T: std::io::Read + std::io::Write + Send>(
     io: T,
     context: &WorkerContext,
     bluetooth_address: Option<String>,
+    transport_readiness: Option<TransportReadiness>,
 ) -> std::result::Result<(std::result::Result<(), String>, T), String> {
     let WorkerContext {
         config,
@@ -2649,6 +3234,8 @@ fn run_protocol<T: std::io::Read + std::io::Write + Send>(
         ping_timeout,
         hands_free,
         presets,
+        wireless_peer,
+        transport_readiness: _,
     } = context;
     let audio_output = !config.disable_audio_output;
     if let Some(address) = &bluetooth_address {
@@ -2672,7 +3259,7 @@ fn run_protocol<T: std::io::Read + std::io::Write + Send>(
     set_session_state(progress, session.state());
     set_stage(progress, WorkerStage::Negotiating);
 
-    let mut media = None;
+    let mut media: Option<LiveMedia> = None;
     let mut disconnect_reason = None;
     let mut shutdown_started = false;
     let mut pending_voice_session = None;
@@ -2700,9 +3287,27 @@ fn run_protocol<T: std::io::Read + std::io::Write + Send>(
             if media.is_none() {
                 drain_pre_media_controls(controls);
             }
-            let events = session
-                .poll()
-                .map_err(|error| format!("polling Android Auto Protocol failed: {error}"))?;
+            let transport_poll_started = Instant::now();
+            let transport_ready = match (media.as_mut(), transport_readiness.as_ref()) {
+                (Some(media), Some(transport)) if session.state() == SessionState::Running => {
+                    media.wait_for_transport_or_input(transport)?
+                }
+                _ => true,
+            };
+            let events = if transport_ready {
+                if let Some(TransportReadiness::Tcp(transport)) = transport_readiness.as_ref() {
+                    crate::wireless_runtime::set_tcp_quickack(transport);
+                }
+                session.poll()
+            } else {
+                session.tick(Instant::now())
+            }
+            .map_err(|error| format!("polling Android Auto Protocol failed: {error}"))?;
+            if let Some(media) = media.as_mut() {
+                media
+                    .loop_window
+                    .record_transport_wait(transport_poll_started.elapsed());
+            }
             if media.is_none() {
                 set_session_state(progress, session.state());
             }
@@ -2723,6 +3328,26 @@ fn run_protocol<T: std::io::Read + std::io::Write + Send>(
                                 hands_free.as_ref(),
                                 presets.clone(),
                             )?);
+                            if let Some(media) = media.as_mut() {
+                                media.input_waits_with_transport = transport_readiness.is_some();
+                                media.radio_peer.clone_from(wireless_peer);
+                                media.link_ports = match transport_readiness.as_ref() {
+                                    Some(TransportReadiness::Tcp(socket)) => {
+                                        if let (Ok(local), Ok(peer)) =
+                                            (socket.local_addr(), socket.peer_addr())
+                                        {
+                                            Some((local.port(), peer.port()))
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                if wireless_peer.is_some() {
+                                    crate::usb_monitor::start();
+                                    crate::usb_monitor::discard_window();
+                                }
+                            }
                             if let Some(active) = pending_voice_session.take() {
                                 media
                                     .as_mut()
@@ -2903,16 +3528,90 @@ fn run_protocol<T: std::io::Read + std::io::Write + Send>(
         {
             Ok(())
         } else {
+            if let Some(media) = media.as_mut() {
+                media.next_latency_diagnostic = Instant::now();
+                media.log_latency_diagnostic(&mut session);
+            }
             let trace = session.trace();
+            let reason = disconnect_reason.unwrap_or(DisconnectReason::PeerClosed);
+            let last_message = trace.last_message.map_or_else(
+                || "none".to_owned(),
+                |(channel, message)| format!("{channel}/{message:#06x}"),
+            );
+            let last_inbound_ms = session.millis_since_last_inbound(Instant::now());
+            let progress_snapshot = progress.lock().ok().map(|progress| *progress);
+            let video_frames = progress_snapshot.map(|progress| progress.video_frames);
+            let keyframe_requests = progress_snapshot.map(|progress| progress.keyframe_requests);
+            let audio_frames = progress_snapshot.map(|progress| progress.audio_frames);
+            let protocol_events = progress_snapshot.map(|progress| progress.protocol_events);
+            let (queued_frames, queue_depth_live, queue_depth_cumulative) = media
+                .as_ref()
+                .map(LiveMedia::video_queue_depths)
+                .unwrap_or((None, None, None));
+            let media_busy_max_ms = media.as_ref().map(|media| {
+                media
+                    .last_media_busy_max
+                    .max(media.media_busy_max)
+                    .as_millis() as u64
+            });
+            let wifi_interface = prelude_wireless::access_point::detect_interface();
+            let arp_station_count = wifi_interface
+                .as_deref()
+                .and_then(prelude_wireless::access_point::arp_station_count);
+            let peer_station = wireless_peer.as_deref().and_then(|peer| {
+                let ip = peer
+                    .rsplit_once(':')
+                    .map(|(host, _)| host)
+                    .unwrap_or(peer)
+                    .parse()
+                    .ok()?;
+                wifi_interface.as_deref().and_then(|interface| {
+                    prelude_wireless::access_point::station_for(interface, ip)
+                })
+            });
+            let transport_close = match reason {
+                DisconnectReason::PeerClosed => "eof",
+                DisconnectReason::PingTimeout => "ping-timeout",
+                DisconnectReason::PeerShutdown => "bye",
+                DisconnectReason::StartupTimeout => "startup-timeout",
+                DisconnectReason::LocalShutdown | DisconnectReason::Cancelled => "local",
+            };
+            tracing::warn!(
+                ?reason,
+                closed_in = ?trace.closed_in,
+                last_phone_message = %last_message,
+                opened_channels = ?trace.opened_channels,
+                transport_close,
+                last_inbound_ms,
+                video_frames,
+                keyframe_requests,
+                audio_frames,
+                protocol_events,
+                queued_frames,
+                queue_depth_live,
+                queue_depth_cumulative,
+                media_busy_max_ms,
+                wireless_peer = wireless_peer.as_deref(),
+                peer_station = peer_station.as_deref(),
+                wifi_interface = wifi_interface.as_deref(),
+                arp_station_count,
+                "Android Auto session disconnected unexpectedly"
+            );
             Err(format!(
-                "Android Auto session disconnected unexpectedly ({:?}) during {:?}; last phone message {}; opened channels {:?}",
-                disconnect_reason.unwrap_or(DisconnectReason::PeerClosed),
+                "Android Auto session disconnected unexpectedly ({reason:?}) during {:?}; last phone message {last_message}; opened channels {:?}; transport_close={transport_close}; last_inbound_ms={}; video_frames={}; keyframe_requests={}; audio_frames={}; protocol_events={}; queue_depth_live={}; queue_depth_cumulative={}; media_busy_max_ms={}; wireless_peer={}; peer_station={}; arp_station_count={}",
                 trace.closed_in,
-                trace.last_message.map_or_else(
-                    || "none".to_owned(),
-                    |(channel, message)| format!("{channel}/{message:#06x}")
-                ),
                 trace.opened_channels,
+                option_count(last_inbound_ms.map(|ms| ms as u64)),
+                option_count(video_frames),
+                option_count(keyframe_requests),
+                option_count(audio_frames),
+                option_count(protocol_events),
+                option_count(queue_depth_live),
+                option_count(queue_depth_cumulative),
+                option_count(media_busy_max_ms),
+                wireless_peer.as_deref().unwrap_or("none"),
+                peer_station.as_deref().unwrap_or("none"),
+                option_count(arp_station_count.map(|count| count as u64)),
             ))
         }
     })();
@@ -3279,6 +3978,34 @@ mod tests {
         let failed = apply_local_mute(current, |_| Err("backend rejected mute".to_owned()));
         assert!(failed.is_err());
         assert!(!current, "caller state remains unchanged on failure");
+    }
+
+    #[test]
+    fn idle_probe_surfaces_failure_detail_on_projection_runtime() {
+        let failure = RuntimeFailure {
+            detail: "Android Auto session disconnected unexpectedly (PeerClosed) during Some(Running); last phone message 3/0x0000; opened channels [1, 3, 8, 6, 9]".to_owned(),
+        };
+        let failed = idle_probe(Some(&failure), &RetrySchedule::new());
+        assert_eq!(failed.state, HealthState::Failed);
+        assert_eq!(failed.detail, failure.detail);
+        assert_eq!(failed.transport_detail, failure.detail);
+        assert!(
+            !failed.detail.contains("AOAP"),
+            "postmortem detail must not be replaced by the AOAP idle-gate copy"
+        );
+
+        let waiting = idle_probe(None, &RetrySchedule::new());
+        assert_eq!(waiting.state, HealthState::NotReady);
+        assert!(
+            !waiting.detail.contains("AOAP"),
+            "idle-gate copy must stay transport-agnostic"
+        );
+        assert_ne!(waiting.detail, waiting.transport_detail);
+        assert!(
+            waiting
+                .transport_detail
+                .contains("waiting for a positively identified")
+        );
     }
 
     #[test]

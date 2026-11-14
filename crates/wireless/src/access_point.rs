@@ -202,6 +202,8 @@ impl AccessPointConfig {
     }
 }
 
+const BEACON_INTERVAL_TU: u32 = 50;
+
 pub fn render_hostapd(config: &AccessPointConfig, width: ChannelWidth) -> String {
     let hw_mode = match config.band() {
         Band::Ghz2_4 => "g",
@@ -219,6 +221,8 @@ pub fn render_hostapd(config: &AccessPointConfig, width: ChannelWidth) -> String
          ieee80211h=0\n\
          hw_mode={hw_mode}\n\
          channel={channel}\n\
+         beacon_int={BEACON_INTERVAL_TU}\n\
+         dtim_period=1\n\
          ieee80211n=1\n\
          wmm_enabled=1\n\
          disassoc_low_ack=0\n\
@@ -456,6 +460,11 @@ impl StationControl {
         self.command(&format!("DENY_ACL DEL_MAC {station}"))
     }
 
+    pub fn deauthenticate(&self, station: &str) -> Result<()> {
+        let station = valid_station(station)?;
+        self.command(&format!("DEAUTHENTICATE {station}"))
+    }
+
     fn command(&self, command: &str) -> Result<()> {
         static NEXT_CLIENT: AtomicU64 = AtomicU64::new(0);
         let client = self.run_dir.join(format!(
@@ -508,6 +517,138 @@ pub fn station_for(interface: &str, address: Ipv4Addr) -> Option<String> {
     station_in_arp_table(&table, interface, address)
 }
 
+pub fn arp_station_count(interface: &str) -> Option<usize> {
+    let table = fs::read_to_string("/proc/net/arp").ok()?;
+    Some(count_arp_stations(&table, interface))
+}
+
+pub fn station_link_summary(interface: &str, station: &str) -> Option<String> {
+    let station = valid_station(station).ok()?;
+    let output = Command::new("iw")
+        .args(["dev", interface, "station", "get", station])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let summary = summarize_station(&String::from_utf8_lossy(&output.stdout));
+    (!summary.is_empty()).then_some(summary)
+}
+
+fn summarize_station(report: &str) -> String {
+    const FIELDS: [&str; 17] = [
+        "DTIM period",
+        "beacon interval",
+        "last ack signal",
+        "avg ack signal",
+        "inactive time",
+        "rx packets",
+        "tx packets",
+        "tx retries",
+        "tx failed",
+        "rx drop misc",
+        "signal",
+        "signal avg",
+        "tx bitrate",
+        "rx bitrate",
+        "beacon loss",
+        "connected time",
+        "airtime weight",
+    ];
+    report
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.trim().split_once(':')?;
+            let name = name.trim();
+            FIELDS
+                .contains(&name)
+                .then(|| format!("{}={}", name.replace(' ', "_"), value.trim()))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+const RADIO_DEBUG_ROOT: &str = "/sys/kernel/debug/ieee80211";
+const RADIO_DEBUG_FILES: [&str; 4] = [
+    "runtime-pm",
+    "deep-sleep",
+    "idle-timeout",
+    "runtime_pm_stats",
+];
+const STATION_DEBUG_FILES: [&str; 3] = ["flags", "num_ps_buf_frames", "airtime"];
+const RADIO_DEBUG_VALUE_LIMIT: usize = 300;
+
+fn radio_debug_directories(interface: &str, station: &str) -> Option<(PathBuf, PathBuf)> {
+    let station = valid_station(station).ok()?;
+    let plain = |name: &str| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    };
+    if !plain(interface) {
+        return None;
+    }
+    let radio = fs::read_to_string(format!("/sys/class/net/{interface}/phy80211/name")).ok()?;
+    let radio = radio.trim();
+    if !plain(radio) {
+        return None;
+    }
+    let root = Path::new(RADIO_DEBUG_ROOT).join(radio);
+    let stations = root
+        .join(format!("netdev:{interface}"))
+        .join("stations")
+        .join(station);
+    Some((root.join("mt76"), stations))
+}
+
+pub fn radio_debug_summary(interface: &str, station: &str) -> Option<String> {
+    let (radio, station) = radio_debug_directories(interface, station)?;
+    let mut values = Vec::new();
+    for (directory, names, prefix) in [
+        (&radio, &RADIO_DEBUG_FILES[..], ""),
+        (&station, &STATION_DEBUG_FILES[..], "station_"),
+    ] {
+        for name in names {
+            if let Ok(text) = fs::read_to_string(directory.join(name)) {
+                values.push(format!("{prefix}{name}={}", single_line(&text)));
+            }
+        }
+    }
+    (!values.is_empty()).then(|| values.join("; "))
+}
+
+pub fn radio_debug_names(interface: &str, station: &str) -> Option<String> {
+    let (radio, station) = radio_debug_directories(interface, station)?;
+    let names = |directory: &Path| -> String {
+        let mut names: Vec<String> = fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        names.join(" ")
+    };
+    Some(format!(
+        "radio: {}; station: {}",
+        names(&radio),
+        names(&station)
+    ))
+}
+
+fn single_line(text: &str) -> String {
+    let mut line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.len() > RADIO_DEBUG_VALUE_LIMIT {
+        let mut end = RADIO_DEBUG_VALUE_LIMIT;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+    }
+    line
+}
+
 fn station_in_arp_table(table: &str, interface: &str, address: Ipv4Addr) -> Option<String> {
     table.lines().skip(1).find_map(|line| {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -521,6 +662,23 @@ fn station_in_arp_table(table: &str, interface: &str, address: Ipv4Addr) -> Opti
             .then(|| mac.to_ascii_lowercase())
             .filter(|mac| valid_station(mac).is_ok())
     })
+}
+
+fn count_arp_stations(table: &str, interface: &str) -> usize {
+    table
+        .lines()
+        .skip(1)
+        .filter(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let [_, _, flags, mac, _, device] = fields[..] else {
+                return false;
+            };
+            device == interface
+                && flags != "0x0"
+                && mac != "00:00:00:00:00:00"
+                && valid_station(mac).is_ok()
+        })
+        .count()
 }
 
 fn start_attempts(config: &AccessPointConfig) -> Vec<(u8, ChannelWidth)> {
@@ -661,6 +819,43 @@ mod tests {
         assert_eq!(station(21).as_deref(), Some("aa:bb:cc:dd:ee:02"));
         assert_eq!(station(20), None);
         assert_eq!(station(22), None);
+        assert_eq!(count_arp_stations(table, "wlan0"), 1);
+        assert_eq!(count_arp_stations(table, "eth0"), 1);
+    }
+
+    #[test]
+    fn station_summary_keeps_the_link_counters_on_one_line() {
+        let report = "Station aa:bb:cc:dd:ee:02 (on wlan0)\n\
+                      \tinactive time:\t12 ms\n\
+                      \trx bytes:\t123456\n\
+                      \ttx retries:\t42\n\
+                      \ttx failed:\t1\n\
+                      \tsignal:  \t-48 [-50, -52] dBm\n\
+                      \ttx bitrate:\t270.0 MBit/s MCS 15 40MHz short GI\n\
+                      \tauthorized:\tyes\n";
+        assert_eq!(
+            summarize_station(report),
+            "inactive_time=12 ms; tx_retries=42; tx_failed=1; signal=-48 [-50, -52] dBm; \
+             tx_bitrate=270.0 MBit/s MCS 15 40MHz short GI"
+        );
+        assert_eq!(
+            summarize_station("command failed: No such file or directory (-2)\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn radio_debug_values_fit_on_one_line_and_bad_names_are_refused() {
+        assert_eq!(
+            single_line("awake time:     1200\ndoze time:        30\nlow power wakes:  4\n"),
+            "awake time: 1200 doze time: 30 low power wakes: 4"
+        );
+        let long = "é".repeat(RADIO_DEBUG_VALUE_LIMIT);
+        let cut = single_line(&long);
+        assert!(cut.len() <= RADIO_DEBUG_VALUE_LIMIT);
+        assert!(cut.chars().all(|character| character == 'é'));
+        assert_eq!(radio_debug_summary("../wlan0", "aa:bb:cc:dd:ee:ff"), None);
+        assert_eq!(radio_debug_names("wlan0", "not-a-mac"), None);
     }
 
     #[test]
@@ -668,6 +863,7 @@ mod tests {
         assert!(valid_station("aa:bb:cc:dd:ee:ff").is_ok());
         assert!(valid_station("aa:bb:cc:dd:ee:ff\nQUIT").is_err());
         assert!(valid_station("aa-bb-cc-dd-ee-ff").is_err());
+        assert!(valid_station("not-a-mac").is_err());
     }
 
     #[test]
@@ -737,6 +933,8 @@ mod tests {
         assert!(rendered.contains("country_code=CA\n"));
         assert!(rendered.contains("wpa=2\n"));
         assert!(rendered.contains("disassoc_low_ack=0\n"));
+        assert!(rendered.contains("beacon_int=50\n"));
+        assert!(rendered.contains("dtim_period=1\n"));
 
         let upper = AccessPointConfig {
             channel: 153,

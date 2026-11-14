@@ -42,6 +42,7 @@ pub struct VideoBackpressureStats {
     pub queued_frames: u64,
     pub replaced_frames: u64,
     pub dropped_frames: u64,
+    pub live_depth: u64,
 }
 
 pub struct VideoIngressBuffer {
@@ -334,7 +335,14 @@ impl VideoIngressBuffer {
     }
 
     pub fn stats(&self) -> Result<VideoBackpressureStats> {
-        Ok(self.lock()?.stats)
+        let state = self.lock()?;
+        let mut stats = state.stats;
+        stats.live_depth = state
+            .commands
+            .iter()
+            .filter(|command| matches!(command, VideoCommand::Frame(_)))
+            .count() as u64;
+        Ok(stats)
     }
 
     #[cfg_attr(
@@ -472,6 +480,25 @@ mod tests {
         );
         let stats = queue.stats().expect("stats");
         assert_eq!(stats.replaced_frames, 2);
+        assert_eq!(stats.live_depth, 1);
+    }
+
+    #[test]
+    fn live_depth_counts_buffered_frames_not_configuration() {
+        let queue = VideoIngressBuffer::new(VideoBackpressureConfig {
+            capacity: 4,
+            ..VideoBackpressureConfig::default()
+        })
+        .expect("queue");
+        queue.submit_configuration(configuration()).expect("config");
+        assert_eq!(queue.stats().expect("stats").live_depth, 0);
+        queue.submit_frame(frame(5, 1)).expect("key");
+        queue.submit_frame(frame(1, 2)).expect("delta");
+        assert_eq!(queue.stats().expect("stats").live_depth, 2);
+        let _ = queue.pop_timeout(Duration::ZERO).expect("pop config");
+        assert_eq!(queue.stats().expect("stats").live_depth, 2);
+        let _ = queue.pop_timeout(Duration::ZERO).expect("pop frame");
+        assert_eq!(queue.stats().expect("stats").live_depth, 1);
     }
 
     #[test]

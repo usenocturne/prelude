@@ -4,7 +4,8 @@ use crate::{
     Error, Result,
     constants::{
         AV_SETUP_OK, BLUETOOTH_PAIRING_NUMERIC_COMPARISON, MAX_PROTO_PAYLOAD,
-        MEDIA_CODEC_H264_BASELINE, MEDIA_CODEC_PCM, STATUS_OK, channel,
+        MEDIA_CODEC_H264_BASELINE, MEDIA_CODEC_PCM, STATUS_OK, VIDEO_FPS_30, VIDEO_FPS_60,
+        VIDEO_RESOLUTION_480P, channel,
     },
 };
 
@@ -506,20 +507,36 @@ fn service_discovery_message(
             available_type: Some(MEDIA_CODEC_H264_BASELINE),
             audio_type: None,
             audio_configs: Vec::new(),
-            video_configs: vec![VideoConfiguration {
-                codec_resolution: Some(1),
-                frame_rate: Some(2),
-                width_margin: Some(0),
-                height_margin: Some(0),
-                density: Some(density_dpi),
-                pixel_aspect_ratio_e4: Some(10_000),
-                video_codec_type: Some(MEDIA_CODEC_H264_BASELINE),
-                ui_config: Some(UiConfig {
-                    margins: Some(empty_insets()),
-                    content_insets: Some(empty_insets()),
-                    stable_content_insets: Some(empty_insets()),
-                }),
-            }],
+            video_configs: vec![
+                VideoConfiguration {
+                    codec_resolution: Some(VIDEO_RESOLUTION_480P),
+                    frame_rate: Some(VIDEO_FPS_60),
+                    width_margin: Some(0),
+                    height_margin: Some(0),
+                    density: Some(density_dpi),
+                    pixel_aspect_ratio_e4: Some(10_000),
+                    video_codec_type: Some(MEDIA_CODEC_H264_BASELINE),
+                    ui_config: Some(UiConfig {
+                        margins: Some(empty_insets()),
+                        content_insets: Some(empty_insets()),
+                        stable_content_insets: Some(empty_insets()),
+                    }),
+                },
+                VideoConfiguration {
+                    codec_resolution: Some(VIDEO_RESOLUTION_480P),
+                    frame_rate: Some(VIDEO_FPS_30),
+                    width_margin: Some(0),
+                    height_margin: Some(0),
+                    density: Some(density_dpi),
+                    pixel_aspect_ratio_e4: Some(10_000),
+                    video_codec_type: Some(MEDIA_CODEC_H264_BASELINE),
+                    ui_config: Some(UiConfig {
+                        margins: Some(empty_insets()),
+                        content_insets: Some(empty_insets()),
+                        stable_content_insets: Some(empty_insets()),
+                    }),
+                },
+            ],
             available_while_in_call: Some(true),
         }),
         input_source_service: None,
@@ -784,13 +801,19 @@ mod tests {
             .find(|service| service.id == i32::from(channel::VIDEO))
             .and_then(|service| service.media_sink_service.as_ref())
             .expect("video");
-        assert_eq!(video.video_configs.len(), 1);
-        let config = &video.video_configs[0];
-        assert_eq!(config.codec_resolution, Some(1));
-        assert_eq!(config.frame_rate, Some(2));
-        assert_eq!(config.density, Some(DEFAULT_VIDEO_DENSITY_DPI));
-        assert_eq!(config.pixel_aspect_ratio_e4, Some(10_000));
-        assert_eq!(config.video_codec_type, Some(MEDIA_CODEC_H264_BASELINE));
+        assert_eq!(video.video_configs.len(), 2);
+        let config_60 = &video.video_configs[0];
+        assert_eq!(config_60.codec_resolution, Some(VIDEO_RESOLUTION_480P));
+        assert_eq!(config_60.frame_rate, Some(VIDEO_FPS_60));
+        assert_eq!(config_60.density, Some(DEFAULT_VIDEO_DENSITY_DPI));
+        assert_eq!(config_60.pixel_aspect_ratio_e4, Some(10_000));
+        assert_eq!(config_60.video_codec_type, Some(MEDIA_CODEC_H264_BASELINE));
+        let config_30 = &video.video_configs[1];
+        assert_eq!(config_30.codec_resolution, Some(VIDEO_RESOLUTION_480P));
+        assert_eq!(config_30.frame_rate, Some(VIDEO_FPS_30));
+        assert_eq!(config_30.density, Some(DEFAULT_VIDEO_DENSITY_DPI));
+        assert_eq!(config_30.pixel_aspect_ratio_e4, Some(10_000));
+        assert_eq!(config_30.video_codec_type, Some(MEDIA_CODEC_H264_BASELINE));
 
         let media = response
             .channels

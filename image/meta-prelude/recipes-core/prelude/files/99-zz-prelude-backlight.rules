@@ -1,0 +1,4 @@
+# preluded owns the panel backlight. systemd-backlight@backlight:backlight is
+# masked so it cannot restore a stale level; drop the systemd tag and clear
+# SYSTEMD_WANTS so ALS brightness CHANGE uevents do not enqueue the masked unit.
+SUBSYSTEM=="backlight", KERNEL=="backlight", TAG-="systemd", ENV{SYSTEMD_WANTS}=""

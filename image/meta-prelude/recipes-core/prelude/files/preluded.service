@@ -21,6 +21,9 @@ ReadWritePaths=/run/prelude /var/lib/prelude
 # The daemon owns the calibrated ALS controls and the panel PWM backlight.
 ReadWritePaths=-/sys/bus/iio/devices -/sys/class/backlight
 LimitRTPRIO=20
+Nice=-20
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=20
 
 [Install]
 WantedBy=multi-user.target

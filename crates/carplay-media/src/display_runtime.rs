@@ -7,10 +7,12 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use crate::{Error, Result, SCREEN_HEIGHT, SCREEN_WIDTH, wayland_presenter::WaylandPresenter};
+use crate::{
+    DurationStats, Error, Result, SCREEN_HEIGHT, SCREEN_WIDTH, wayland_presenter::WaylandPresenter,
+};
 
 const DISPLAY_POLL: Duration = Duration::from_millis(16);
 const DISPLAY_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,6 +35,8 @@ struct DisplayState {
     generation: u64,
     stopped: bool,
     failure: Option<String>,
+    video_submitted_at: Option<Instant>,
+    video_commit: DurationStats,
 }
 
 #[derive(Debug, Default)]
@@ -289,9 +293,18 @@ impl LinuxDisplayHandle {
         state.video = Some(Arc::clone(&frame));
         state.video_owner = Some(source);
         state.source_frames.insert(source, (frame_sequence, frame));
+        state.video_submitted_at.get_or_insert_with(Instant::now);
         state.generation = state.generation.wrapping_add(1);
         self.shared.changed.notify_one();
         Ok(())
+    }
+
+    pub fn take_video_commit_stats(&self) -> DurationStats {
+        self.shared
+            .state
+            .lock()
+            .map(|mut state| std::mem::take(&mut state.video_commit))
+            .unwrap_or_default()
     }
 
     pub(crate) fn register_video_source(&self) -> Result<u64> {
@@ -492,18 +505,23 @@ fn run_display(shared: Arc<SharedDisplay>, startup: mpsc::SyncSender<Result<()>>
     }
     let _ = startup.send(Ok(()));
     loop {
-        let (frame, generation, stopped) = {
+        let (frame, generation, stopped, video_submitted_at) = {
             let state = shared
                 .state
                 .lock()
                 .map_err(|_| Error::Backend("display state lock is poisoned".to_owned()))?;
-            let (state, _) = shared
+            let (mut state, _) = shared
                 .changed
                 .wait_timeout_while(state, DISPLAY_POLL, |state| {
                     !state.stopped && state.generation == rendered_generation
                 })
                 .map_err(|_| Error::Backend("display state lock is poisoned".to_owned()))?;
-            (visible_frame(&state), state.generation, state.stopped)
+            (
+                visible_frame(&state),
+                state.generation,
+                state.stopped,
+                state.video_submitted_at.take(),
+            )
         };
         if stopped {
             return Ok(());
@@ -524,6 +542,11 @@ fn run_display(shared: Arc<SharedDisplay>, startup: mpsc::SyncSender<Result<()>>
                 shared.changed.notify_all();
             }
             return Err(Error::Backend(detail));
+        }
+        if let Some(submitted_at) = video_submitted_at
+            && let Ok(mut state) = shared.state.lock()
+        {
+            state.video_commit.record(submitted_at.elapsed());
         }
         rendered_generation = generation;
     }
