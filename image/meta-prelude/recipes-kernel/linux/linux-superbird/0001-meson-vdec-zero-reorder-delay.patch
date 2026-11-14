@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Prelude OS <prelude@local>
+Date: Fri, 13 Nov 2026 00:00:00 +0000
+Subject: [PATCH] media: meson: vdec: zero reorder delay and tolerate parser DMA offset jitter in H.264
+
+In low-latency phone projection (Android Auto / CarPlay), streams have
+no B-frames and max_num_reorder_frames == 0. Setting bits [15:8] of
+AV_SCRATCH_0 to 0 instructs the Amlogic microcode not to delay picture
+emission, returning decoded frames immediately without holding them in the
+DPB buffer.
+
+Additionally, ESPARSER DMA alignment and search pattern padding can cause
+the packet write pointer in VIFIFO to advance up to ~256 bytes ahead of the
+actual slice header offset reported by firmware. Allow up to SZ_1K bounded
+tolerance when matching VIFIFO offsets in amvdec_dst_buf_done_offset,
+preventing false-positive misses and preserving accurate per-buffer
+timestamp association.
+
+Signed-off-by: Prelude OS <prelude@local>
+---
+ drivers/staging/media/meson/vdec/codec_h264.c  | 5 ++++-
+ drivers/staging/media/meson/vdec/vdec_helpers.c | 2 +-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_h264.c b/drivers/staging/media/meson/vdec/codec_h264.c
+index 548c717..c82613b 100644
+--- a/drivers/staging/media/meson/vdec/codec_h264.c
++++ b/drivers/staging/media/meson/vdec/codec_h264.c
+@@ -316,6 +316,8 @@ static void codec_h264_set_par(struct amvdec_session *sess)
+ 	/* End of ref MV */
+ 	amvdec_write_dos(core, AV_SCRATCH_4, h264->ref_paddr + h264->ref_size);
+ 
++	dev_info_once(core->dev, "H.264 zero-reorder low-latency: max_refs=%u, dst_bufs=%u\n",
++		      h264->max_refs, sess->num_dst_bufs);
+ 	amvdec_write_dos(core, AV_SCRATCH_0, (h264->max_refs << 24) |
+ 					     (sess->num_dst_bufs << 16) |
+-					     ((h264->max_refs - 1) << 8));
++					     (0 << 8));
+ }
+ 
+ /*
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index 6817394..c982314 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -398,7 +398,7 @@ void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
+ 	spin_lock_irqsave(&sess->ts_spinlock, flags);
+ 
+ 	/* Look for our vififo offset to get the corresponding timestamp. */
+ 	list_for_each_entry_safe(tmp, n, &sess->timestamps, list) {
+-		if (tmp->offset > offset)
++		if (tmp->offset > offset && (tmp->offset - offset) > SZ_1K)
+ 			break;
+ 
+ 		match = tmp;
+-- 
+2.39.5
