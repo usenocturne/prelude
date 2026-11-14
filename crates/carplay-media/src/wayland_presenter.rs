@@ -27,6 +27,7 @@ use wayland_client::{
 
 const NV12_PLANE_RATIO_NUMERATOR: usize = 3;
 const NV12_PLANE_RATIO_DENOMINATOR: usize = 2;
+const BUFFER_POOL_SIZE: usize = 6;
 
 pub(crate) struct WaylandPresenter {
     connection: Connection,
@@ -56,7 +57,7 @@ impl WaylandPresenter {
             .map(|bytes| bytes / NV12_PLANE_RATIO_DENOMINATOR)
             .ok_or("Wayland shared-memory pool size overflowed")?;
         let pool_size = frame_size
-            .checked_mul(3)
+            .checked_mul(BUFFER_POOL_SIZE)
             .ok_or("Wayland shared-memory pool size overflowed")?;
         let connection = Connection::connect_to_env()
             .map_err(|error| format!("cannot connect to Wayland compositor: {error}"))?;
@@ -93,7 +94,7 @@ impl WaylandPresenter {
                 configured: false,
                 configure_error: None,
                 closed: false,
-                buffer: None,
+                buffers: Vec::with_capacity(BUFFER_POOL_SIZE),
             },
         };
         presenter
@@ -120,7 +121,7 @@ impl WaylandPresenter {
         y_pitch: usize,
         uv_pitch: usize,
     ) -> Result<(), String> {
-        self.dispatch()?;
+        self.ensure_buffer_available()?;
         let width = usize::try_from(self.state.width).map_err(|_| "invalid Wayland width")?;
         let height = usize::try_from(self.state.height).map_err(|_| "invalid Wayland height")?;
         self.state.present(&self.event_queue.handle(), |canvas| {
@@ -133,7 +134,7 @@ impl WaylandPresenter {
     }
 
     pub(crate) fn present_packed_nv12(&mut self, frame: &[u8]) -> Result<(), String> {
-        self.dispatch()?;
+        self.ensure_buffer_available()?;
         let width = usize::try_from(self.state.width).map_err(|_| "invalid Wayland width")?;
         let height = usize::try_from(self.state.height).map_err(|_| "invalid Wayland height")?;
         let expected = nv12_frame_size(width, height)?;
@@ -153,6 +154,7 @@ impl WaylandPresenter {
     }
 
     pub(crate) fn clear(&mut self) -> Result<(), String> {
+        self.ensure_buffer_available()?;
         let width = usize::try_from(self.state.width).map_err(|_| "invalid Wayland width")?;
         let height = usize::try_from(self.state.height).map_err(|_| "invalid Wayland height")?;
         self.state.present(&self.event_queue.handle(), |canvas| {
@@ -172,14 +174,33 @@ impl WaylandPresenter {
     }
 
     fn dispatch(&mut self) -> Result<(), String> {
+        if let Some(guard) = self.event_queue.prepare_read() {
+            let _ = guard.read();
+        }
         self.event_queue
-            .roundtrip(&mut self.state)
+            .dispatch_pending(&mut self.state)
             .map_err(|error| format!("Wayland event dispatch failed: {error}"))?;
         if let Some(error) = self.state.configure_error.take() {
             return Err(error);
         }
         if self.state.closed {
             return Err("Wayland compositor closed the CarPlay surface".to_owned());
+        }
+        Ok(())
+    }
+
+    fn ensure_buffer_available(&mut self) -> Result<(), String> {
+        self.dispatch()?;
+        if !self.state.has_free_buffer() {
+            self.event_queue
+                .roundtrip(&mut self.state)
+                .map_err(|error| format!("Wayland fallback roundtrip failed: {error}"))?;
+            if let Some(error) = self.state.configure_error.take() {
+                return Err(error);
+            }
+            if self.state.closed {
+                return Err("Wayland compositor closed the CarPlay surface".to_owned());
+            }
         }
         Ok(())
     }
@@ -196,7 +217,7 @@ struct PresenterState {
     configured: bool,
     configure_error: Option<String>,
     closed: bool,
-    buffer: Option<Nv12Buffer>,
+    buffers: Vec<Nv12Buffer>,
 }
 
 #[derive(Debug)]
@@ -206,6 +227,11 @@ struct Nv12Buffer {
 }
 
 impl PresenterState {
+    fn has_free_buffer(&self) -> bool {
+        self.buffers.len() < BUFFER_POOL_SIZE
+            || self.buffers.iter().any(|buf| !buf.slot.has_active_buffers())
+    }
+
     fn present(
         &mut self,
         _qh: &QueueHandle<Self>,
@@ -214,23 +240,34 @@ impl PresenterState {
         let stride = i32::try_from(self.width).map_err(|_| "Wayland buffer stride overflowed")?;
         let width = i32::try_from(self.width).map_err(|_| "Wayland width is too large")?;
         let height = i32::try_from(self.height).map_err(|_| "Wayland height is too large")?;
-        if self.buffer.is_none() {
-            let (buffer, _) = create_nv12_buffer(&mut self.pool, width, height, stride)?;
-            self.buffer = Some(buffer);
+
+        let mut target_index = None;
+        for (i, buf) in self.buffers.iter().enumerate() {
+            if !buf.slot.has_active_buffers() {
+                target_index = Some(i);
+                break;
+            }
         }
-        let frame = self
-            .buffer
-            .as_mut()
-            .ok_or("Wayland frame buffer is unexpectedly absent")?;
-        let canvas = match frame.slot.canvas(&mut self.pool) {
-            Some(canvas) => canvas,
+
+        let index = match target_index {
+            Some(i) => i,
+            None if self.buffers.len() < BUFFER_POOL_SIZE => {
+                let buffer = create_nv12_buffer(&mut self.pool, width, height, stride)?;
+                self.buffers.push(buffer);
+                self.buffers.len() - 1
+            }
             None => {
-                let (replacement, canvas) =
-                    create_nv12_buffer(&mut self.pool, width, height, stride)?;
-                *frame = replacement;
-                canvas
+                // If all pool buffers are held by the compositor, do not tear or overwrite
+                // in-flight scanout memory. Skip this frame safely.
+                return Ok(());
             }
         };
+
+        let frame = &self.buffers[index];
+        let canvas = frame
+            .slot
+            .canvas(&mut self.pool)
+            .ok_or("Wayland frame buffer canvas is unexpectedly unavailable")?;
         draw(canvas)?;
         self.window.wl_surface().damage_buffer(0, 0, width, height);
         frame
@@ -247,7 +284,7 @@ fn create_nv12_buffer(
     width: i32,
     height: i32,
     stride: i32,
-) -> Result<(Nv12Buffer, &mut [u8]), String> {
+) -> Result<Nv12Buffer, String> {
     let stride_usize = usize::try_from(stride).map_err(|_| "invalid Wayland NV12 stride")?;
     let height_usize = usize::try_from(height).map_err(|_| "invalid Wayland NV12 height")?;
     let frame_size = nv12_frame_size(stride_usize, height_usize)?;
@@ -257,8 +294,7 @@ fn create_nv12_buffer(
     let buffer = pool
         .create_buffer_in(&slot, width, height, stride, wl_shm::Format::Nv12)
         .map_err(|error| format!("cannot allocate Wayland NV12 buffer: {error}"))?;
-    let canvas = pool.raw_data_mut(&slot);
-    Ok((Nv12Buffer { buffer, slot }, canvas))
+    Ok(Nv12Buffer { buffer, slot })
 }
 
 impl CompositorHandler for PresenterState {

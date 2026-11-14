@@ -42,6 +42,8 @@ pub struct VideoBackpressureStats {
     pub queued_frames: u64,
     pub replaced_frames: u64,
     pub dropped_frames: u64,
+    /// Frames currently buffered in the ingress command queue (not cumulative).
+    pub live_depth: u64,
 }
 
 pub struct VideoIngressBuffer {
@@ -59,6 +61,7 @@ pub(crate) enum StartupSampleDisposition {
 #[cfg(any(test, all(target_os = "linux", feature = "linux-backend")))]
 #[derive(Debug, Default)]
 pub(crate) struct VideoStartupRenderGate {
+    immediate: bool,
     first_idr_seen: bool,
     render_from_pts_ns: Option<u64>,
     keyframe_requested: bool,
@@ -68,6 +71,13 @@ pub(crate) struct VideoStartupRenderGate {
 
 #[cfg(any(test, all(target_os = "linux", feature = "linux-backend")))]
 impl VideoStartupRenderGate {
+    pub(crate) fn immediate() -> Self {
+        Self {
+            immediate: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn register_input(&mut self, idr: bool, pts_ns: u64) {
         if idr {
             if self.first_idr_seen {
@@ -94,7 +104,8 @@ impl VideoStartupRenderGate {
             ));
         }
         self.last_output_pts_ns = Some(pts_ns);
-        if self.opened {
+        if self.opened || self.immediate {
+            self.opened = true;
             return Ok(StartupSampleDisposition::Render);
         }
         let Some(render_from) = self.render_from_pts_ns else {
@@ -334,7 +345,14 @@ impl VideoIngressBuffer {
     }
 
     pub fn stats(&self) -> Result<VideoBackpressureStats> {
-        Ok(self.lock()?.stats)
+        let state = self.lock()?;
+        let mut stats = state.stats;
+        stats.live_depth = state
+            .commands
+            .iter()
+            .filter(|command| matches!(command, VideoCommand::Frame(_)))
+            .count() as u64;
+        Ok(stats)
     }
 
     #[cfg_attr(
@@ -472,6 +490,25 @@ mod tests {
         );
         let stats = queue.stats().expect("stats");
         assert_eq!(stats.replaced_frames, 2);
+        assert_eq!(stats.live_depth, 1);
+    }
+
+    #[test]
+    fn live_depth_counts_buffered_frames_not_configuration() {
+        let queue = VideoIngressBuffer::new(VideoBackpressureConfig {
+            capacity: 4,
+            ..VideoBackpressureConfig::default()
+        })
+        .expect("queue");
+        queue.submit_configuration(configuration()).expect("config");
+        assert_eq!(queue.stats().expect("stats").live_depth, 0);
+        queue.submit_frame(frame(5, 1)).expect("key");
+        queue.submit_frame(frame(1, 2)).expect("delta");
+        assert_eq!(queue.stats().expect("stats").live_depth, 2);
+        let _ = queue.pop_timeout(Duration::ZERO).expect("pop config");
+        assert_eq!(queue.stats().expect("stats").live_depth, 2);
+        let _ = queue.pop_timeout(Duration::ZERO).expect("pop frame");
+        assert_eq!(queue.stats().expect("stats").live_depth, 1);
     }
 
     #[test]
@@ -594,6 +631,16 @@ mod tests {
             gate.observe_output(Some(99)).expect("clean delta"),
             StartupSampleDisposition::Render
         );
+    }
+
+    #[test]
+    fn startup_gate_immediate_mode_opens_on_first_output_sample() {
+        let mut gate = VideoStartupRenderGate::immediate();
+        assert_eq!(
+            gate.observe_output(Some(1_000)).expect("observe"),
+            StartupSampleDisposition::Render
+        );
+        assert!(gate.is_open());
     }
 
     #[test]

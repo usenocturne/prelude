@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     os::unix::fs::FileTypeExt,
     path::Path,
@@ -24,6 +24,7 @@ use crate::{
     VideoFrameDisposition, VideoIngressBuffer, VideoPipelinePlan,
     backend_plan::AudioGainRamp,
     backpressure::{DecodeStallWatchdog, StartupSampleDisposition, VideoStartupRenderGate},
+    decoder_flush::{DecoderFlush, take_flush_output},
     pipeline_state::{PipelineLifecycleState, require_settled_state, video_start_is_settled},
     presentation_timing::{VideoPresentationClock, VideoPresentationSchedule},
     resolve_builtin_microphone, resolve_usb_dac, revalidate_usb_dac, validate_video_decoder_target,
@@ -40,17 +41,21 @@ use gstreamer_video::{VideoFrameExt, VideoFrameRef, VideoInfo};
 mod output_equalizer;
 use output_equalizer::OutputEqualizer;
 
-const WORKER_POLL: Duration = Duration::from_millis(10);
+const WORKER_POLL: Duration = Duration::from_millis(1);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const GST_STATE_TIMEOUT: gst::ClockTime = gst::ClockTime::from_seconds(2);
 const DEFAULT_COMMAND_CAPACITY: usize = 64;
 const MAXIMUM_COMMAND_CAPACITY: usize = 1024;
 const AUDIO_CONTROL_CAPACITY: usize = 16;
 const AUDIO_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
-const VIDEO_FRAME_DURATION_NS: u64 = 1_000_000_000 / 30;
+const VIDEO_FRAME_DURATION_NS: u64 = 1_000_000_000 / 60;
 const HARDWARE_STARTUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const HARDWARE_STARTUP_KEYFRAME_RETRY: Duration = Duration::from_secs(1);
-const HARDWARE_DECODER_PREROLL_BUFFERS: u32 = 4;
+/// Distance between a frame's presentation time and each skipped picture
+/// that follows it; far below a frame interval, so every picture keeps a
+/// distinct and ordered time.
+const FLUSH_PICTURE_SPACING_NS: u64 = 1_000;
+const MAXIMUM_PENDING_FLUSH_PICTURES: usize = 64;
 const USB_MIXER_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const AUDIO_OUTPUT_PRIME_DURATION: Duration = Duration::from_millis(250);
 const TEST_TONE_DURATION: Duration = Duration::from_millis(750);
@@ -199,6 +204,7 @@ impl VideoSynchronizationTelemetrySnapshot {
 #[derive(Clone)]
 pub struct VideoSynchronizationTelemetry {
     snapshot: Arc<Mutex<VideoSynchronizationTelemetrySnapshot>>,
+    latency: crate::VideoLatencyProbe,
 }
 
 impl std::fmt::Debug for VideoSynchronizationTelemetry {
@@ -216,7 +222,13 @@ impl VideoSynchronizationTelemetry {
             snapshot: Arc::new(Mutex::new(VideoSynchronizationTelemetrySnapshot::new(
                 output_delay,
             ))),
+            latency: crate::VideoLatencyProbe::default(),
         }
+    }
+
+    /// Per-frame latency measurements for the pipeline this telemetry follows.
+    pub const fn latency(&self) -> &crate::VideoLatencyProbe {
+        &self.latency
     }
 
     pub fn snapshot(&self) -> Result<VideoSynchronizationTelemetrySnapshot> {
@@ -248,6 +260,16 @@ impl VideoSynchronizationTelemetry {
 pub struct LinuxVideoBackendConfig {
     pub backpressure: VideoBackpressureConfig,
     pub output_delay: AudioOutputDelay,
+    /// Follow every frame with skipped pictures so the hardware decoder
+    /// returns it without waiting for the next frames to arrive.
+    pub flush_decoder: bool,
+    /// Open the startup gate on the first decoded frame instead of waiting
+    /// for a second IDR keyframe to warm up the decoder.
+    pub immediate_startup: bool,
+    /// Pictures to send after each frame beyond reference frames. Defaults to 2 (total 3).
+    /// For low-latency streams with rewritten SPS (max_dec_frame_buffering=1), setting to 0
+    /// pushes 1 picture per frame instead of 3.
+    pub held_flush_frames: Option<u32>,
 }
 
 pub struct LinuxVideoBackend {
@@ -360,6 +382,9 @@ impl LinuxVideoBackend {
                     events: event_tx,
                     synchronization_telemetry: worker_synchronization_telemetry,
                     output_delay: config.output_delay,
+                    flush_decoder: config.flush_decoder,
+                    immediate_startup: config.immediate_startup,
+                    held_flush_frames: config.held_flush_frames,
                     display,
                 });
                 if let Err(error) = &result {
@@ -451,6 +476,9 @@ struct VideoWorkerContext {
     events: SyncSender<VideoBackendEvent>,
     synchronization_telemetry: VideoSynchronizationTelemetry,
     output_delay: AudioOutputDelay,
+    flush_decoder: bool,
+    immediate_startup: bool,
+    held_flush_frames: Option<u32>,
     display: Option<LinuxDisplayHandle>,
 }
 
@@ -491,6 +519,9 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
         events,
         synchronization_telemetry,
         output_delay,
+        flush_decoder,
+        immediate_startup,
+        held_flush_frames,
         display,
     } = context;
     let display_registration = match DisplayVideoRegistration::new(display.clone()) {
@@ -522,7 +553,13 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
         return ingress.stats();
     };
     let mut active_configuration = initial_configuration;
-    let mut pipeline = match VideoGstPipeline::start(&active_configuration, output_delay) {
+    let mut pipeline = match VideoGstPipeline::start(
+        &active_configuration,
+        output_delay,
+        flush_decoder,
+        immediate_startup,
+        held_flush_frames,
+    ) {
         Ok(pipeline) => pipeline,
         Err(error) => {
             let _ = startup.send(Err(error));
@@ -555,7 +592,13 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
             Some(crate::backpressure::VideoCommand::Configuration(configuration)) => {
                 pipeline.stop()?;
                 active_configuration = configuration;
-                match VideoGstPipeline::start(&active_configuration, output_delay) {
+                match VideoGstPipeline::start(
+                    &active_configuration,
+                    output_delay,
+                    flush_decoder,
+                    immediate_startup,
+                    held_flush_frames,
+                ) {
                     Ok(started) => {
                         if let Err(error) = register_pipeline(&pipeline_control, &started.pipeline)
                         {
@@ -565,6 +608,9 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
                         }
                         pipeline = started;
                         stall_watchdog = DecodeStallWatchdog::default();
+                        synchronization_telemetry
+                            .latency()
+                            .record_pipeline_restart();
                     }
                     Err(error) => {
                         report_failure(&errors, "video", &error);
@@ -572,20 +618,31 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
                     }
                 }
             }
-            Some(crate::backpressure::VideoCommand::Frame(frame)) => match pipeline.push(frame) {
-                Ok(()) => {
-                    if pipeline.startup_gate.is_none() {
-                        stall_watchdog.record_input(Instant::now());
+            Some(crate::backpressure::VideoCommand::Frame(frame)) => {
+                let frame_identifier = frame.nonce_counter;
+                let pushed_at = Instant::now();
+                match pipeline.push(frame) {
+                    Ok(pushed) => {
+                        let latency = synchronization_telemetry.latency();
+                        latency.record_push(
+                            frame_identifier,
+                            pushed.presentation_time_ns,
+                            pushed_at,
+                        );
+                        latency.record_flush_pictures(pushed.flush_pictures);
+                        if pipeline.startup_gate.is_none() {
+                            stall_watchdog.record_input(Instant::now());
+                        }
+                    }
+                    Err(error) => {
+                        if cancel.load(Ordering::Acquire) {
+                            break;
+                        }
+                        report_failure(&errors, "video", &error);
+                        return Err(error);
                     }
                 }
-                Err(error) => {
-                    if cancel.load(Ordering::Acquire) {
-                        break;
-                    }
-                    report_failure(&errors, "video", &error);
-                    return Err(error);
-                }
-            },
+            }
             Some(crate::backpressure::VideoCommand::Stop) => break,
             None => {}
         }
@@ -594,6 +651,14 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
             return Err(error);
         }
         while let Some(sample) = pipeline.sink.try_pull_sample(gst::ClockTime::ZERO) {
+            let decoded_frame = sample
+                .buffer()
+                .and_then(gst::BufferRef::pts)
+                .map(|pts| {
+                    synchronization_telemetry
+                        .latency()
+                        .record_output(pts.nseconds(), Instant::now())
+                });
             let disposition = match pipeline.sample_disposition(&sample) {
                 Ok(disposition) => disposition,
                 Err(error) => {
@@ -622,6 +687,11 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
                     ) {
                         report_failure(&errors, "video renderer", &error);
                         return Err(error);
+                    }
+                    if let Some(decoded_frame) = decoded_frame {
+                        synchronization_telemetry
+                            .latency()
+                            .record_render(decoded_frame, Instant::now());
                     }
                     let actual_lateness_ns = pipeline
                         .clock_time_ns()?
@@ -676,12 +746,27 @@ struct VideoGstPipeline {
     startup_gate: Option<VideoStartupRenderGate>,
     startup_recovery_deadline: Option<Instant>,
     last_keyframe_request: Option<Instant>,
+    flush: Option<DecoderFlush>,
+    flush_outputs: FlushOutputs,
+}
+
+/// Presentation times of the skipped pictures that are still inside the
+/// decoder, oldest first.
+type FlushOutputs = Arc<Mutex<VecDeque<u64>>>;
+
+/// What one call to [`VideoGstPipeline::push`] handed to the decoder.
+struct PushedFrame {
+    presentation_time_ns: u64,
+    flush_pictures: usize,
 }
 
 impl VideoGstPipeline {
     fn start(
         configuration: &VideoCodecConfiguration,
         output_delay: AudioOutputDelay,
+        flush_decoder: bool,
+        immediate_startup: bool,
+        held_flush_frames: Option<u32>,
     ) -> Result<Self> {
         let plan = VideoPipelinePlan::h264(configuration)?;
         let pipeline = gst::Pipeline::new();
@@ -700,23 +785,23 @@ impl VideoGstPipeline {
                 .build(),
         )?;
         let decoder_queue = make("queue", "decoder-input-queue")?;
-        set_checked(&decoder_queue, "max-size-time", 2_000_000_000_u64)?;
+        set_checked(&decoder_queue, "max-size-time", 200_000_000_u64)?;
         set_checked(&decoder_queue, "max-size-bytes", 0_u32)?;
-        set_checked(&decoder_queue, "max-size-buffers", 0_u32)?;
-        set_checked(
-            &decoder_queue,
-            "min-threshold-buffers",
-            HARDWARE_DECODER_PREROLL_BUFFERS,
-        )?;
+        set_checked(&decoder_queue, "max-size-buffers", 8_u32)?;
+        set_checked(&decoder_queue, "min-threshold-buffers", 0_u32)?;
         let decoder = make("v4l2h264dec", "hardware-decoder")?;
         require_string_property_equals(&decoder, "device", TARGET_VIDEO_DEVICE)?;
         set_enum_checked(&decoder, "output-io-mode", "mmap")?;
         set_enum_checked(&decoder, "capture-io-mode", "mmap")?;
         set_checked(&decoder, "discard-corrupted-frames", true)?;
         install_h264_decoder_caps_adapter(&parser)?;
+        let flush_outputs = FlushOutputs::default();
+        if flush_decoder {
+            discard_flush_pictures(&decoder, Arc::clone(&flush_outputs))?;
+        }
         let renderer_queue = make("queue", "renderer-queue")?;
         set_enum_checked(&renderer_queue, "leaky", "downstream")?;
-        set_checked(&renderer_queue, "max-size-buffers", 2_u32)?;
+        set_checked(&renderer_queue, "max-size-buffers", 1_u32)?;
         set_checked(&renderer_queue, "max-size-bytes", 0_u32)?;
         set_checked(&renderer_queue, "max-size-time", 0_u64)?;
         let sink_element = make("appsink", "screen-sink")?;
@@ -772,13 +857,28 @@ impl VideoGstPipeline {
             clock,
             presentation_clock: VideoPresentationClock::new(output_delay),
             next_pts_ns: 0,
-            startup_gate: Some(VideoStartupRenderGate::default()),
+            startup_gate: if immediate_startup {
+                Some(VideoStartupRenderGate::immediate())
+            } else {
+                Some(VideoStartupRenderGate::default())
+            },
             startup_recovery_deadline: None,
             last_keyframe_request: None,
+            flush: flush_decoder.then(|| match held_flush_frames {
+                Some(held) => DecoderFlush::with_held_frames(configuration, held),
+                None => DecoderFlush::new(configuration),
+            }),
+            flush_outputs,
         })
     }
 
-    fn push(&mut self, frame: EncryptedVideoFrame) -> Result<()> {
+    /// Hands one frame to the decoder, followed by the skipped pictures that
+    /// make the decoder return it.
+    fn push(&mut self, frame: EncryptedVideoFrame) -> Result<PushedFrame> {
+        let followers = self
+            .flush
+            .as_mut()
+            .and_then(|flush| flush.followers(&frame));
         let idr = frame
             .nal_units
             .iter()
@@ -815,7 +915,38 @@ impl VideoGstPipeline {
         self.source
             .push_buffer(buffer)
             .map_err(|error| Error::Backend(format!("video appsrc rejected a frame: {error:?}")))?;
-        Ok(())
+        let mut flush_pictures = 0;
+        if let Some(followers) = followers {
+            for index in 1..=followers.count {
+                let pts_ns = pts_ns.saturating_add(index as u64 * FLUSH_PICTURE_SPACING_NS);
+                {
+                    let mut pending = self.flush_outputs.lock().map_err(|_| {
+                        Error::Backend("decoder flush bookkeeping is poisoned".to_owned())
+                    })?;
+                    if pending.len() >= MAXIMUM_PENDING_FLUSH_PICTURES {
+                        pending.pop_front();
+                    }
+                    pending.push_back(pts_ns);
+                }
+                let mut buffer = gst::Buffer::from_slice(followers.picture.clone());
+                {
+                    let buffer = buffer.get_mut().ok_or_else(|| {
+                        Error::Backend("video buffer is unexpectedly shared".to_owned())
+                    })?;
+                    let pts = gst::ClockTime::from_nseconds(pts_ns);
+                    buffer.set_pts(pts);
+                    buffer.set_dts(pts);
+                }
+                self.source.push_buffer(buffer).map_err(|error| {
+                    Error::Backend(format!("video appsrc rejected a flush picture: {error:?}"))
+                })?;
+                flush_pictures += 1;
+            }
+        }
+        Ok(PushedFrame {
+            presentation_time_ns: pts_ns,
+            flush_pictures,
+        })
     }
 
     fn sample_disposition(&mut self, sample: &gst::Sample) -> Result<StartupSampleDisposition> {
@@ -931,6 +1062,33 @@ fn video_sink_capacity(output_delay: AudioOutputDelay) -> u32 {
     u32::try_from(delayed_frames)
         .unwrap_or(u32::MAX)
         .saturating_add(2)
+}
+
+/// Drops the skipped pictures as they leave the decoder, so only the phone's
+/// frames reach the renderer.
+fn discard_flush_pictures(decoder: &gst::Element, pending: FlushOutputs) -> Result<()> {
+    let source_pad = decoder
+        .static_pad("src")
+        .ok_or_else(|| Error::Backend("hardware decoder has no source pad".to_owned()))?;
+    source_pad
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_ref() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let Some(pts) = buffer.pts() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let Ok(mut pending) = pending.lock() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            if take_flush_output(&mut pending, pts.nseconds()) {
+                gst::PadProbeReturn::Drop
+            } else {
+                gst::PadProbeReturn::Ok
+            }
+        })
+        .ok_or_else(|| Error::Backend("cannot install decoder flush picture filter".to_owned()))?;
+    Ok(())
 }
 
 fn install_h264_decoder_caps_adapter(parser: &gst::Element) -> Result<()> {

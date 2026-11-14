@@ -467,7 +467,7 @@ fn exactly_one<T>(mut matches: Vec<T>, description: &str) -> Result<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::symlink;
 
