@@ -19,6 +19,7 @@ SRC_URI += " \
     file://prelude-device-recovery.path \
     file://prelude-host-health.timer \
     file://preluded.env \
+    file://prelude-udhcpc-script \
     file://preluded-dev.conf \
     file://preluded-wireless.conf \
     file://journald-persistent.conf \
@@ -78,6 +79,9 @@ do_install() {
     install -d ${D}${bindir}
     install -m 0755 ${B}/target/${CARGO_TARGET_SUBDIR}/preluded ${D}${bindir}/preluded
     install -m 0755 ${B}/target/${CARGO_TARGET_SUBDIR}/preludectl ${D}${bindir}/preludectl
+    # DHCP hook for Wi-Fi client mode (udhcpc -s); see prelude-udhcpc-script.
+    install -d ${D}${libexecdir}
+    install -m 0755 ${UNPACKDIR}/prelude-udhcpc-script ${D}${libexecdir}/prelude-udhcpc-script
 
     install -d ${D}${systemd_system_unitdir}
     install -m 0644 ${UNPACKDIR}/preluded.service ${D}${systemd_system_unitdir}/
@@ -186,6 +190,7 @@ SUMMARY:${PN}-dev-config = "Experimental projection configuration and provisioni
 FILES:${PN}:append = " \
     ${sysconfdir}/systemd/system/systemd-backlight@backlight:backlight.service \
     ${sysconfdir}/udev/rules.d/99-zz-prelude-backlight.rules \
+    ${libexecdir}/prelude-udhcpc-script \
     ${nonarch_libdir}/tmpfiles.d/prelude.conf \
     ${datadir}/prelude/*.nv12 \
     ${systemd_system_unitdir}/preluded.service.d/30-wireless.conf \

@@ -1,0 +1,49 @@
+#!/bin/sh
+# udhcpc hook for preluded's Wi-Fi client mode.
+#
+# Applies the lease to the interface, points systemd-resolved at the lease's
+# DNS servers for that link only, and records the lease for preluded in
+# $PRELUDE_CLIENT_DIR/lease. Nothing under /etc is written.
+set -eu
+set -f
+
+client_dir=${PRELUDE_CLIENT_DIR:-/run/prelude/client}
+lease="$client_dir/lease"
+iface=${interface:-}
+
+if ! printf '%s' "$iface" | grep -Eq '^[A-Za-z0-9_.-]{1,15}$'; then
+    echo "prelude-udhcpc-script: refusing interface '$iface'" >&2
+    exit 1
+fi
+
+clear_lease() {
+    ip addr flush dev "$iface" || true
+    resolvectl revert "$iface" || true
+    rm -f "$lease"
+}
+
+case "${1:-}" in
+    deconfig|leasefail|nak)
+        clear_lease
+        ;;
+    bound|renew)
+        ip addr flush dev "$iface"
+        ip addr add "${ip}/${mask}" dev "$iface"
+        gateway=""
+        for candidate in ${router:-}; do
+            gateway=$candidate
+            break
+        done
+        if [ -n "$gateway" ]; then
+            ip route replace default via "$gateway" dev "$iface"
+        fi
+        servers=$(echo ${dns:-})
+        if [ -n "$servers" ]; then
+            resolvectl dns "$iface" $servers
+            resolvectl domain "$iface" '~.'
+        fi
+        mkdir -p "$client_dir"
+        printf 'address=%s/%s\nrouter=%s\ndns=%s\n' "$ip" "$mask" "$gateway" "$servers" > "$lease.tmp"
+        mv "$lease.tmp" "$lease"
+        ;;
+esac

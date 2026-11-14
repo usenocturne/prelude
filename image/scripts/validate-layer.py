@@ -564,6 +564,18 @@ for unsupported_package in (
         fail(f"runtime packages unsupported USB/IP dependency: {unsupported_package}")
 if "iproute2" not in packagegroup:
     fail("core packagegroup lacks the fixed-path ip utility required by NCM link setup")
+# Wi-Fi client mode drives wpa_supplicant and udhcpc with Prelude's hook.
+# wpa-supplicant stays a BAD_RECOMMENDATION, so only an explicit RDEPENDS
+# installs it.
+if not re.search(r"^\s+wpa-supplicant \\$", packagegroup, re.MULTILINE):
+    fail("core packagegroup must depend on wpa-supplicant for Wi-Fi client mode")
+for needle in (
+    "file://prelude-udhcpc-script",
+    "install -m 0755 ${UNPACKDIR}/prelude-udhcpc-script ${D}${libexecdir}/prelude-udhcpc-script",
+    "${libexecdir}/prelude-udhcpc-script",
+):
+    if needle not in recipe:
+        fail(f"runtime recipe must ship the Wi-Fi client DHCP hook ({needle})")
 if 'LICENSE_FLAGS_ACCEPTED += "commercial_faad2"' not in distro:
     fail("distro does not narrowly accept FAAD2's restricted-policy flag")
 if "commercial_ffmpeg" in distro or "commercial_gstreamer1.0-libav" in distro:

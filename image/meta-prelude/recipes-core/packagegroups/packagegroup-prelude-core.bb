@@ -62,10 +62,13 @@ RDEPENDS:${PN} = " \
 # support is installed so any compatible adapter works without image changes.
 # mac80211 allocates ccm(aes)/gcm(aes) for every key and requests them by
 # module alias, so the generic fallbacks for the built-in ARMv8 CE ciphers are
-# listed explicitly.
+# listed explicitly. wpa-supplicant lets the same adapter join a home network
+# or phone hotspot to get online; it stays in BAD_RECOMMENDATIONS so nothing
+# else pulls it in.
 RDEPENDS:${PN} += " \
     hostapd \
     dnsmasq \
+    wpa-supplicant \
     iw \
     wireless-regdb-static \
     linux-firmware-prelude-mt76-usb \
