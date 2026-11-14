@@ -1,13 +1,5 @@
-//! Force low-delay H.264 SPS VUI bitstream restrictions for Amlogic V4L2.
-//!
-//! Android Auto often omits `bitstream_restriction_flag`, so meson-vdec defaults to a
-//! deep reorder/DPB (observed as a locked queued−presented gap of 16 or 48 frames).
-//! Rewriting SPS before AVCC/V4L2 submission asks the firmware for immediate output.
-
 #![cfg_attr(not(test), allow(dead_code))]
 
-/// Rewrite an H.264 SPS NAL (with header byte) so VUI bitstream restrictions request
-/// `max_num_reorder_frames = 0` and `max_dec_frame_buffering = 1`.
 pub fn force_low_latency_sps(nal: &[u8]) -> Result<Vec<u8>, String> {
     if nal.is_empty() || nal[0] & 0x1f != 7 {
         return Err("expected an H.264 SPS NAL unit".to_owned());
@@ -52,7 +44,11 @@ fn ebsp_from_rbsp(rbsp: &[u8]) -> Vec<u8> {
             zero_count = 0;
         }
         ebsp.push(byte);
-        zero_count = if byte == 0 { zero_count.saturating_add(1) } else { 0 };
+        zero_count = if byte == 0 {
+            zero_count.saturating_add(1)
+        } else {
+            0
+        };
     }
     ebsp
 }
@@ -63,9 +59,9 @@ fn rewrite_sps_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, String> {
 
     let profile_idc = reader.read_bits(8)?;
     writer.write_bits(profile_idc, 8)?;
-    writer.write_bits(reader.read_bits(8)?, 8)?; // constraint flags
-    writer.write_bits(reader.read_bits(8)?, 8)?; // level_idc
-    copy_ue(&mut reader, &mut writer)?; // seq_parameter_set_id
+    writer.write_bits(reader.read_bits(8)?, 8)?;
+    writer.write_bits(reader.read_bits(8)?, 8)?;
+    copy_ue(&mut reader, &mut writer)?;
 
     if matches!(
         profile_idc,
@@ -73,11 +69,11 @@ fn rewrite_sps_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, String> {
     ) {
         let chroma_format_idc = copy_ue(&mut reader, &mut writer)?;
         if chroma_format_idc == 3 {
-            writer.write_bit(reader.read_bit()?)?; // separate_colour_plane_flag
+            writer.write_bit(reader.read_bit()?)?;
         }
-        copy_ue(&mut reader, &mut writer)?; // bit_depth_luma_minus8
-        copy_ue(&mut reader, &mut writer)?; // bit_depth_chroma_minus8
-        writer.write_bit(reader.read_bit()?)?; // qpprime_y_zero_transform_bypass_flag
+        copy_ue(&mut reader, &mut writer)?;
+        copy_ue(&mut reader, &mut writer)?;
+        writer.write_bit(reader.read_bit()?)?;
         let seq_scaling_matrix_present = reader.read_bit()?;
         writer.write_bit(seq_scaling_matrix_present)?;
         if seq_scaling_matrix_present {
@@ -95,14 +91,18 @@ fn rewrite_sps_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, String> {
                             write_se(&mut writer, delta)?;
                             next_scale = (last_scale + delta + 256) % 256;
                         }
-                        last_scale = if next_scale == 0 { last_scale } else { next_scale };
+                        last_scale = if next_scale == 0 {
+                            last_scale
+                        } else {
+                            next_scale
+                        };
                     }
                 }
             }
         }
     }
 
-    copy_ue(&mut reader, &mut writer)?; // log2_max_frame_num_minus4
+    copy_ue(&mut reader, &mut writer)?;
     let pic_order_cnt_type = copy_ue(&mut reader, &mut writer)?;
     if pic_order_cnt_type == 0 {
         copy_ue(&mut reader, &mut writer)?;
@@ -115,16 +115,16 @@ fn rewrite_sps_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, String> {
             copy_se(&mut reader, &mut writer)?;
         }
     }
-    let max_num_ref_frames = copy_ue(&mut reader, &mut writer)?; // max_num_ref_frames
-    writer.write_bit(reader.read_bit()?)?; // gaps_in_frame_num_value_allowed_flag
-    copy_ue(&mut reader, &mut writer)?; // pic_width_in_mbs_minus1
-    copy_ue(&mut reader, &mut writer)?; // pic_height_in_map_units_minus1
+    let max_num_ref_frames = copy_ue(&mut reader, &mut writer)?;
+    writer.write_bit(reader.read_bit()?)?;
+    copy_ue(&mut reader, &mut writer)?;
+    copy_ue(&mut reader, &mut writer)?;
     let frame_mbs_only = reader.read_bit()?;
     writer.write_bit(frame_mbs_only)?;
     if !frame_mbs_only {
         writer.write_bit(reader.read_bit()?)?;
     }
-    writer.write_bit(reader.read_bit()?)?; // direct_8x8_inference_flag
+    writer.write_bit(reader.read_bit()?)?;
     let frame_cropping = reader.read_bit()?;
     writer.write_bit(frame_cropping)?;
     if frame_cropping {
@@ -134,7 +134,7 @@ fn rewrite_sps_rbsp(rbsp: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     let vui_present = reader.read_bit().unwrap_or(false);
-    writer.write_bit(true)?; // always emit VUI
+    writer.write_bit(true)?;
     if vui_present {
         copy_vui_and_force_low_latency(&mut reader, &mut writer, max_num_ref_frames)?;
     } else {
@@ -170,19 +170,14 @@ fn copy_vui_and_force_low_latency(
         writer.write_bits(reader.read_bits(3)?, 3)?;
         let full_range = reader.read_bit()?;
         writer.write_bit(full_range)?;
-        // The phone alternates between two parameter sets that differ only
-        // in this description (BT.709 vs unspecified). Downstream hardware and
-        // Wayland colorimetry require BT.709. Normalize both to standard BT.709
-        // (primaries=1, transfer=1, matrix=1) so both rewrite to identical bytes
-        // without dropping colorimetry.
         let colour = reader.read_bit()?;
         if colour {
             reader.read_bits(24)?;
         }
-        writer.write_bit(true)?; // colour_description_present_flag
-        writer.write_bits(1, 8)?; // colour_primaries: BT.709
-        writer.write_bits(1, 8)?; // transfer_characteristics: BT.709
-        writer.write_bits(1, 8)?; // matrix_coefficients: BT.709
+        writer.write_bit(true)?;
+        writer.write_bits(1, 8)?;
+        writer.write_bits(1, 8)?;
+        writer.write_bits(1, 8)?;
     }
     let chroma_loc = reader.read_bit()?;
     writer.write_bit(chroma_loc)?;
@@ -210,7 +205,7 @@ fn copy_vui_and_force_low_latency(
     if nal_hrd || vcl_hrd {
         writer.write_bit(reader.read_bit()?)?;
     }
-    writer.write_bit(reader.read_bit()?)?; // pic_struct_present_flag
+    writer.write_bit(reader.read_bit()?)?;
     let old_restriction = reader.read_bit().unwrap_or(false);
     if old_restriction {
         let mv_over = reader.read_bit()?;
@@ -221,16 +216,14 @@ fn copy_vui_and_force_low_latency(
         let _old_reorder = read_ue(reader)?;
         let old_buf = read_ue(reader)?;
 
-        // Preserve the phone's negotiated motion vector length and limits so hardware
-        // decoder microcode indexes motion vectors correctly without macroblock distortion.
-        writer.write_bit(true)?; // bitstream_restriction_flag
+        writer.write_bit(true)?;
         writer.write_bit(mv_over)?;
         write_ue(writer, bytes_per_pic)?;
         write_ue(writer, bits_per_mb)?;
         write_ue(writer, log2_max_mv_hor)?;
         write_ue(writer, log2_max_mv_ver)?;
-        write_ue(writer, 0)?; // max_num_reorder_frames = 0
-        write_ue(writer, old_buf.min(max_num_ref_frames).max(1))?; // max_dec_frame_buffering = 1
+        write_ue(writer, 0)?;
+        write_ue(writer, old_buf.min(max_num_ref_frames).max(1))?;
     } else {
         write_low_latency_bitstream_restriction(writer, max_num_ref_frames)?;
     }
@@ -238,14 +231,14 @@ fn copy_vui_and_force_low_latency(
 }
 
 fn write_empty_vui_prefix(writer: &mut BitWriter) -> Result<(), String> {
-    writer.write_bit(false)?; // aspect_ratio_info_present_flag
-    writer.write_bit(false)?; // overscan_info_present_flag
-    writer.write_bit(false)?; // video_signal_type_present_flag
-    writer.write_bit(false)?; // chroma_loc_info_present_flag
-    writer.write_bit(false)?; // timing_info_present_flag
-    writer.write_bit(false)?; // nal_hrd_parameters_present_flag
-    writer.write_bit(false)?; // vcl_hrd_parameters_present_flag
-    writer.write_bit(false)?; // pic_struct_present_flag
+    writer.write_bit(false)?;
+    writer.write_bit(false)?;
+    writer.write_bit(false)?;
+    writer.write_bit(false)?;
+    writer.write_bit(false)?;
+    writer.write_bit(false)?;
+    writer.write_bit(false)?;
+    writer.write_bit(false)?;
     Ok(())
 }
 
@@ -253,14 +246,14 @@ fn write_low_latency_bitstream_restriction(
     writer: &mut BitWriter,
     max_num_ref_frames: u32,
 ) -> Result<(), String> {
-    writer.write_bit(true)?; // bitstream_restriction_flag
-    writer.write_bit(true)?; // motion_vectors_over_pic_boundaries_flag
-    write_ue(writer, 0)?; // max_bytes_per_pic_denom
-    write_ue(writer, 0)?; // max_bits_per_mb_denom
-    write_ue(writer, 16)?; // log2_max_mv_length_horizontal
-    write_ue(writer, 16)?; // log2_max_mv_length_vertical
-    write_ue(writer, 0)?; // max_num_reorder_frames
-    write_ue(writer, max_num_ref_frames.max(1))?; // max_dec_frame_buffering
+    writer.write_bit(true)?;
+    writer.write_bit(true)?;
+    write_ue(writer, 0)?;
+    write_ue(writer, 0)?;
+    write_ue(writer, 16)?;
+    write_ue(writer, 16)?;
+    write_ue(writer, 0)?;
+    write_ue(writer, max_num_ref_frames.max(1))?;
     Ok(())
 }
 
@@ -392,7 +385,6 @@ impl BitWriter {
     }
 
     fn finish_rbsp(mut self) -> Result<Vec<u8>, String> {
-        // rbsp_trailing_bits: stop bit then zero alignment bits.
         self.write_bit(true)?;
         while self.bit % 8 != 0 {
             self.write_bit(false)?;
@@ -406,29 +398,24 @@ mod tests {
     use super::*;
 
     fn baseline_sps_without_vui() -> Vec<u8> {
-        // Minimal Constrained Baseline SPS: 480x800 style geometry is unnecessary;
-        // this fixture only needs to parse and accept a VUI rewrite.
-        // profile 66, constraints, level 30, sps_id 0, log2_max_frame_num 0,
-        // poc_type 0, log2_poc_lsb 0, max_ref 1, gaps 0, width/height 1/1 MBs,
-        // frame_mbs_only 1, direct8x8 1, crop 0, vui 0 + trailing.
         let rbsp = {
             let mut w = BitWriter::default();
-            w.write_bits(66, 8).unwrap();
-            w.write_bits(0b11000000, 8).unwrap();
-            w.write_bits(30, 8).unwrap();
-            write_ue(&mut w, 0).unwrap();
-            write_ue(&mut w, 0).unwrap();
-            write_ue(&mut w, 0).unwrap();
-            write_ue(&mut w, 0).unwrap();
-            write_ue(&mut w, 1).unwrap();
-            w.write_bit(false).unwrap();
-            write_ue(&mut w, 29).unwrap(); // width
-            write_ue(&mut w, 49).unwrap(); // height
-            w.write_bit(true).unwrap();
-            w.write_bit(true).unwrap();
-            w.write_bit(false).unwrap();
-            w.write_bit(false).unwrap(); // vui absent
-            w.finish_rbsp().unwrap()
+            w.write_bits(66, 8).expect("bits");
+            w.write_bits(0b11000000, 8).expect("bits");
+            w.write_bits(30, 8).expect("bits");
+            write_ue(&mut w, 0).expect("bits");
+            write_ue(&mut w, 0).expect("bits");
+            write_ue(&mut w, 0).expect("bits");
+            write_ue(&mut w, 0).expect("bits");
+            write_ue(&mut w, 1).expect("bits");
+            w.write_bit(false).expect("bits");
+            write_ue(&mut w, 29).expect("bits");
+            write_ue(&mut w, 49).expect("bits");
+            w.write_bit(true).expect("bits");
+            w.write_bit(true).expect("bits");
+            w.write_bit(false).expect("bits");
+            w.write_bit(false).expect("bits");
+            w.finish_rbsp().expect("bits")
         };
         let mut nal = vec![0x67];
         nal.extend(ebsp_from_rbsp(&rbsp));
@@ -446,15 +433,12 @@ mod tests {
             "VUI bitstream restrictions should grow the SPS"
         );
 
-        // Idempotent enough to re-parse: second rewrite must still be SPS.
         let again = force_low_latency_sps(&rewritten).expect("second rewrite");
         assert_eq!(again[0] & 0x1f, 7);
     }
 
     #[test]
     fn parameter_sets_that_differ_only_in_colour_description_rewrite_identically() {
-        // The two sets a Pixel 9 Pro XL alternates between: BT.709 and
-        // unspecified colour description, everything else equal.
         let described = hexadecimal("6742001fda0320f69a80808083c50aa8");
         let unspecified = hexadecimal("6742001fda0320f69a81010103c50aa8");
         assert_ne!(described, unspecified);
@@ -463,11 +447,11 @@ mod tests {
             rewritten,
             force_low_latency_sps(&unspecified).expect("rewrite")
         );
-        // Rewriting again changes nothing, so a repeated set is not a change.
-        assert_eq!(force_low_latency_sps(&rewritten).expect("rewrite"), rewritten);
-        // Everything ahead of the VUI is untouched.
+        assert_eq!(
+            force_low_latency_sps(&rewritten).expect("rewrite"),
+            rewritten
+        );
         assert_eq!(rewritten[..8], described[..8]);
-        // The BT.709 SPS from the phone is already optimal and preserves its exact bytes.
         assert_eq!(rewritten, described);
     }
 
@@ -487,10 +471,10 @@ mod tests {
     fn exp_golomb_round_trips_small_values() {
         for value in [0_u32, 1, 2, 3, 16, 49] {
             let mut writer = BitWriter::default();
-            write_ue(&mut writer, value).unwrap();
-            let bytes = writer.finish_rbsp().unwrap();
+            write_ue(&mut writer, value).expect("bits");
+            let bytes = writer.finish_rbsp().expect("bits");
             let mut reader = BitReader::new(&bytes);
-            assert_eq!(read_ue(&mut reader).unwrap(), value);
+            assert_eq!(read_ue(&mut reader).expect("bits"), value);
         }
     }
 

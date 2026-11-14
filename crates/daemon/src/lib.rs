@@ -15,10 +15,10 @@ mod error;
 mod first_video;
 #[cfg(any(test, all(target_os = "linux", feature = "linux-media")))]
 mod fonts;
+mod h264_sps;
 mod hands_free;
 mod health;
 mod heartbeat;
-mod h264_sps;
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 mod host_ui;
 mod iap2_runtime;

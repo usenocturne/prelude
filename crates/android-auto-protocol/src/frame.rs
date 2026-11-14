@@ -141,7 +141,6 @@ pub(crate) struct MessageAssembler {
 }
 
 impl MessageAssembler {
-    /// Whether no fragmented message is waiting for its remaining fragments.
     pub(crate) fn is_idle(&self) -> bool {
         self.channels.is_empty()
     }

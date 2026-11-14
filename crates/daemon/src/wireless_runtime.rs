@@ -310,8 +310,6 @@ impl WirelessPhoneDirectory {
             && self.android_auto.snapshot().is_empty()
             && !android_auto_queued_for_target
         {
-            // Kick Wi-Fi so the phone restarts wireless projection without tearing
-            // the Bluetooth ACL / HandsFree link.
             self.kick_android_auto_station("settings connect");
         }
         if let Some(control) = current_control(&self.bluetooth_control) {
@@ -391,7 +389,6 @@ impl WirelessPhoneDirectory {
         }
     }
 
-    /// Soft-reset wireless AA by deauthenticating the station without DENY_ACL.
     pub(crate) fn kick_android_auto_station(&self, reason: &str) -> bool {
         let station = self.android_auto_station();
         let Some(station) = station else {
@@ -399,7 +396,11 @@ impl WirelessPhoneDirectory {
             return false;
         };
         let Some(stations) = current_stations(&self.access_point) else {
-            tracing::warn!(reason, station, "access point is down; cannot deauthenticate");
+            tracing::warn!(
+                reason,
+                station,
+                "access point is down; cannot deauthenticate"
+            );
             return false;
         };
         match stations.deauthenticate(&station) {
@@ -700,7 +701,8 @@ impl WirelessService {
     }
 
     pub fn reconnect_last_phone(&self) {
-        self.directory.kick_android_auto_station("reconnect last phone");
+        self.directory
+            .kick_android_auto_station("reconnect last phone");
         self.page_now.store(true, Ordering::Release);
     }
 
@@ -798,8 +800,6 @@ fn sleep_unless_stopped(stop: &AtomicBool, duration: Duration) {
 }
 
 fn serve_call_audio(hands_free: &HandsFree, stop: &AtomicBool) {
-    // BlueZ/hci0 often report EBADFD/Busy during early bring-up; keep those at
-    // debug until they persist across several retries so boot journals stay clean.
     const WARN_AFTER_FAILURES: u32 = 3;
     let mut consecutive_failures = 0_u32;
     while !stop.load(Ordering::Relaxed) {
@@ -853,8 +853,6 @@ fn supervise_access_point(
 ) {
     let usb_projection = &projection.usb_projection;
     let mut waiting_logged = false;
-    // The Wi-Fi adapter is a USB device; its bus is watched from before it
-    // is first used so that a fault on the cable is on record.
     crate::usb_monitor::start();
     while !stop.load(Ordering::Relaxed) {
         if usb_projection.load(Ordering::Acquire) {
@@ -1005,6 +1003,7 @@ fn publish(shared: &SharedAccessPoint, access_point: &mut AccessPoint) {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::incompatible_msrv)]
 pub(crate) fn set_tcp_quickack(stream: &std::net::TcpStream) {
     use std::os::linux::net::TcpStreamExt;
     let _ = stream.set_quickack(true);
@@ -1227,25 +1226,25 @@ impl BluetoothDispatch {
                 continue;
             };
             let bluetooth = self.bluetooth_config(base, mode);
-            let (service, incoming) =
-                match BluetoothService::start(bluetooth, self.passkeys.clone()) {
-                    Ok(started) => {
-                        bluetooth_start_failures = 0;
-                        started
+            let (service, incoming) = match BluetoothService::start(
+                bluetooth,
+                self.passkeys.clone(),
+            ) {
+                Ok(started) => {
+                    bluetooth_start_failures = 0;
+                    started
+                }
+                Err(error) => {
+                    bluetooth_start_failures = bluetooth_start_failures.saturating_add(1);
+                    if bluetooth_start_failures >= 3 {
+                        tracing::warn!(%error, bluetooth_start_failures, "Bluetooth is not ready; retrying");
+                    } else {
+                        tracing::debug!(%error, bluetooth_start_failures, "Bluetooth is not ready; retrying");
                     }
-                    Err(error) => {
-                        // Early BlueZ Busy/EBADFD races are expected while hci0
-                        // finishes bring-up; only warn once they keep failing.
-                        bluetooth_start_failures = bluetooth_start_failures.saturating_add(1);
-                        if bluetooth_start_failures >= 3 {
-                            tracing::warn!(%error, bluetooth_start_failures, "Bluetooth is not ready; retrying");
-                        } else {
-                            tracing::debug!(%error, bluetooth_start_failures, "Bluetooth is not ready; retrying");
-                        }
-                        sleep_unless_stopped(&self.stop, BLUETOOTH_START_RETRY);
-                        continue;
-                    }
-                };
+                    sleep_unless_stopped(&self.stop, BLUETOOTH_START_RETRY);
+                    continue;
+                }
+            };
             if let Ok(mut address) = self.bluetooth_address.write() {
                 *address = Some(service.address());
             }
@@ -1432,7 +1431,6 @@ impl BluetoothDispatch {
             {
                 *focus = Some((phone.address.clone(), Instant::now() + HAND_BACK_FOCUS));
             }
-            // USB hand-back still needs a BT disconnect so the phone reopens AA RFCOMM.
             if phone.kind == PhoneKind::AndroidAuto && self.usb_ended.swap(false, Ordering::AcqRel)
             {
                 service.control().disconnect(&phone.address);
@@ -1725,8 +1723,6 @@ mod tests {
 
     #[test]
     fn unexpected_android_auto_death_forces_rebootstrap_but_clean_shutdown_does_not() {
-        // Recovery arms on unexpected empty transition; the action is Wi-Fi DEAUTH
-        // (not Bluetooth Disconnect) via kick_android_auto_station.
         assert!(should_force_android_auto_rebootstrap(true, false, false));
         assert!(!should_force_android_auto_rebootstrap(true, false, true));
         assert!(!should_force_android_auto_rebootstrap(false, false, false));

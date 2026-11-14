@@ -229,7 +229,10 @@ struct Nv12Buffer {
 impl PresenterState {
     fn has_free_buffer(&self) -> bool {
         self.buffers.len() < BUFFER_POOL_SIZE
-            || self.buffers.iter().any(|buf| !buf.slot.has_active_buffers())
+            || self
+                .buffers
+                .iter()
+                .any(|buf| !buf.slot.has_active_buffers())
     }
 
     fn present(
@@ -257,8 +260,6 @@ impl PresenterState {
                 self.buffers.len() - 1
             }
             None => {
-                // If all pool buffers are held by the compositor, do not tear or overwrite
-                // in-flight scanout memory. Skip this frame safely.
                 return Ok(());
             }
         };

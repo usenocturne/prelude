@@ -103,8 +103,6 @@ pub const MAX_ANDROID_AUTO_WORKER_STOP_WAIT: Duration = Duration::from_secs(5);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(10);
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 const VIDEO_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(10);
-/// How long the protocol loop waits for the phone or an input device before
-/// it services timers and the media backends again.
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 const TRANSPORT_OR_INPUT_WAIT: Duration = Duration::from_millis(10);
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
@@ -828,8 +826,6 @@ fn idle_probe(failure: Option<&RuntimeFailure>, retry: &RetrySchedule) -> Runtim
             "Android Auto is waiting for a positively identified Android phone".to_owned(),
         )
     };
-    // Postmortem failures must surface on projection_runtime. The idle-gate copy is only for
-    // NotReady waits, and stays transport-agnostic (wired AOAP and wireless TCP both apply).
     let detail = if matches!(state, HealthState::Failed) {
         transport_detail.clone()
     } else {
@@ -1621,29 +1617,18 @@ struct LiveMedia {
     audio_diagnostic_started: Instant,
     media_busy: Duration,
     media_busy_max: Duration,
-    /// Survives diagnostic window resets so PeerClosed can report the last observed max.
     last_media_busy_max: Duration,
     video_arrivals: VideoArrivalWindow,
     loop_window: LoopWindow,
     next_latency_diagnostic: Instant,
-    /// The kernel's TCP counters at the start of the current window.
     tcp_counters: Option<TcpCounters>,
-    /// Whether the protocol loop already waited for input together with the
-    /// phone's socket, so collecting input must not wait again.
     input_waits_with_transport: bool,
-    /// The kernel's account of TCP recovery at the start of the current
-    /// window, and its segment counts second by second within the window.
     tcp_recovery: Option<TcpRecoveryCounters>,
     tcp_seconds: SecondCounts,
-    /// The phone's address on the access point, for a wireless session.
     radio_peer: Option<String>,
-    /// The access point interface and the phone's station address on it,
-    /// once they have been found.
     radio_station: Option<(String, String)>,
     radio_report: Option<thread::JoinHandle<()>>,
     last_radio_report: Option<Instant>,
-    /// The local and remote ports of the phone's connection, by which the
-    /// kernel's account of it is found. USB sessions have none.
     link_ports: Option<(u16, u16)>,
 }
 
@@ -1796,8 +1781,6 @@ impl LiveMedia {
         })
     }
 
-    /// Waits until the phone's socket or pipe, or an input device has something to
-    /// read and returns whether the transport does.
     fn wait_for_transport_or_input(
         &mut self,
         transport: &TransportReadiness,
@@ -2316,9 +2299,6 @@ impl LiveMedia {
         Ok(())
     }
 
-    /// Logs what the access point's radio reports about the phone. The radio
-    /// is asked from another thread because the answer takes long enough to
-    /// hold up a video frame; nothing is sent to the phone.
     fn report_radio(&mut self) {
         if self
             .radio_report
@@ -2372,8 +2352,6 @@ impl LiveMedia {
             .ok();
     }
 
-    /// Reports, for the window just ended, where time went on each stage
-    /// between the phone and the screen and between a touch and the phone.
     fn log_latency_diagnostic<T: std::io::Read + std::io::Write + Send>(
         &mut self,
         session: &mut Session<T>,
@@ -2568,10 +2546,7 @@ impl LiveMedia {
         let touch = self.input.take_touch_wait();
         tracing::info!(
             raw_touch_events = touch.raw_events,
-            kernel_wait_avg_ms = touch
-                .total_micros
-                .checked_div(touch.raw_events)
-                .map(millis),
+            kernel_wait_avg_ms = touch.total_micros.checked_div(touch.raw_events).map(millis),
             kernel_wait_max_ms = millis(touch.maximum_micros),
             input_suppressed = self.input_suppressed,
             "Android Auto latency diagnostic: touch"
@@ -2704,8 +2679,8 @@ impl LiveMedia {
             .snapshot()
             .ok()
             .map(|snapshot| snapshot.presented_frames);
-        let queue_depth_cumulative = presented_frames
-            .map(|presented| ingress.queued_frames.saturating_sub(presented));
+        let queue_depth_cumulative =
+            presented_frames.map(|presented| ingress.queued_frames.saturating_sub(presented));
         (
             Some(ingress.queued_frames),
             Some(ingress.live_depth),
@@ -2917,8 +2892,6 @@ struct WorkerContext {
     hands_free: Option<HandsFree>,
     presets: PresetBindings,
     wireless_peer: Option<String>,
-    /// A second handle to the phone's socket or pipe, used only to wait until it has
-    /// something to read.
     transport_readiness: Option<TransportReadiness>,
 }
 
@@ -3006,20 +2979,19 @@ fn run_worker(
         WorkerTransport::Usb(candidate) => {
             run_usb_worker(&candidate, &context, &setup_cancellation)
         }
-        WorkerTransport::Wireless {
-            stream, lease, ..
-        } => {
+        WorkerTransport::Wireless { stream, lease, .. } => {
             set_stage(&progress, WorkerStage::OpeningProtocol);
             let bluetooth_address = car_bluetooth_address(&context);
             let readiness = context
                 .transport_readiness
                 .as_ref()
                 .and_then(|r| r.try_clone().ok());
-            let result =
-                run_protocol(stream, &context, bluetooth_address, readiness).and_then(|(result, stream)| {
+            let result = run_protocol(stream, &context, bluetooth_address, readiness).and_then(
+                |(result, stream)| {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     result
-                });
+                },
+            );
             if context.ended_by_phone.load(Ordering::Acquire) {
                 lease.ended_by_phone();
             }
@@ -3051,38 +3023,49 @@ fn car_bluetooth_address(context: &WorkerContext) -> Option<String> {
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
-struct UsbPipedIo {
+const USB_INBOUND_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+const USB_INBOUND_POLL: Duration = Duration::from_millis(100);
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+struct UsbInboundWorker {
     reader: std::os::unix::net::UnixStream,
-    transport: Option<UsbAoapTransport<RusbHandle>>,
-    write_timeout: Duration,
     cancellation: prelude_android_auto::CancellationToken,
-    worker_handle: Option<std::thread::JoinHandle<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+impl Drop for UsbInboundWorker {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        let _ = self.reader.shutdown(std::net::Shutdown::Both);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+struct UsbPipedIo {
+    inbound: UsbInboundWorker,
+    outbound: prelude_android_auto::AoapIo<RusbHandle>,
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 impl std::io::Read for UsbPipedIo {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.reader.read(buf)
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.inbound.reader.read(bytes)
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 impl std::io::Write for UsbPipedIo {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let Some(transport) = self.transport.as_mut() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "USB transport already closed",
-            ));
-        };
-        transport
-            .write_all(buf, self.write_timeout, &self.cancellation)
-            .map(|()| buf.len())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.outbound.write(bytes)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        self.outbound.flush()
     }
 }
 
@@ -3094,67 +3077,63 @@ impl UsbPipedIo {
         read_timeout: Duration,
         write_timeout: Duration,
     ) -> std::result::Result<(Self, std::os::unix::net::UnixStream), String> {
-        let (reader, mut writer) = std::os::unix::net::UnixStream::pair()
-            .map_err(|error| format!("creating Android Auto USB pipe pair failed: {error}"))?;
-        let readiness = reader
-            .try_clone()
-            .map_err(|error| format!("cloning Android Auto USB readiness handle failed: {error}"))?;
-        let _ = reader.set_read_timeout(Some(read_timeout));
-        let mut read_transport = transport
-            .try_clone()
-            .map_err(|error| format!("cloning Android Auto USB transport for inbound worker failed: {error}"))?;
-        let worker_cancellation = cancellation.clone();
+        use std::io::Write;
 
-        let worker_handle = std::thread::Builder::new()
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair()
+            .map_err(|error| format!("creating the Android Auto USB pipe failed: {error}"))?;
+        let readiness = reader.try_clone().map_err(|error| {
+            format!("cloning the Android Auto USB readiness handle failed: {error}")
+        })?;
+        reader
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|error| format!("configuring the Android Auto USB pipe failed: {error}"))?;
+        let mut inbound = transport.try_clone().map_err(|error| {
+            format!("cloning the Android Auto USB transport for its inbound worker failed: {error}")
+        })?;
+        let worker_cancellation = cancellation.clone();
+        let handle = thread::Builder::new()
             .name("aa-usb-rx".to_owned())
             .spawn(move || {
-                let mut buffer = vec![0u8; 64 * 1024];
-                let poll_interval = Duration::from_millis(100);
-                while !worker_cancellation.is_cancelled() {
-                    match read_transport.read(&mut buffer, poll_interval, &worker_cancellation) {
-                        Ok(0) => break,
-                        Ok(bytes) => {
-                            use std::io::Write;
-                            if writer.write_all(&buffer[..bytes]).is_err() {
+                let mut buffer = vec![0_u8; USB_INBOUND_BUFFER_BYTES];
+                loop {
+                    match inbound.read(&mut buffer, USB_INBOUND_POLL, &worker_cancellation) {
+                        Ok(length) => {
+                            if writer.write_all(&buffer[..length]).is_err() {
                                 break;
                             }
                         }
-                        Err(prelude_android_auto::Error::Timeout { .. }) => continue,
+                        Err(prelude_android_auto::Error::Timeout { .. }) => {}
                         Err(prelude_android_auto::Error::Cancelled { .. }) => break,
-                        Err(_) => break,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "reading from the Android Auto USB accessory failed"
+                            );
+                            break;
+                        }
                     }
                 }
             })
-            .map_err(|error| format!("spawning Android Auto USB inbound worker failed: {error}"))?;
-
+            .map_err(|error| {
+                format!("spawning the Android Auto USB inbound worker failed: {error}")
+            })?;
         Ok((
             Self {
-                reader,
-                transport: Some(transport),
-                write_timeout,
-                cancellation,
-                worker_handle: Some(worker_handle),
+                inbound: UsbInboundWorker {
+                    reader,
+                    cancellation: cancellation.clone(),
+                    handle: Some(handle),
+                },
+                outbound: transport.into_io(cancellation, read_timeout, write_timeout),
             },
             readiness,
         ))
     }
 
-    fn into_transport(mut self) -> UsbAoapTransport<RusbHandle> {
-        self.cancellation.cancel();
-        if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.join();
-        }
-        self.transport.take().expect("USB transport present")
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "linux-media"))]
-impl Drop for UsbPipedIo {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-        if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.join();
-        }
+    fn into_transport(self) -> UsbAoapTransport<RusbHandle> {
+        let Self { inbound, outbound } = self;
+        drop(inbound);
+        outbound.into_transport()
     }
 }
 
@@ -3192,7 +3171,7 @@ fn run_usb_worker(
         ),
         ..AoapTimeouts::default()
     };
-    let mut transport = match open_accessory(
+    let transport = match open_accessory(
         &mut backend,
         candidate,
         &identity,
@@ -3228,7 +3207,7 @@ fn run_usb_worker(
         bluetooth_address,
         Some(TransportReadiness::Unix(readiness)),
     )?;
-    let mut transport = io.into_transport();
+    let transport = io.into_transport();
     let transport_result = transport
         .close()
         .map_err(|error| format!("closing Android Auto USB transport failed: {error}"));
@@ -3309,9 +3288,6 @@ fn run_protocol<T: std::io::Read + std::io::Write + Send>(
                 drain_pre_media_controls(controls);
             }
             let transport_poll_started = Instant::now();
-            // With a socket to watch, wait for the phone and the input
-            // devices together: a blocking read would hold back a touch, and
-            // an input wait after every read would hold back the phone.
             let transport_ready = match (media.as_mut(), transport_readiness.as_ref()) {
                 (Some(media), Some(transport)) if session.state() == SessionState::Running => {
                     media.wait_for_transport_or_input(transport)?
@@ -3552,14 +3528,6 @@ fn run_protocol<T: std::io::Read + std::io::Write + Send>(
         {
             Ok(())
         } else {
-            // PeerClosed is transport EOF/TLS peer-close, not a protocol ByeBye.
-            // Field notes (Pixel wireless AA): Boot1 closed mid-video with 0 drops and
-            // no hostapd deauth; a later boot closed after PING_REQUEST. Do not lead with
-            // media-loop stall fixes (steady media_busy_max_ms was 20). Next capture needs
-            // phone-side AA logs plus this snapshot + hostapd/station lines from rebootstrap.
-            //
-            // The window in progress holds the seconds that led up to the
-            // disconnect; report it rather than lose it.
             if let Some(media) = media.as_mut() {
                 media.next_latency_diagnostic = Instant::now();
                 media.log_latency_diagnostic(&mut session);
@@ -3597,11 +3565,9 @@ fn run_protocol<T: std::io::Read + std::io::Write + Send>(
                     .unwrap_or(peer)
                     .parse()
                     .ok()?;
-                wifi_interface
-                    .as_deref()
-                    .and_then(|interface| {
-                        prelude_wireless::access_point::station_for(interface, ip)
-                    })
+                wifi_interface.as_deref().and_then(|interface| {
+                    prelude_wireless::access_point::station_for(interface, ip)
+                })
             });
             let transport_close = match reason {
                 DisconnectReason::PeerClosed => "eof",
@@ -4035,7 +4001,11 @@ mod tests {
             "idle-gate copy must stay transport-agnostic"
         );
         assert_ne!(waiting.detail, waiting.transport_detail);
-        assert!(waiting.transport_detail.contains("waiting for a positively identified"));
+        assert!(
+            waiting
+                .transport_detail
+                .contains("waiting for a positively identified")
+        );
     }
 
     #[test]

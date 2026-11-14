@@ -1,10 +1,3 @@
-//! Watches the USB buses through the kernel's usbmon text interface, to tell
-//! whether packets for the phone wait on this side of the Wi-Fi adapter, wait
-//! inside it, or are lost on the cable.
-//!
-//! Only the head of each event is used. The bytes carried by a transfer are
-//! never kept or logged.
-
 #![cfg_attr(
     not(all(target_os = "linux", feature = "linux-media")),
     allow(dead_code)
@@ -19,17 +12,12 @@ use std::{
     thread,
 };
 
-/// Every bus at once. Root hubs are told apart by their device number.
 const MONITOR_PATH: &str = "/sys/kernel/debug/usb/usbmon/0u";
+const ENABLE_VARIABLE: &str = "PRELUDE_USB_MONITOR";
 const ROOT_HUB: u16 = 1;
-/// usbmon stamps events in microseconds that start over every 4096 seconds.
 const TIMESTAMP_SPAN: u64 = 4_096 * 1_000_000;
-/// A silence this long, in microseconds, counts as a pause.
 const PAUSE: u64 = 100_000;
-/// How much must arrive from the adapter during a silence towards it before
-/// the silence counts as packets being held rather than nothing to send.
 const HOLD_INBOUND_BYTES: u64 = 4_000;
-/// Control transfers closer together than this belong to one burst.
 const BURST_GAP: u64 = 20_000;
 const SAMPLES: usize = 12;
 const FAILURES: usize = 8;
@@ -61,14 +49,10 @@ struct UsbEvent {
     inbound: bool,
     device: u16,
     endpoint: u8,
-    /// The transfer's status. Only a completion or a refusal carries a
-    /// meaningful one.
     status: Option<i32>,
     length: u64,
 }
 
-/// Reads the head of one usbmon `u` format line, such as
-/// `ffff 3575914555 S Bo:1:005:2 -115 31 = 55534243`.
 fn parse_event(line: &str) -> Option<UsbEvent> {
     let mut fields = line.split_ascii_whitespace();
     let urb = u64::from_str_radix(fields.next()?, 16).ok()?;
@@ -99,8 +83,6 @@ fn parse_event(line: &str) -> Option<UsbEvent> {
     let word = fields.next()?;
     let (status, length) = match word.split(':').next()?.parse::<i32>() {
         Ok(status) => (Some(status), fields.next()?),
-        // A setup packet stands where the status would: a tag and five
-        // fields, then the length.
         Err(_) => (None, fields.nth(5)?),
     };
     Some(UsbEvent {
@@ -116,18 +98,14 @@ fn parse_event(line: &str) -> Option<UsbEvent> {
     })
 }
 
-/// Microseconds from one usbmon stamp to a later one.
 fn elapsed(from: u64, to: u64) -> u64 {
     (to % TIMESTAMP_SPAN + TIMESTAMP_SPAN - from % TIMESTAMP_SPAN) % TIMESTAMP_SPAN
 }
 
-/// What crossed the USB buses, other than their root hubs, in one window.
-/// Times are in microseconds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct UsbWindow {
     pub(crate) events: u64,
     pub(crate) unparsed: u64,
-    /// Transfers the host controller refused to start.
     pub(crate) refused: u64,
     pub(crate) out_submitted: u64,
     pub(crate) out_completed: u64,
@@ -137,12 +115,8 @@ pub(crate) struct UsbWindow {
     pub(crate) out_latency_maximum: u64,
     pub(crate) out_in_flight_maximum: u64,
     pub(crate) out_gap_maximum: u64,
-    /// Pauses in what was handed to the adapter while it kept delivering
-    /// data from the air.
     pub(crate) out_holds: u64,
     pub(crate) out_hold_samples: Vec<u64>,
-    /// For those pauses, how long after the driver's latest burst of control
-    /// transfers began the first packet was handed over again.
     pub(crate) out_resumed_after_control: Vec<u64>,
     pub(crate) in_completed: u64,
     pub(crate) in_failed: u64,
@@ -156,10 +130,7 @@ pub(crate) struct UsbWindow {
     pub(crate) control_bursts: u64,
     pub(crate) control_burst_intervals: Vec<u64>,
     pub(crate) control_burst_span_maximum: u64,
-    /// The first transfers that failed, as direction, endpoint, device and
-    /// status.
     pub(crate) failures: Vec<String>,
-    /// Bulk transfers completed with data, by direction and endpoint.
     pub(crate) endpoints: BTreeMap<(bool, u8), u64>,
 }
 
@@ -168,7 +139,6 @@ impl UsbWindow {
         self.out_latency_total.checked_div(self.out_completed)
     }
 
-    /// Renders the endpoints as `out5:120 in4:300`.
     pub(crate) fn render_endpoints(&self) -> String {
         self.endpoints
             .iter()
@@ -181,7 +151,6 @@ impl UsbWindow {
     }
 }
 
-/// Renders microseconds as milliseconds separated by spaces.
 pub(crate) fn render_millis(micros: &[u64]) -> String {
     micros
         .iter()
@@ -199,8 +168,6 @@ fn sample(samples: &mut Vec<u64>, value: u64) {
 #[derive(Debug, Default)]
 struct Tracker {
     window: UsbWindow,
-    /// When each transfer still in flight was submitted, and whether it is a
-    /// bulk transfer towards the device.
     pending: HashMap<u64, (u64, bool)>,
     out_in_flight: u64,
     last_out_submit: Option<u64>,
@@ -208,8 +175,6 @@ struct Tracker {
     last_inbound: Option<u64>,
     burst_started: Option<u64>,
     last_control_submit: Option<u64>,
-    /// The head of the first line seen of each kind, to check the reading
-    /// of the format against the real thing.
     examples: BTreeMap<&'static str, String>,
     examples_reported: bool,
 }
@@ -365,8 +330,6 @@ impl Tracker {
         }
     }
 
-    /// Notes when a transfer was submitted. Transfers whose completion was
-    /// never seen are forgotten once enough of them pile up.
     fn remember(&mut self, event: &UsbEvent, outbound_bulk: bool) {
         if self.pending.len() >= PENDING_LIMIT {
             let now = event.micros;
@@ -402,7 +365,6 @@ impl Tracker {
         ));
     }
 
-    /// Keeps the head of a line, without the bytes of the transfer.
     fn keep_example(&mut self, kind: &'static str, line: &str) {
         if self.examples.contains_key(kind) {
             return;
@@ -429,9 +391,10 @@ impl Tracker {
 
 static MONITOR: Mutex<Option<Arc<Mutex<Tracker>>>> = Mutex::new(None);
 
-/// Starts watching the USB buses unless that is already under way. Loads
-/// the kernel's usbmon module when its files are missing.
 pub(crate) fn start() {
+    if std::env::var_os(ENABLE_VARIABLE).is_none() {
+        return;
+    }
     let Ok(mut monitor) = MONITOR.lock() else {
         return;
     };
@@ -500,20 +463,12 @@ fn with_tracker<T>(action: impl FnOnce(&mut Tracker) -> T) -> Option<T> {
     Some(action(&mut tracker))
 }
 
-/// Forgets what was counted so far, so the next window starts now.
 pub(crate) fn discard_window() {
     let _ = with_tracker(|tracker| tracker.window = UsbWindow::default());
 }
 
-/// Takes what was counted since the last call. The second value is, once,
-/// the head of the first line of each kind.
 pub(crate) fn take_window() -> Option<(UsbWindow, Option<String>)> {
-    with_tracker(|tracker| {
-        (
-            std::mem::take(&mut tracker.window),
-            tracker.take_examples(),
-        )
-    })
+    with_tracker(|tracker| (std::mem::take(&mut tracker.window), tracker.take_examples()))
 }
 
 #[cfg(test)]
@@ -562,8 +517,8 @@ mod tests {
         assert_eq!((bulk.device, bulk.endpoint), (5, 2));
         assert_eq!((bulk.status, bulk.length), (Some(-115), 31));
 
-        let interrupt = parse_event("c0de 100 C Ii:1:001:1 0:2048 2 = 0400")
-            .expect("interrupt completion");
+        let interrupt =
+            parse_event("c0de 100 C Ii:1:001:1 0:2048 2 = 0400").expect("interrupt completion");
         assert_eq!(interrupt.transfer, Transfer::Interrupt);
         assert_eq!((interrupt.status, interrupt.length), (Some(0), 2));
 
@@ -588,8 +543,6 @@ mod tests {
     fn a_silence_towards_the_adapter_while_it_delivers_is_a_hold() {
         let mut tracker = Tracker::default();
         let mut lines = vec![out(1, 1_000_000, 'S', -115), out(1, 1_000_300, 'C', 0)];
-        // The driver's control burst, then data arriving while nothing is
-        // handed to the adapter for 200 ms.
         lines.push(control(9, 1_010_000));
         lines.push(control(9, 1_011_000));
         for arrival in 0..4_u64 {
@@ -597,7 +550,6 @@ mod tests {
         }
         lines.push(control(9, 1_190_000));
         lines.push(out(3, 1_200_000, 'S', -115));
-        // A silence with nothing arriving is not a hold.
         lines.push(out(4, 1_500_000, 'S', -115));
         record(&mut tracker, &lines);
 
@@ -631,7 +583,6 @@ mod tests {
                 "00000000000000aa 3000 C Bi:1:002:4 -71 0".to_owned(),
                 "00000000000000ab 4000 E Bo:1:002:5 -19 0".to_owned(),
                 "00000000000000ac 5000 C Ci:1:002:0 -110 0".to_owned(),
-                // The root hub is not the adapter.
                 "00000000000000ad 6000 C Ii:1:001:1 -71:2048 0".to_owned(),
                 "garbage".to_owned(),
             ],
@@ -660,7 +611,11 @@ mod tests {
         assert_eq!(tracker.take_examples(), None);
         record(
             &mut tracker,
-            &[out(1, 1_000, 'S', -115), inbound(2, 2_000, 64), inbound(3, 3_000, 64)],
+            &[
+                out(1, 1_000, 'S', -115),
+                inbound(2, 2_000, 64),
+                inbound(3, 3_000, 64),
+            ],
         );
         let examples = tracker.take_examples().expect("examples");
         assert_eq!(

@@ -41,11 +41,6 @@ const VIDEO_HEIGHT: u32 = 480;
 const MICROPHONE_SESSION_ID: i32 = 1;
 const MAX_MIC_WINDOW: usize = 16;
 const AUDIO_MAX_UNACKED: u32 = 4;
-/// How many video frames the phone may send before one of them has been
-/// acknowledged. With TCP_QUICKACK enabled, ACKs return immediately without
-/// delayed-ACK stall, and 6 frames provide ~100ms credit buffer at 60fps (or
-/// ~200ms at 30fps) to absorb Wi-Fi packet jitter without buffering lag or
-/// triggering TCP buffer-bloat retransmission cascades.
 const VIDEO_MAX_UNACKED: u32 = 6;
 const READ_BUFFER_LIMIT: usize = 256 * 1024;
 const MAX_ACTIVE_TLS_REASSEMBLIES: usize = 16;
@@ -138,43 +133,27 @@ pub struct SessionTrace {
     pub opened_channels: Vec<u8>,
 }
 
-/// Measurements of the transport link since the window was last taken.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkWindow {
-    /// Transport reads that returned data.
     pub reads: u64,
     pub read_bytes: u64,
-    /// Transport reads that ended at their timeout with no data.
     pub read_timeouts: u64,
-    /// Pings the phone answered, and how long each answer took.
     pub ping_round_trips: u64,
     pub ping_total_micros: u64,
     pub ping_minimum_micros: u64,
     pub ping_maximum_micros: u64,
-    /// Video frames received, the reads each one needed, and the time from
-    /// the first read holding part of a frame to the frame being complete.
     pub video_frames: u64,
     pub video_reads_total: u64,
     pub video_reads_maximum: u64,
     pub video_assembly_total_micros: u64,
     pub video_assembly_maximum_micros: u64,
-    /// The round trip of each answered ping in the order the answers came,
-    /// for the first [`LINK_SAMPLES`] of them.
     pub ping_round_trip_micros: [u64; LINK_SAMPLES],
-    /// Pings the phone sent.
     pub phone_pings: u64,
-    /// How many of the phone's pings have a gap recorded below.
     pub phone_ping_gaps: u64,
-    /// For each ping the phone sent after its first: how long after the
-    /// previous one it arrived here, and how far the timestamp the phone
-    /// wrote into it had advanced, in the phone's own unit. The phone sends
-    /// its pings without waiting for anything from this side, so where the
-    /// two disagree the ping was held up on its way here.
     pub phone_ping_arrival_gap_micros: [u64; LINK_SAMPLES],
     pub phone_ping_timestamp_gap: [i64; LINK_SAMPLES],
 }
 
-/// How many individual pings of each direction a window keeps.
 pub const LINK_SAMPLES: usize = 8;
 
 impl LinkWindow {
@@ -574,12 +553,8 @@ pub struct Session<T> {
     disconnected_emitted: bool,
     trace: SessionTrace,
     link: LinkWindow,
-    /// The timestamp of the ping awaiting its answer, and when it was written.
     ping_sent: Option<(i64, Instant)>,
-    /// The timestamp inside the phone's latest ping, and when it arrived.
     phone_ping: Option<(i64, Instant)>,
-    /// When the first read holding part of the message now being assembled
-    /// returned, and how many reads that message has taken so far.
     receive_started: Option<(Instant, u64)>,
     read_buffer: Vec<u8>,
 }
@@ -631,8 +606,6 @@ impl<T: Read + Write + Send> Session<T> {
         })
     }
 
-    /// Returns the link measurements since the last call and starts a new
-    /// window.
     pub fn take_link_window(&mut self) -> LinkWindow {
         std::mem::take(&mut self.link)
     }
@@ -689,8 +662,6 @@ impl<T: Read + Write + Send> Session<T> {
                         if self.receive_is_idle() {
                             self.receive_started = None;
                         } else if self.receive_started.is_none() {
-                            // A message completed in this read and the bytes left
-                            // over belong to the next one.
                             self.receive_started = Some((received_at, 1));
                         }
                         Ok(events)
@@ -733,7 +704,6 @@ impl<T: Read + Write + Send> Session<T> {
         Ok(events)
     }
 
-    /// Whether no partially received message is waiting for more bytes.
     fn receive_is_idle(&self) -> bool {
         self.decoder.buffered_len() == 0
             && self.plaintext.is_idle()
@@ -1158,8 +1128,6 @@ impl<T: Read + Write + Send> Session<T> {
         if channel_id == channel::VIDEO
             && matches!(message_id, message::MEDIA | message::MEDIA_WITH_TIMESTAMP)
         {
-            // A frame with no recorded start arrived whole in a read that
-            // also completed an earlier message.
             let (assembly, reads) = assembly.map_or((Duration::ZERO, 1), |(started, reads)| {
                 (started.elapsed(), reads)
             });

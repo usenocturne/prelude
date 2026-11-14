@@ -11,8 +11,7 @@ use std::{
 };
 
 use crate::{
-    DurationStats, Error, Result, SCREEN_HEIGHT, SCREEN_WIDTH,
-    wayland_presenter::WaylandPresenter,
+    DurationStats, Error, Result, SCREEN_HEIGHT, SCREEN_WIDTH, wayland_presenter::WaylandPresenter,
 };
 
 const DISPLAY_POLL: Duration = Duration::from_millis(16);
@@ -36,10 +35,7 @@ struct DisplayState {
     generation: u64,
     stopped: bool,
     failure: Option<String>,
-    /// When the newest video frame was submitted, until the display thread
-    /// commits it to the compositor.
     video_submitted_at: Option<Instant>,
-    /// Video submission to compositor commit, since the last reading.
     video_commit: DurationStats,
 }
 
@@ -303,8 +299,6 @@ impl LinuxDisplayHandle {
         Ok(())
     }
 
-    /// Returns how long video frames waited between submission and their
-    /// compositor commit since the last call, and starts a new window.
     pub fn take_video_commit_stats(&self) -> DurationStats {
         self.shared
             .state

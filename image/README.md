@@ -297,6 +297,10 @@ CarPlay calls ride the CarPlay session's telephony stream instead.
 - The journal is persistent. Wireless failures happen with the hub attached,
   so hold Back while powering on to boot into USB recovery, then read the
   failed boot with `journalctl -b -1 -u preluded`.
+- Setting `PRELUDE_USB_MONITOR=1` in `/etc/default/preluded` makes preluded
+  load `usbmon` and add USB bus statistics for the Wi-Fi adapter to the
+  wireless Android Auto latency diagnostics. It is off by default because it
+  traces every USB transfer on the device.
 
 ## Verification
 

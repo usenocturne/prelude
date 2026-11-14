@@ -1,6 +1,3 @@
-//! Measurements that locate where Android Auto time goes between the phone
-//! and the screen, and between a touch and the phone.
-
 #![cfg_attr(
     not(all(target_os = "linux", feature = "linux-media")),
     allow(dead_code)
@@ -8,12 +5,8 @@
 
 use std::time::{Duration, Instant};
 
-/// Upper bounds, in milliseconds, of the gap histogram buckets. Gaps at or
-/// above the last bound land in one further bucket.
 pub(crate) const GAP_BUCKET_BOUNDS_MS: [u64; 6] = [20, 40, 70, 120, 250, 1_000];
 
-/// How many gaps fell under each bound of [`GAP_BUCKET_BOUNDS_MS`], plus the
-/// gaps at or above the last bound.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct GapHistogram([u64; GAP_BUCKET_BOUNDS_MS.len() + 1]);
 
@@ -26,7 +19,6 @@ impl GapHistogram {
         self.0[bucket] = self.0[bucket].saturating_add(1);
     }
 
-    /// Renders the buckets as `<20:3 <40:0 ... >=1000:1`.
     pub(crate) fn render(&self) -> String {
         let mut rendered = String::new();
         for (index, count) in self.0.iter().enumerate() {
@@ -45,13 +37,9 @@ impl GapHistogram {
     }
 }
 
-/// A gap this long between two frames counts as the stream having paused.
 const PAUSE_THRESHOLD: Duration = Duration::from_millis(80);
 const MAXIMUM_PAUSE_INTERVALS: usize = 64;
 
-/// The time from each resumption of the stream after a pause to the next
-/// one. A link that stalls on a fixed cycle shows up as intervals that are
-/// multiples of that cycle.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PauseIntervals {
     millis: [u16; MAXIMUM_PAUSE_INTERVALS],
@@ -87,7 +75,6 @@ impl PauseIntervals {
         self.last_resumption = Some(arrived_at);
     }
 
-    /// Renders the intervals in milliseconds, in the order they happened.
     pub(crate) fn render(&self) -> String {
         self.millis[..self.recorded]
             .iter()
@@ -97,8 +84,6 @@ impl PauseIntervals {
     }
 }
 
-/// Video frames as they arrive from the phone, compared with the phone's own
-/// timestamps for the same frames.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VideoArrivalWindow {
     pub(crate) frames: u64,
@@ -114,12 +99,9 @@ pub(crate) struct VideoArrivalWindow {
     last_phone_micros: Option<u64>,
     pub(crate) maximum_phone_gap_micros: u64,
     pub(crate) phone_gaps: GapHistogram,
-    /// The first timestamped frame of the session: its arrival and its phone
-    /// timestamp. Later frames are compared against it.
     anchor: Option<(Instant, u64)>,
     minimum_skew_micros: Option<i64>,
     maximum_skew_micros: Option<i64>,
-    /// The smallest skew seen since the session started.
     session_minimum_skew_micros: Option<i64>,
 }
 
@@ -165,7 +147,6 @@ impl VideoArrivalWindow {
         );
     }
 
-    /// Wall time between the first and last arrival of the window.
     pub(crate) fn arrival_span(&self) -> Option<Duration> {
         Some(
             self.last_arrival?
@@ -173,7 +154,6 @@ impl VideoArrivalWindow {
         )
     }
 
-    /// Phone time between the first and last timestamped frame of the window.
     pub(crate) fn phone_span_micros(&self) -> Option<u64> {
         Some(
             self.last_phone_micros?
@@ -181,9 +161,6 @@ impl VideoArrivalWindow {
         )
     }
 
-    /// How much later than the session's fastest frame the window's fastest
-    /// frame arrived, measured against the phone's timestamps. A value that
-    /// keeps growing means frames are backing up before they reach us.
     pub(crate) fn minimum_delay_over_floor_micros(&self) -> Option<i64> {
         Some(
             self.minimum_skew_micros?
@@ -191,8 +168,6 @@ impl VideoArrivalWindow {
         )
     }
 
-    /// How much later than the session's fastest frame the window's slowest
-    /// frame arrived, measured against the phone's timestamps.
     pub(crate) fn maximum_delay_over_floor_micros(&self) -> Option<i64> {
         Some(
             self.maximum_skew_micros?
@@ -200,7 +175,6 @@ impl VideoArrivalWindow {
         )
     }
 
-    /// Starts a new window, keeping what later frames are compared against.
     pub(crate) fn restart(&mut self) {
         *self = Self {
             last_arrival: self.last_arrival,
@@ -216,16 +190,11 @@ impl VideoArrivalWindow {
     }
 }
 
-/// How the protocol thread spent one window.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct LoopWindow {
     pub(crate) iterations: u64,
-    /// Time inside the transport read, which is where the thread waits for
-    /// the phone.
     pub(crate) transport_wait: Duration,
     pub(crate) maximum_transport_wait: Duration,
-    /// Time inside the input poll, which is where the thread waits for the
-    /// touch screen and the knob.
     pub(crate) input_wait: Duration,
     pub(crate) maximum_input_wait: Duration,
 }
@@ -243,9 +212,6 @@ impl LoopWindow {
     }
 }
 
-/// The kernel's TCP segment counters. These cover every connection on the
-/// device, not only Android Auto; an idle device was observed to leave them
-/// at zero, so during a session they are dominated by the phone link.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TcpCounters {
     pub(crate) segments_received: u64,
@@ -253,8 +219,6 @@ pub(crate) struct TcpCounters {
     pub(crate) segments_retransmitted: u64,
 }
 
-/// One protocol's counters from a kernel statistics file, where a line of
-/// column names is followed by a line of values with the same prefix.
 struct CounterTable<'a> {
     names: Vec<&'a str>,
     values: Vec<&'a str>,
@@ -280,8 +244,6 @@ impl TcpCounters {
         Self::parse(&std::fs::read_to_string("/proc/net/snmp").ok()?)
     }
 
-    /// Reads the counters from the two `Tcp:` lines of `/proc/net/snmp`: the
-    /// first names the columns and the second holds the values.
     fn parse(table: &str) -> Option<Self> {
         let table = CounterTable::find(table, "Tcp:")?;
         Some(Self {
@@ -291,10 +253,11 @@ impl TcpCounters {
         })
     }
 
-    /// How far the counters moved since `earlier`.
     pub(crate) fn since(self, earlier: Self) -> Self {
         Self {
-            segments_received: self.segments_received.saturating_sub(earlier.segments_received),
+            segments_received: self
+                .segments_received
+                .saturating_sub(earlier.segments_received),
             segments_sent: self.segments_sent.saturating_sub(earlier.segments_sent),
             segments_retransmitted: self
                 .segments_retransmitted
@@ -303,27 +266,14 @@ impl TcpCounters {
     }
 }
 
-/// The kernel's account of why TCP segments were sent again and of what the
-/// other side reported about them. Like [`TcpCounters`], these cover every
-/// connection on the device.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TcpRecoveryCounters {
-    /// Retransmissions made because nothing was acknowledged in time.
     pub(crate) timeouts: u64,
-    /// Probes sent to find out whether the tail of a burst was lost.
     pub(crate) loss_probes: u64,
-    /// Retransmissions made because later segments were acknowledged first.
     pub(crate) fast_retransmits: u64,
-    /// Times the phone reported receiving a segment twice, which means a
-    /// retransmission from here was not needed: the original was late, not
-    /// lost.
     pub(crate) needless_retransmits_reported: u64,
-    /// Times this side received a segment it already had, which means the
-    /// phone retransmitted something that had arrived.
     pub(crate) duplicates_received: u64,
-    /// Segments from the phone that arrived ahead of an earlier one.
     pub(crate) out_of_order_received: u64,
-    /// Acknowledgements this side held back to send with later data.
     pub(crate) delayed_acknowledgements: u64,
 }
 
@@ -347,12 +297,13 @@ impl TcpRecoveryCounters {
         })
     }
 
-    /// How far the counters moved since `earlier`.
     pub(crate) fn since(self, earlier: Self) -> Self {
         Self {
             timeouts: self.timeouts.saturating_sub(earlier.timeouts),
             loss_probes: self.loss_probes.saturating_sub(earlier.loss_probes),
-            fast_retransmits: self.fast_retransmits.saturating_sub(earlier.fast_retransmits),
+            fast_retransmits: self
+                .fast_retransmits
+                .saturating_sub(earlier.fast_retransmits),
             needless_retransmits_reported: self
                 .needless_retransmits_reported
                 .saturating_sub(earlier.needless_retransmits_reported),
@@ -369,8 +320,6 @@ impl TcpRecoveryCounters {
     }
 }
 
-/// Segment counts for each second of a window, so that the moment a link
-/// changes character can be placed to the second rather than to the window.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SecondCounts {
     previous: Option<(Instant, TcpCounters)>,
@@ -381,27 +330,16 @@ pub(crate) struct SecondCounts {
     backoffs: Vec<u64>,
 }
 
-/// What the kernel's TCP knows about the one connection to the phone.
-///
-/// The retransmission timeout is the kernel's smoothed round trip to the
-/// phone plus at least 200 ms, in steps of 10 ms. That round trip runs from
-/// a segment leaving here to the phone's kernel acknowledging it, so the
-/// Android Auto app on the phone plays no part in it: a timeout near 200 ms
-/// while Android Auto pings take far longer puts the delay in the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConnectionState {
     pub(crate) retransmission_timeout_ms: u64,
-    /// Bytes written to the phone that it has not yet acknowledged.
     pub(crate) unacknowledged_bytes: u64,
-    /// How many times in a row the oldest of those bytes was retransmitted.
     pub(crate) backoffs: u64,
 }
 
 impl ConnectionState {
-    /// Milliseconds in one of the clock ticks `/proc/net/tcp` counts in.
     const TICK_MS: u64 = 10;
 
-    /// Reads the state of the connection between two ports.
     pub(crate) fn read(local_port: u16, remote_port: u16) -> Option<Self> {
         ["/proc/net/tcp", "/proc/net/tcp6"]
             .iter()
@@ -416,8 +354,7 @@ impl ConnectionState {
         };
         table.lines().find_map(|line| {
             let fields: Vec<&str> = line.split_ascii_whitespace().collect();
-            if port(fields.get(1)?) != Some(local_port)
-                || port(fields.get(2)?) != Some(remote_port)
+            if port(fields.get(1)?) != Some(local_port) || port(fields.get(2)?) != Some(remote_port)
             {
                 return None;
             }
@@ -435,7 +372,6 @@ impl ConnectionState {
     }
 }
 
-/// The seconds of one window, each list oldest first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SecondSeries {
     pub(crate) received: String,
@@ -447,10 +383,8 @@ pub(crate) struct SecondSeries {
 
 impl SecondCounts {
     const INTERVAL: Duration = Duration::from_secs(1);
-    /// Seconds kept when a window is not collected on time.
     const LIMIT: usize = 30;
 
-    /// Whether a second has passed since the counters were last recorded.
     pub(crate) fn due(&self, now: Instant) -> bool {
         self.previous
             .is_none_or(|(at, _)| now.saturating_duration_since(at) >= Self::INTERVAL)
@@ -478,7 +412,6 @@ impl SecondCounts {
         self.previous = Some((now, counters));
     }
 
-    /// Renders the seconds recorded since the last call and starts over.
     pub(crate) fn take(&mut self) -> SecondSeries {
         let series = SecondSeries {
             received: render_list(&self.received),
@@ -496,7 +429,6 @@ impl SecondCounts {
     }
 }
 
-/// Renders values separated by spaces.
 pub(crate) fn render_list<T: ToString>(values: &[T]) -> String {
     values
         .iter()
@@ -505,7 +437,6 @@ pub(crate) fn render_list<T: ToString>(values: &[T]) -> String {
         .join(" ")
 }
 
-/// Renders bytes as lowercase hexadecimal.
 pub(crate) fn hexadecimal(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -574,7 +505,10 @@ mod tests {
         let moved = now.since(earlier);
         assert_eq!((moved.timeouts, moved.delayed_acknowledgements), (5, 30));
         assert_eq!(moved.duplicates_received, 7);
-        assert_eq!(TcpRecoveryCounters::parse("TcpExt: DelayedACKs\nTcpExt: 1\n"), None);
+        assert_eq!(
+            TcpRecoveryCounters::parse("TcpExt: DelayedACKs\nTcpExt: 1\n"),
+            None
+        );
     }
 
     #[test]
@@ -609,7 +543,6 @@ mod tests {
                 backoffs: "0 2".to_owned(),
             }
         );
-        // A session over USB has no connection to ask.
         seconds.record(at(start, 3_000), counters(230, 9), None);
         assert_eq!(
             seconds.take(),
@@ -653,7 +586,11 @@ mod tests {
         let start = Instant::now();
         let mut window = VideoArrivalWindow::default();
         for frame in 0..10_u64 {
-            window.record(at(start, frame * 33), Some(5_000_000 + frame * 33_000), 4_000);
+            window.record(
+                at(start, frame * 33),
+                Some(5_000_000 + frame * 33_000),
+                4_000,
+            );
         }
         assert_eq!(window.frames, 10);
         assert_eq!(window.timestamped_frames, 10);
@@ -663,7 +600,10 @@ mod tests {
         assert_eq!(window.maximum_phone_gap_micros, 33_000);
         assert_eq!(window.minimum_delay_over_floor_micros(), Some(0));
         assert_eq!(window.maximum_delay_over_floor_micros(), Some(0));
-        assert_eq!(window.arrival_gaps.render(), "<20:0 <40:9 <70:0 <120:0 <250:0 <1000:0 >=1000:0");
+        assert_eq!(
+            window.arrival_gaps.render(),
+            "<20:0 <40:9 <70:0 <120:0 <250:0 <1000:0 >=1000:0"
+        );
     }
 
     #[test]
@@ -687,14 +627,16 @@ mod tests {
             window.record(at(start, frame * 100), Some(frame * 100_000), 1);
         }
         assert_eq!(window.maximum_delay_over_floor_micros(), Some(0));
-        assert_eq!(window.phone_gaps.render(), "<20:0 <40:0 <70:0 <120:4 <250:0 <1000:0 >=1000:0");
+        assert_eq!(
+            window.phone_gaps.render(),
+            "<20:0 <40:0 <70:0 <120:4 <250:0 <1000:0 >=1000:0"
+        );
     }
 
     #[test]
     fn pauses_report_the_time_between_resumptions() {
         let start = Instant::now();
         let mut window = VideoArrivalWindow::default();
-        // Bursts of three frames 33 ms apart that resume every 250 ms.
         for burst in 0..4_u64 {
             for frame in 0..3_u64 {
                 window.record(at(start, burst * 250 + frame * 33), None, 1);
@@ -705,7 +647,6 @@ mod tests {
         window.restart();
         assert_eq!(window.pause_intervals.pauses, 0);
         assert_eq!(window.pause_intervals.render(), "");
-        // The interval that spans the restart is still measured.
         window.record(at(start, 1_000), None, 1);
         assert_eq!(window.pause_intervals.render(), "250");
     }
@@ -736,7 +677,10 @@ mod tests {
         assert_eq!(window.largest_frame_bytes, 30);
         assert_eq!(window.phone_span_micros(), None);
         assert_eq!(window.maximum_delay_over_floor_micros(), None);
-        assert_eq!(window.arrival_gaps.render(), "<20:0 <40:0 <70:0 <120:0 <250:0 <1000:0 >=1000:1");
+        assert_eq!(
+            window.arrival_gaps.render(),
+            "<20:0 <40:0 <70:0 <120:0 <250:0 <1000:0 >=1000:1"
+        );
     }
 
     #[test]

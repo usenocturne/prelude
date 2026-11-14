@@ -170,11 +170,8 @@ pub struct LinuxInputBatch {
     pub terminal: Option<LinuxInputTerminal>,
 }
 
-/// How long touch events waited in the kernel before this backend read them,
-/// since the window was last taken.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TouchWaitWindow {
-    /// Raw touch events read, including the synchronization markers.
     pub raw_events: u64,
     pub total_micros: u64,
     pub maximum_micros: u64,
@@ -347,16 +344,10 @@ impl LinuxInputBackend {
         self.config.grab_policy
     }
 
-    /// Returns how long touch events waited in the kernel since the last call
-    /// and starts a new window.
     pub fn take_touch_wait(&mut self) -> TouchWaitWindow {
         std::mem::take(&mut self.touch_wait)
     }
 
-    /// Waits until an input device or `other` has something to read, or
-    /// `timeout` passes, and returns whether `other` does. A caller that also
-    /// serves a socket uses this so neither side waits behind the other, and
-    /// then collects the input with [`Self::poll_ready`].
     pub fn wait_with(
         &self,
         other: BorrowedFd<'_>,
@@ -383,13 +374,10 @@ impl LinuxInputBackend {
             .is_some_and(|ready| ready.intersects(readable)))
     }
 
-    /// Collects the input that is ready now, waiting up to the configured
-    /// poll interval for some to arrive.
     pub fn poll(&mut self) -> Result<LinuxInputBatch, LinuxInputError> {
         self.poll_within(self.config.poll_interval)
     }
 
-    /// Collects the input that is ready now without waiting.
     pub fn poll_ready(&mut self) -> Result<LinuxInputBatch, LinuxInputError> {
         self.poll_within(Duration::ZERO)
     }
@@ -455,7 +443,6 @@ impl LinuxInputBackend {
             let fetched_at = SystemTime::now();
             for event in fetched {
                 if role == DeviceRole::Touch {
-                    // The kernel stamps each event when the panel reports it.
                     self.touch_wait.record(
                         fetched_at
                             .duration_since(event.timestamp())

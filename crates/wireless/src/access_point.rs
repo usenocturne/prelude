@@ -202,12 +202,6 @@ impl AccessPointConfig {
     }
 }
 
-/// Beacon interval in time units of 1.024 ms. A phone that lets its radio
-/// sleep collects what the access point holds for it once per beacon that
-/// carries a delivery indication, so with hostapd's defaults (100 time units,
-/// every second beacon) it can leave a packet waiting for 205 ms. Every
-/// beacon now carries the indication and beacons come twice as often, which
-/// bounds that wait at 51 ms.
 const BEACON_INTERVAL_TU: u32 = 50;
 
 pub fn render_hostapd(config: &AccessPointConfig, width: ChannelWidth) -> String {
@@ -466,7 +460,6 @@ impl StationControl {
         self.command(&format!("DENY_ACL DEL_MAC {station}"))
     }
 
-    /// Kick a station off the AP without adding it to DENY_ACL so it can reassociate.
     pub fn deauthenticate(&self, station: &str) -> Result<()> {
         let station = valid_station(station)?;
         self.command(&format!("DEAUTHENTICATE {station}"))
@@ -524,14 +517,11 @@ pub fn station_for(interface: &str, address: Ipv4Addr) -> Option<String> {
     station_in_arp_table(&table, interface, address)
 }
 
-/// Count complete ARP entries on `interface` (rough AP client contention signal).
 pub fn arp_station_count(interface: &str) -> Option<usize> {
     let table = fs::read_to_string("/proc/net/arp").ok()?;
     Some(count_arp_stations(&table, interface))
 }
 
-/// The radio's own counters for one associated station, as one line of
-/// `name=value` pairs, or `None` when the radio cannot be asked.
 pub fn station_link_summary(interface: &str, station: &str) -> Option<String> {
     let station = valid_station(station).ok()?;
     let output = Command::new("iw")
@@ -580,9 +570,6 @@ fn summarize_station(report: &str) -> String {
 }
 
 const RADIO_DEBUG_ROOT: &str = "/sys/kernel/debug/ieee80211";
-/// Debug files of the radio driver that report state it already holds in
-/// memory. Other files beside them reset the chip or read its registers when
-/// they are opened, so nothing outside these lists is ever read.
 const RADIO_DEBUG_FILES: [&str; 4] = [
     "runtime-pm",
     "deep-sleep",
@@ -616,9 +603,6 @@ fn radio_debug_directories(interface: &str, station: &str) -> Option<(PathBuf, P
     Some((root.join("mt76"), stations))
 }
 
-/// What the radio driver's debug files say about its own power saving and
-/// about one associated station, as one line of `name=value` pairs. Reading
-/// them sends nothing to the radio.
 pub fn radio_debug_summary(interface: &str, station: &str) -> Option<String> {
     let (radio, station) = radio_debug_directories(interface, station)?;
     let mut values = Vec::new();
@@ -635,8 +619,6 @@ pub fn radio_debug_summary(interface: &str, station: &str) -> Option<String> {
     (!values.is_empty()).then(|| values.join("; "))
 }
 
-/// The names of the debug files the radio driver offers, without reading any
-/// of them.
 pub fn radio_debug_names(interface: &str, station: &str) -> Option<String> {
     let (radio, station) = radio_debug_directories(interface, station)?;
     let names = |directory: &Path| -> String {
@@ -655,7 +637,6 @@ pub fn radio_debug_names(interface: &str, station: &str) -> Option<String> {
     ))
 }
 
-/// Joins the words of `text` with single spaces and cuts the result short.
 fn single_line(text: &str) -> String {
     let mut line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.len() > RADIO_DEBUG_VALUE_LIMIT {
@@ -684,16 +665,20 @@ fn station_in_arp_table(table: &str, interface: &str, address: Ipv4Addr) -> Opti
 }
 
 fn count_arp_stations(table: &str, interface: &str) -> usize {
-    table.lines().skip(1).filter(|line| {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let [_, _, flags, mac, _, device] = fields[..] else {
-            return false;
-        };
-        device == interface
-            && flags != "0x0"
-            && mac != "00:00:00:00:00:00"
-            && valid_station(mac).is_ok()
-    }).count()
+    table
+        .lines()
+        .skip(1)
+        .filter(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let [_, _, flags, mac, _, device] = fields[..] else {
+                return false;
+            };
+            device == interface
+                && flags != "0x0"
+                && mac != "00:00:00:00:00:00"
+                && valid_station(mac).is_ok()
+        })
+        .count()
 }
 
 fn start_attempts(config: &AccessPointConfig) -> Vec<(u8, ChannelWidth)> {
@@ -853,7 +838,10 @@ mod tests {
             "inactive_time=12 ms; tx_retries=42; tx_failed=1; signal=-48 [-50, -52] dBm; \
              tx_bitrate=270.0 MBit/s MCS 15 40MHz short GI"
         );
-        assert_eq!(summarize_station("command failed: No such file or directory (-2)\n"), "");
+        assert_eq!(
+            summarize_station("command failed: No such file or directory (-2)\n"),
+            ""
+        );
     }
 
     #[test]
@@ -875,7 +863,6 @@ mod tests {
         assert!(valid_station("aa:bb:cc:dd:ee:ff").is_ok());
         assert!(valid_station("aa:bb:cc:dd:ee:ff\nQUIT").is_err());
         assert!(valid_station("aa-bb-cc-dd-ee-ff").is_err());
-        // deauthenticate / deny / admit all share this validator.
         assert!(valid_station("not-a-mac").is_err());
     }
 

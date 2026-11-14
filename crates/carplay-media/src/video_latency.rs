@@ -1,9 +1,3 @@
-//! Per-frame latency measurement for the hardware video path.
-//!
-//! The probe follows every frame from socket arrival through the decoder to
-//! the display hand-off, so each stage of the pipeline reports a measured
-//! duration instead of an inferred one.
-
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -12,7 +6,6 @@ use std::{
 
 const MAXIMUM_TRACKED_FRAMES: usize = 512;
 
-/// Minimum, maximum, and mean of the durations observed in one window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DurationStats {
     pub count: u64,
@@ -55,44 +48,25 @@ impl DurationStats {
     }
 }
 
-/// One measurement window of the hardware video path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VideoLatencyWindow {
-    /// Frames handed to the decoder.
     pub pushed_frames: u64,
-    /// Decoded frames that came back out of the decoder.
     pub decoded_frames: u64,
-    /// Decoded frames handed to the display.
     pub rendered_frames: u64,
-    /// Frames the pipeline discarded before they reached the application.
     pub skipped_frames: u64,
-    /// Decoder outputs whose timestamp matched no tracked input.
     pub unmatched_outputs: u64,
-    /// Pipeline restarts, each of which discards every frame in flight.
     pub pipeline_restarts: u64,
-    /// Skipped pictures sent after frames to make the decoder return them.
     pub flush_pictures: u64,
-    /// Socket arrival to decoder input.
     pub ingress_wait: DurationStats,
-    /// Decoder input to decoder output.
     pub decode: DurationStats,
-    /// Decoder output to display hand-off.
     pub render: DurationStats,
-    /// Socket arrival to display hand-off.
     pub arrival_to_display: DurationStats,
-    /// Newer frames already inside the decoder when a frame came out. A
-    /// minimum above zero means the decoder holds frames back until later
-    /// input arrives.
     pub held_frames_minimum: Option<u64>,
     pub held_frames_maximum: Option<u64>,
-    /// Frames inside the decoder when the window was read.
     pub in_flight_frames: u64,
-    /// How long the oldest frame inside the decoder had been waiting when the
-    /// window was read.
     pub oldest_in_flight_micros: Option<u64>,
 }
 
-/// A decoded frame that is still waiting for its display hand-off.
 #[derive(Debug, Clone, Copy)]
 pub struct DecodedFrame {
     arrived_at: Option<Instant>,
@@ -121,7 +95,6 @@ pub struct VideoLatencyProbe {
 }
 
 impl VideoLatencyProbe {
-    /// Records when the frame with this identifier arrived from the phone.
     pub fn record_arrival(&self, frame_identifier: u64, arrived_at: Instant) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
@@ -132,8 +105,12 @@ impl VideoLatencyProbe {
         inner.arrivals.push_back((frame_identifier, arrived_at));
     }
 
-    /// Records a frame entering the decoder.
-    pub fn record_push(&self, frame_identifier: u64, presentation_time_ns: u64, pushed_at: Instant) {
+    pub fn record_push(
+        &self,
+        frame_identifier: u64,
+        presentation_time_ns: u64,
+        pushed_at: Instant,
+    ) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -169,7 +146,6 @@ impl VideoLatencyProbe {
         });
     }
 
-    /// Records a frame leaving the decoder.
     pub fn record_output(&self, presentation_time_ns: u64, decoded_at: Instant) -> DecodedFrame {
         let unmatched = DecodedFrame {
             arrived_at: None,
@@ -205,7 +181,6 @@ impl VideoLatencyProbe {
         }
     }
 
-    /// Records a decoded frame reaching the display.
     pub fn record_render(&self, frame: DecodedFrame, rendered_at: Instant) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
@@ -222,7 +197,6 @@ impl VideoLatencyProbe {
         }
     }
 
-    /// Records skipped pictures sent to the decoder after a frame.
     pub fn record_flush_pictures(&self, count: usize) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
@@ -230,7 +204,6 @@ impl VideoLatencyProbe {
         inner.window.flush_pictures = inner.window.flush_pictures.saturating_add(count as u64);
     }
 
-    /// Records a pipeline restart, which discards every frame in flight.
     pub fn record_pipeline_restart(&self) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
@@ -241,7 +214,6 @@ impl VideoLatencyProbe {
         inner.window.pipeline_restarts = inner.window.pipeline_restarts.saturating_add(1);
     }
 
-    /// Returns the current window and starts a new one.
     pub fn take_window(&self, now: Instant) -> VideoLatencyWindow {
         let Ok(mut inner) = self.inner.lock() else {
             return VideoLatencyWindow::default();
@@ -342,6 +314,9 @@ mod tests {
         assert_eq!(window.pipeline_restarts, 1);
         assert_eq!(window.skipped_frames, 2);
         assert_eq!(window.in_flight_frames, 0);
-        assert_eq!(probe.take_window(at(start, 4)), VideoLatencyWindow::default());
+        assert_eq!(
+            probe.take_window(at(start, 4)),
+            VideoLatencyWindow::default()
+        );
     }
 }
