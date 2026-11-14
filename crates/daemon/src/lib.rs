@@ -2,6 +2,7 @@
 
 mod airplay_data_channel;
 mod airplay_runtime;
+mod android_auto_latency;
 mod android_auto_runtime;
 mod audio_status;
 mod automatic_runtime;
@@ -17,6 +18,7 @@ mod fonts;
 mod hands_free;
 mod health;
 mod heartbeat;
+mod h264_sps;
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 mod host_ui;
 mod iap2_runtime;
@@ -31,6 +33,7 @@ mod settings;
 mod shared_mfi;
 #[cfg(any(test, all(target_os = "linux", feature = "linux-media")))]
 mod status_screen;
+mod usb_monitor;
 mod wired_runtime;
 mod wireless_carplay;
 mod wireless_runtime;
