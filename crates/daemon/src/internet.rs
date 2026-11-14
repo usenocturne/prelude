@@ -525,13 +525,18 @@ impl ClientBackend for StationBackend {
     }
 
     fn reachable(&self) -> bool {
-        let Ok(addresses) = (REACHABILITY_HOST, REACHABILITY_PORT).to_socket_addrs() else {
-            return false;
-        };
-        addresses
-            .into_iter()
-            .any(|address| TcpStream::connect_timeout(&address, REACHABILITY_TIMEOUT).is_ok())
+        reachable()
     }
+}
+
+/// Whether GitHub's API host answers on 443 from here.
+pub fn reachable() -> bool {
+    let Ok(addresses) = (REACHABILITY_HOST, REACHABILITY_PORT).to_socket_addrs() else {
+        return false;
+    };
+    addresses
+        .into_iter()
+        .any(|address| TcpStream::connect_timeout(&address, REACHABILITY_TIMEOUT).is_ok())
 }
 
 #[derive(Debug)]

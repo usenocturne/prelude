@@ -5,6 +5,7 @@
 //! and the bundle manifest check are pure functions; GitHub, `swupdate` and
 //! the reboot sit behind traits so the worker can be tested with fakes.
 
+pub mod io;
 pub mod release;
 pub mod system;
 
