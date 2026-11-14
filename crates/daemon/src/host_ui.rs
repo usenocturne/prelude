@@ -1,5 +1,7 @@
+// Tests here and in child modules reach `fs` through `super::*`.
+#[cfg(test)]
+use std::fs;
 use std::{
-    fs,
     path::PathBuf,
     sync::{
         Arc,
@@ -24,11 +26,13 @@ use crate::{
     WirelessPhoneDirectory,
     fonts::{self, FontSet},
     internet::{Internet, InternetState},
+    updater::{Candidate, UpdateState, Updater},
 };
 
 mod equalizer_ui;
 mod internet_ui;
 mod keyboard;
+mod updates_ui;
 use equalizer_ui::EqualizerUi;
 
 const DISPLAY_WIDTH: usize = 800;
@@ -129,6 +133,7 @@ impl HostUi {
         ambient_light: Option<AmbientLightControl>,
         phones: Option<WirelessPhoneDirectory>,
         internet: Option<Internet>,
+        updater: Option<Updater>,
     ) -> Result<Self, String> {
         let (events_tx, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -149,6 +154,7 @@ impl HostUi {
                     ambient_light,
                     phones,
                     internet,
+                    updater,
                     events_tx,
                     worker_wake,
                 );
@@ -273,6 +279,10 @@ enum Page {
     Internet,
     WifiNetworks,
     Keyboard,
+    Updates,
+    AllVersions,
+    UpdateConfirm,
+    UpdateProgress,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +313,17 @@ enum Item {
     Internet,
     InternetNetwork,
     InternetTest,
+    UpdateInstalled,
+    UpdateChannel,
+    UpdateNetwork,
+    CheckUpdates,
+    ShowAllVersions,
+    InstallUpdate,
+    UpdateVersion(usize),
+    ConfirmInstall,
+    CancelUpdate,
+    RestartNow,
+    Later,
     Network(usize),
     NetworkForget,
 }
@@ -525,6 +546,12 @@ struct SettingsUi<D> {
     keyboard: Option<keyboard::Keyboard>,
     keyboard_ssid: Vec<u8>,
     awaiting_connect: bool,
+    updater: Option<Updater>,
+    update_state: UpdateState,
+    update_versions: Vec<Candidate>,
+    update_choice: Option<Candidate>,
+    /// The Internet page was opened from Updates; Back returns there.
+    internet_return: bool,
     events: Sender<HostUiEvent>,
     wake: Arc<Notify>,
     fonts: &'static FontSet,
@@ -541,6 +568,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         ambient_light: Option<AmbientLightControl>,
         directory: Option<WirelessPhoneDirectory>,
         internet: Option<Internet>,
+        updater: Option<Updater>,
         events: Sender<HostUiEvent>,
         wake: Arc<Notify>,
     ) -> Self {
@@ -588,6 +616,11 @@ impl<D: OverlaySurface> SettingsUi<D> {
             keyboard: None,
             keyboard_ssid: Vec::new(),
             awaiting_connect: false,
+            update_state: updater.as_ref().map_or(UpdateState::Idle, Updater::state),
+            updater,
+            update_versions: Vec::new(),
+            update_choice: None,
+            internet_return: false,
             events,
             wake,
             fonts: fonts::shared(),
@@ -597,7 +630,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
     fn handle(&mut self, event: PlatformInputEvent) {
         match event.kind {
             PlatformInputEventKind::SettingsButton => {
-                if self.menu_open {
+                if self.menu_open && self.updates_locked() {
+                    // The install keeps the screen until it finishes.
+                } else if self.menu_open {
                     self.close();
                 } else {
                     self.open();
@@ -651,6 +686,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
 
     fn tick(&mut self) {
         if self.menu_open && self.poll_internet() {
+            self.redraw();
+        }
+        if self.menu_open && self.poll_updates() {
             self.redraw();
         }
         if self.menu_open && self.phones_refreshed.elapsed() >= PHONES_REFRESH_INTERVAL {
@@ -750,8 +788,18 @@ impl<D: OverlaySurface> SettingsUi<D> {
                     .footer("Wi-Fi restarts after settings close"),
             ],
             Page::Internet | Page::WifiNetworks | Page::Keyboard => self.internet_sections(),
+            Page::Updates | Page::AllVersions | Page::UpdateConfirm | Page::UpdateProgress => {
+                self.updates_sections()
+            }
             Page::Wifi | Page::Equalizer | Page::Support => Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn layout_sections_footer(&self) -> Option<&'static str> {
+        self.sections()
+            .into_iter()
+            .find_map(|section| section.footer)
     }
 
     fn layout(&self) -> Layout {
@@ -794,6 +842,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
             return;
         }
         self.menu_open = true;
+        self.internet_return = false;
         self.page = Page::Settings;
         self.focus = 0;
         self.settings_focus = 0;
@@ -1025,7 +1074,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
             Item::PresetsEnabled => self.toggle_presets_enabled(),
             Item::PresetsReset => self.reset_presets(),
             Item::Support => self.enter(Page::Support),
-            Item::Version => {}
+            Item::Version => self.open_updates(),
             Item::Phone(index) => self.open_phone(index),
             Item::Connect => self.connect_opened_phone(),
             Item::Forget => self.forget_opened_phone(),
@@ -1042,6 +1091,17 @@ impl<D: OverlaySurface> SettingsUi<D> {
             | Item::InternetTest
             | Item::Network(_)
             | Item::NetworkForget => self.activate_internet(item),
+            Item::UpdateInstalled
+            | Item::UpdateChannel
+            | Item::UpdateNetwork
+            | Item::CheckUpdates
+            | Item::ShowAllVersions
+            | Item::InstallUpdate
+            | Item::UpdateVersion(_)
+            | Item::ConfirmInstall
+            | Item::CancelUpdate
+            | Item::RestartNow
+            | Item::Later => self.activate_updates(item),
         }
     }
 
@@ -1204,6 +1264,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
             Page::Settings => {}
             Page::Phone => self.show_phones(self.phone_focus),
             Page::Internet | Page::WifiNetworks | Page::Keyboard => self.go_back_internet(),
+            Page::Updates | Page::AllVersions | Page::UpdateConfirm | Page::UpdateProgress => {
+                self.go_back_updates();
+            }
             _ => {
                 self.leave_subpage();
                 self.redraw();
@@ -1394,6 +1457,10 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 .keyboard
                 .as_ref()
                 .map_or("Password", |keyboard| keyboard.title.as_str()),
+            Page::Updates => "Updates",
+            Page::AllVersions => "All versions",
+            Page::UpdateConfirm => "Install update",
+            Page::UpdateProgress => "Updating",
         }
     }
 
@@ -1481,6 +1548,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 "Enable wireless projection to change Wi-Fi settings",
             ),
             Page::WifiNetworks => self.wifi_networks_empty_text(),
+            Page::AllVersions => self.all_versions_empty_text(),
             _ => return,
         };
         let center_x = DISPLAY_WIDTH as i32 / 2;
@@ -1866,6 +1934,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
             Item::Support => {
                 RowView::new("Support Prelude", Trailing::Link(String::new(), SECONDARY))
             }
+            Item::Version if self.updater.is_some() => {
+                RowView::new("Version", Trailing::Link(self.version.clone(), SECONDARY))
+            }
             Item::Version => {
                 RowView::new("Version", Trailing::Value(self.version.clone(), SECONDARY))
             }
@@ -1923,23 +1994,23 @@ impl<D: OverlaySurface> SettingsUi<D> {
             | Item::InternetTest
             | Item::Network(_)
             | Item::NetworkForget => self.internet_row_view(item),
+            Item::UpdateInstalled
+            | Item::UpdateChannel
+            | Item::UpdateNetwork
+            | Item::CheckUpdates
+            | Item::ShowAllVersions
+            | Item::InstallUpdate
+            | Item::UpdateVersion(_)
+            | Item::ConfirmInstall
+            | Item::CancelUpdate
+            | Item::RestartNow
+            | Item::Later => self.updates_row_view(item),
         }
     }
 }
 
 fn system_version() -> String {
-    fs::read_to_string("/etc/os-release")
-        .ok()
-        .and_then(|contents| os_release_version(&contents))
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
-}
-
-fn os_release_version(contents: &str) -> Option<String> {
-    contents
-        .lines()
-        .find_map(|line| line.strip_prefix("VERSION_ID="))
-        .map(|value| value.trim().trim_matches('"').to_owned())
-        .filter(|value| !value.is_empty())
+    crate::updater::system::installed_version()
 }
 
 const fn band_name(band: Band) -> &'static str {
@@ -2319,6 +2390,8 @@ mod tests {
     use crate::{
         fonts::bitmap_glyph,
         internet::{InternetCommand, InternetError, Route},
+        settings::UpdateChannel,
+        updater::UpdateCommand,
     };
 
     struct NullSurface;
@@ -2341,6 +2414,8 @@ mod tests {
         ui: SettingsUi<NullSurface>,
         events: Receiver<HostUiEvent>,
         internet_commands: Option<Receiver<InternetCommand>>,
+        update_commands: Option<Receiver<UpdateCommand>>,
+        update_cancel: Option<Arc<AtomicBool>>,
         _state: tempfile::TempDir,
     }
 
@@ -2362,6 +2437,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 sender,
                 Arc::new(Notify::new()),
             );
@@ -2370,8 +2446,45 @@ mod tests {
                 ui,
                 events,
                 internet_commands: None,
+                update_commands: None,
+                update_cancel: None,
                 _state: state,
             }
+        }
+
+        fn with_updater(mut self) -> Self {
+            let (updater, commands, cancel) = Updater::detached();
+            self.ui.updater = Some(updater);
+            self.update_commands = Some(commands);
+            self.update_cancel = Some(cancel);
+            self.ui.version = "1.0.12-test".to_owned();
+            self
+        }
+
+        fn update_commands(&self) -> Vec<UpdateCommand> {
+            self.update_commands
+                .as_ref()
+                .expect("updater")
+                .try_iter()
+                .collect()
+        }
+
+        fn cancelled(&self) -> bool {
+            self.update_cancel
+                .as_ref()
+                .expect("updater")
+                .load(Ordering::SeqCst)
+        }
+
+        fn set_update(&mut self, state: UpdateState) {
+            self.ui.updater.as_ref().expect("updater").set_state(state);
+            self.ui.tick();
+        }
+
+        fn open_updates(&mut self) {
+            self.focus(Item::Version);
+            self.press(KnobInputButton::Select);
+            assert_eq!(self.ui.page, Page::Updates);
         }
 
         fn with_internet(mut self) -> Self {
@@ -2464,6 +2577,276 @@ mod tests {
             Trailing::Switch(on) => on.to_string(),
             Trailing::None => String::new(),
         }
+    }
+
+    fn candidate(version: &str, relation: crate::updater::Relation) -> crate::updater::Candidate {
+        crate::updater::Candidate {
+            version: semver::Version::parse(version).expect("version"),
+            tag: format!("v{version}"),
+            asset: crate::updater::Asset {
+                name: format!("prelude_update_prod_v{version}.swu"),
+                size: 1000,
+                url: "https://example.invalid".to_owned(),
+                sha256: None,
+            },
+            relation,
+        }
+    }
+
+    fn page_items(harness: &Harness) -> Vec<Item> {
+        harness
+            .ui
+            .layout()
+            .rows
+            .iter()
+            .map(|row| row.item)
+            .collect()
+    }
+
+    #[test]
+    fn version_row_opens_updates() {
+        let mut harness = Harness::new().with_updater();
+        assert!(matches!(
+            harness.ui.row_view(Item::Version).trailing,
+            Trailing::Link(..)
+        ));
+        harness.open_updates();
+        assert_eq!(
+            trailing_value(&harness.ui.row_view(Item::UpdateInstalled)),
+            "1.0.12-test"
+        );
+        assert_eq!(
+            trailing_value(&harness.ui.row_view(Item::UpdateChannel)),
+            "Stable"
+        );
+        let mut plain = Harness::new();
+        assert!(matches!(
+            plain.ui.row_view(Item::Version).trailing,
+            Trailing::Value(..)
+        ));
+        plain.focus(Item::Version);
+        plain.press(KnobInputButton::Select);
+        assert_eq!(plain.ui.page, Page::Settings, "no updater, no Updates page");
+    }
+
+    #[test]
+    fn check_sends_command_with_channel() {
+        let mut harness = Harness::new().with_updater();
+        harness.open_updates();
+        harness.focus(Item::UpdateChannel);
+        harness.press(KnobInputButton::Select);
+        assert_eq!(harness.ui.settings.update_channel, UpdateChannel::Beta);
+        assert_eq!(
+            RuntimeSettings::load(&harness.ui.state_dir, RuntimeSettings::default())
+                .expect("saved")
+                .update_channel,
+            UpdateChannel::Beta
+        );
+        harness.focus(Item::CheckUpdates);
+        harness.press(KnobInputButton::Select);
+        assert_eq!(
+            harness.update_commands(),
+            vec![UpdateCommand::Check {
+                channel: UpdateChannel::Beta
+            }]
+        );
+    }
+
+    #[test]
+    fn available_shows_install_row_and_confirm() {
+        let mut harness = Harness::new().with_updater();
+        harness.open_updates();
+        let update = candidate("1.0.13-test", crate::updater::Relation::Newer);
+        harness.set_update(UpdateState::Available(update.clone()));
+        assert_eq!(
+            harness.ui.update_caption().as_deref(),
+            Some("1.0.13-test available")
+        );
+        assert_eq!(
+            harness.ui.row_view(Item::InstallUpdate).label,
+            "Install 1.0.13-test"
+        );
+        harness.focus(Item::InstallUpdate);
+        harness.press(KnobInputButton::Select);
+        assert_eq!(harness.ui.page, Page::UpdateConfirm);
+        assert_eq!(
+            harness.ui.layout_sections_footer(),
+            Some(updates_ui::CONFIRM_TEXT)
+        );
+        harness.focus(Item::ConfirmInstall);
+        assert_eq!(
+            harness.ui.row_view(Item::ConfirmInstall).label,
+            "Install 1.0.13-test"
+        );
+        harness.press(KnobInputButton::Select);
+        assert_eq!(
+            harness.update_commands(),
+            vec![UpdateCommand::Install(update)]
+        );
+        assert_eq!(harness.ui.page, Page::UpdateProgress);
+    }
+
+    #[test]
+    fn older_version_confirm_warns() {
+        let mut harness = Harness::new().with_updater();
+        harness.open_updates();
+        harness.focus(Item::ShowAllVersions);
+        harness.press(KnobInputButton::Select);
+        assert_eq!(harness.ui.page, Page::AllVersions);
+        assert!(matches!(
+            harness.update_commands().as_slice(),
+            [UpdateCommand::ListAll { .. }]
+        ));
+        harness.set_update(UpdateState::Versions(vec![
+            candidate("1.0.12-test", crate::updater::Relation::Installed),
+            candidate("1.0.11", crate::updater::Relation::Older),
+        ]));
+        harness.focus(Item::UpdateVersion(1));
+        harness.press(KnobInputButton::Select);
+        assert_eq!(harness.ui.page, Page::UpdateConfirm);
+        assert_eq!(
+            harness.ui.layout_sections_footer(),
+            Some(updates_ui::CONFIRM_OLDER_TEXT)
+        );
+    }
+
+    #[test]
+    fn all_versions_rows_label_relation() {
+        let mut harness = Harness::new().with_updater();
+        harness.open_updates();
+        harness.focus(Item::ShowAllVersions);
+        harness.press(KnobInputButton::Select);
+        harness.set_update(UpdateState::Versions(vec![
+            candidate("1.0.13", crate::updater::Relation::Newer),
+            candidate("1.0.12-test", crate::updater::Relation::Installed),
+            candidate("1.0.11", crate::updater::Relation::Older),
+        ]));
+        let details: Vec<_> = (0..3)
+            .map(|index| harness.ui.row_view(Item::UpdateVersion(index)).detail)
+            .collect();
+        assert_eq!(
+            details,
+            [
+                Some("Newer".to_owned()),
+                Some("Installed".to_owned()),
+                Some("Older - rollback".to_owned())
+            ]
+        );
+        harness.focus(Item::UpdateVersion(1));
+        harness.press(KnobInputButton::Select);
+        assert_eq!(
+            harness.ui.page,
+            Page::AllVersions,
+            "the installed row is inert"
+        );
+    }
+
+    #[test]
+    fn progress_locks_settings_button_and_back() {
+        let mut harness = Harness::new().with_updater();
+        harness.open_updates();
+        harness.set_update(UpdateState::Available(candidate(
+            "1.0.13",
+            crate::updater::Relation::Newer,
+        )));
+        harness.focus(Item::InstallUpdate);
+        harness.press(KnobInputButton::Select);
+        harness.focus(Item::ConfirmInstall);
+        harness.press(KnobInputButton::Select);
+        harness.set_update(UpdateState::Downloading {
+            version: "1.0.13".to_owned(),
+            done: 500,
+            total: 1000,
+        });
+        assert_eq!(
+            harness.ui.update_caption().as_deref(),
+            Some("Downloading 50%")
+        );
+        harness.send(PlatformInputEventKind::SettingsButton);
+        assert!(harness.ui.menu_open);
+        assert_eq!(harness.ui.page, Page::UpdateProgress);
+        harness.press(KnobInputButton::Back);
+        assert!(harness.cancelled(), "Back cancels a download");
+        assert_eq!(harness.ui.page, Page::UpdateProgress);
+
+        harness.set_update(UpdateState::Installing {
+            version: "1.0.13".to_owned(),
+        });
+        assert_eq!(page_items(&harness), Vec::<Item>::new());
+        harness.press(KnobInputButton::Back);
+        harness.send(PlatformInputEventKind::SettingsButton);
+        assert!(harness.ui.menu_open);
+        assert_eq!(harness.ui.page, Page::UpdateProgress);
+    }
+
+    #[test]
+    fn installed_offers_restart() {
+        let mut harness = Harness::new().with_updater();
+        harness.ui.enter(Page::UpdateProgress);
+        harness.set_update(UpdateState::Installed {
+            version: "1.0.13".to_owned(),
+        });
+        assert_eq!(page_items(&harness), vec![Item::RestartNow, Item::Later]);
+        harness.focus(Item::RestartNow);
+        harness.press(KnobInputButton::Select);
+        assert_eq!(harness.update_commands(), vec![UpdateCommand::Restart]);
+    }
+
+    #[test]
+    fn pending_update_shows_restart() {
+        let mut harness = Harness::new().with_updater();
+        crate::updater::system::write_pending(
+            &harness.ui.state_dir,
+            crate::updater::system::Slot::A,
+            "1.0.13",
+        )
+        .expect("pending");
+        harness.open_updates();
+        assert!(page_items(&harness).contains(&Item::RestartNow));
+        assert_eq!(
+            harness.ui.update_caption().as_deref(),
+            Some("Installed - restart to finish")
+        );
+    }
+
+    #[test]
+    fn unavailable_build_shows_message_only() {
+        let mut harness = Harness::new().with_updater();
+        harness.set_update(UpdateState::Unavailable(
+            crate::updater::UpdateError::Unavailable,
+        ));
+        harness.open_updates();
+        assert_eq!(page_items(&harness), vec![Item::UpdateInstalled]);
+        assert_eq!(
+            harness.ui.update_caption().as_deref(),
+            Some("Updates are not available on this build")
+        );
+    }
+
+    #[test]
+    fn network_row_opens_internet_and_back_returns_to_updates() {
+        let mut harness = Harness::new().with_internet().with_updater();
+        harness.open_updates();
+        harness.focus(Item::UpdateNetwork);
+        assert_eq!(
+            trailing_value(&harness.ui.row_view(Item::UpdateNetwork)),
+            "Choose…"
+        );
+        harness.press(KnobInputButton::Select);
+        assert_eq!(harness.ui.page, Page::Internet);
+        harness.press(KnobInputButton::Back);
+        assert_eq!(harness.ui.page, Page::Updates);
+        assert_eq!(harness.commands(), vec![InternetCommand::Release]);
+    }
+
+    #[test]
+    fn updates_installed_value_fits() {
+        let harness = Harness::new().with_updater();
+        let value = trailing_value(&harness.ui.row_view(Item::UpdateInstalled));
+        assert_eq!(harness.ui.fonts.fit(&value, VALUE_SIZE, false, 360), value);
+        let label_width = harness.ui.fonts.text_width("Installed", LABEL_SIZE, false);
+        let value_width = harness.ui.fonts.text_width(&value, VALUE_SIZE, false);
+        assert!(CONTENT_X + label_width + CONTROL_GAP + value_width < CONTENT_RIGHT);
     }
 
     #[test]
@@ -2800,11 +3183,18 @@ mod tests {
     #[test]
     fn version_comes_from_os_release() {
         assert_eq!(
-            os_release_version("ID=prelude\nVERSION_ID=\"1.0.0\"\n").as_deref(),
+            crate::updater::system::os_release_version("ID=prelude\nVERSION_ID=\"1.0.0\"\n")
+                .as_deref(),
             Some("1.0.0")
         );
-        assert_eq!(os_release_version("VERSION_ID=\"\"\n"), None);
-        assert_eq!(os_release_version("ID=prelude\n"), None);
+        assert_eq!(
+            crate::updater::system::os_release_version("VERSION_ID=\"\"\n"),
+            None
+        );
+        assert_eq!(
+            crate::updater::system::os_release_version("ID=prelude\n"),
+            None
+        );
     }
 
     #[test]
@@ -3290,7 +3680,18 @@ mod tests {
              Shift Delete Space Show Hide Join ABC 123 #+= Connect a USB Wi-Fi adapter adapter \
              removed Wrong password Network not found This network's security is not supported \
              Choose a network No address from the network Connected, but the internet is \
-             unreachable Wi-Fi failed Press Back to try again"
+             unreachable Wi-Fi failed Press Back to try again \
+             Updates Installed Stable Beta Check for updates Show all versions Install Restart now \
+             Later Cancel Up to date available Connecting… Checking… Downloading 100% Verifying… \
+             Installing… keep power connected Installed - restart to finish Newer Older - rollback \
+             CarPlay and Android Auto pause during the update. Keep power connected. This is older \
+             than the installed version. Updates are not available on this build No update for \
+             this build type Could not get online GitHub is busy. Try again later. Could not reach \
+             GitHub Not enough free space The download failed The download is not the expected \
+             file Install failed. Nothing was changed. Restart to finish the last update Updates \
+             need a healthy start first. Try again in a minute. This system's slot could not be \
+             read All versions Install update Updating No versions found Looking for Prelude \
+             releases"
                 .chars()
         {
             assert!(

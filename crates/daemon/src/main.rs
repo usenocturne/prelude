@@ -182,8 +182,7 @@ async fn main() -> Result<()> {
         wireless.show_pairing_codes(display.handle(), config.state_dir.clone())?;
     }
     let mut daemon = Daemon::new(config, discovery, runtime)?;
-    // Held for the life of the daemon; Task 6 hands it to the Updates page.
-    let _updater = start_updater(daemon.config(), wireless.as_ref());
+    let updater = start_updater(daemon.config(), wireless.as_ref());
 
     #[cfg(all(target_os = "linux", feature = "linux-media"))]
     let host_ui = display.as_ref().map(|display_runtime| {
@@ -196,6 +195,7 @@ async fn main() -> Result<()> {
             ambient_control.clone(),
             wireless.as_ref().map(WirelessService::directory),
             wireless.as_ref().map(WirelessService::internet),
+            updater.clone(),
         )
     });
     #[cfg(all(target_os = "linux", feature = "linux-media"))]

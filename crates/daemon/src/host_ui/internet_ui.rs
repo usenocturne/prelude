@@ -193,6 +193,11 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 self.redraw();
             }
             Page::WifiNetworks => self.return_to_internet(),
+            _ if self.internet_return => {
+                self.internet_return = false;
+                self.release_internet();
+                self.enter(Page::Updates);
+            }
             _ => {
                 self.release_internet();
                 self.leave_subpage();
