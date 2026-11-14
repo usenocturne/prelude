@@ -18,6 +18,8 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/run/prelude /var/lib/prelude
+# swupdate, started by the Updates page, flips the A/B slot in uboot.env.
+ReadWritePaths=-/mnt/uboot-env
 # The daemon owns the calibrated ALS controls and the panel PWM backlight.
 ReadWritePaths=-/sys/bus/iio/devices -/sys/class/backlight
 LimitRTPRIO=20

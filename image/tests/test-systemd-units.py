@@ -85,6 +85,9 @@ assert words(units[daemon_name], "Unit", "Conflicts") == {"superbird-als.service
 assert values(units[daemon_name], "Unit", "StartLimitIntervalSec") == ["0"]
 assert values(units[daemon_name], "Service", "Restart") == ["on-failure"]
 assert values(units[daemon_name], "Service", "RestartSec") == ["2s"]
+# libubootenv rewrites uboot.env when swupdate flips the active slot.
+assert "-/mnt/uboot-env" in values(units[daemon_name], "Service", "ReadWritePaths"), \
+    "preluded cannot let swupdate update the boot environment"
 assert set(values(units[daemon_name], "Service", "ReadWritePaths")) >= {
     "/run/prelude /var/lib/prelude",
     "-/sys/bus/iio/devices -/sys/class/backlight",

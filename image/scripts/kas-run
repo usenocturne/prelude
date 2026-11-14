@@ -37,7 +37,7 @@ if [ "$operation" != checkout ]; then
   case "$target" in
     *-local) runtime_args="$runtime_args -v $monorepo_dir:/monorepo" ;;
   esac
-  for variable in PRELUDE_MONOREPO_SRC_URI PRELUDE_MONOREPO_SRCREV PRELUDE_WIRELESS_COUNTRY PRELUDE_WIRELESS_PASSPHRASE PRELUDE_OTA_SIGNING_KEY PRELUDE_OTA_PUBLIC_KEY; do
+  for variable in PRELUDE_MONOREPO_SRC_URI PRELUDE_MONOREPO_SRCREV PRELUDE_WIRELESS_COUNTRY PRELUDE_WIRELESS_PASSPHRASE PRELUDE_UPDATES_REPOSITORY PRELUDE_OTA_SIGNING_KEY PRELUDE_OTA_PUBLIC_KEY; do
     if [ -n "${!variable:-}" ]; then
       runtime_args="$runtime_args -e $variable"
     fi

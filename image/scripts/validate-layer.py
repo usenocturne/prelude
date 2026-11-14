@@ -867,4 +867,20 @@ for unit in ("swupdate.service", "swupdate.socket"):
 if "prelude_write_ota_markers" not in image_base or "ota-disabled" not in image_base:
     fail("images do not write the flavour and OTA availability markers")
 
+
+runtime_recipe = text("meta-prelude/recipes-core/prelude/prelude-runtime_0.1.0.bb")
+if 'PRELUDE_UPDATES_REPOSITORY ??= "usenocturne/prelude"' not in runtime_recipe:
+    fail("runtime recipe does not default the OTA release repository")
+updates_at = runtime_recipe.find("[updates]")
+if updates_at < 0 or 'repository = \"%s\"' not in runtime_recipe:
+    fail("runtime recipe does not write an [updates] repository")
+for config_file in ("config.toml", "config-dev.toml"):
+    if f">> ${{D}}${{sysconfdir}}/prelude/{config_file}" not in runtime_recipe[updates_at:]:
+        fail(f"runtime recipe does not bake the OTA release repository into {config_file}")
+kas_profile = text("kas/prelude.yml")
+if "PRELUDE_UPDATES_REPOSITORY: null" not in kas_profile:
+    fail("KAS profile does not forward PRELUDE_UPDATES_REPOSITORY")
+if "PRELUDE_UPDATES_REPOSITORY" not in text("scripts/kas-run"):
+    fail("kas-run does not forward PRELUDE_UPDATES_REPOSITORY")
+
 print("prelude image layer static checks passed")

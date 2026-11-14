@@ -37,6 +37,15 @@ pub enum SettingsError {
     InvalidEqualizer(#[source] prelude_media::Error),
 }
 
+/// Which releases the Updates page offers: Stable skips GitHub prereleases.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Beta,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuntimeSettings {
@@ -54,6 +63,7 @@ pub struct RuntimeSettings {
     pub equalizer: prelude_media::EqualizerSettings,
     pub wifi_channel: Option<u8>,
     pub wifi_channel_width_mhz: Option<u16>,
+    pub update_channel: UpdateChannel,
 }
 
 impl Default for RuntimeSettings {
@@ -72,6 +82,7 @@ impl Default for RuntimeSettings {
             equalizer: Default::default(),
             wifi_channel: None,
             wifi_channel_width_mhz: None,
+            update_channel: UpdateChannel::default(),
         }
     }
 }
@@ -97,6 +108,7 @@ impl RuntimeSettings {
             equalizer: config.media.equalizer.settings(),
             wifi_channel: Some(config.wireless.channel),
             wifi_channel_width_mhz: Some(config.wireless.channel_width_mhz),
+            update_channel: UpdateChannel::default(),
         }
     }
 
@@ -254,6 +266,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn update_channel_defaults_to_stable_and_old_files_load() {
+        assert_eq!(
+            RuntimeSettings::default().update_channel,
+            UpdateChannel::Stable
+        );
+        let old: RuntimeSettings =
+            toml::from_str("auto_brightness = false\n").expect("old settings file");
+        assert_eq!(old.update_channel, UpdateChannel::Stable);
+        let beta = RuntimeSettings {
+            update_channel: UpdateChannel::Beta,
+            ..RuntimeSettings::default()
+        };
+        let text = toml::to_string(&beta).expect("serialize");
+        assert!(text.contains("update_channel = \"beta\""), "{text}");
+        let back: RuntimeSettings = toml::from_str(&text).expect("parse");
+        assert_eq!(back.update_channel, UpdateChannel::Beta);
+    }
+
+    #[test]
     fn settings_round_trip_atomically_and_privately() {
         let directory = TempDir::new().expect("state directory");
         let settings = RuntimeSettings {
@@ -279,6 +310,7 @@ mod tests {
             },
             wifi_channel: Some(149),
             wifi_channel_width_mhz: Some(40),
+            update_channel: UpdateChannel::default(),
         };
         settings.persist(directory.path()).expect("persist");
         assert_eq!(

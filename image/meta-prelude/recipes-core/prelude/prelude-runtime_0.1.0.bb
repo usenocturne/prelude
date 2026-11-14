@@ -32,6 +32,7 @@ SRC_URI += " \
 "
 # ISO 3166-1 alpha-2 code for the access point's regulatory domain.
 PRELUDE_WIRELESS_COUNTRY ??= "US"
+PRELUDE_UPDATES_REPOSITORY ??= "usenocturne/prelude"
 # A fixed WPA2 passphrase lets a laptop join the access point and SSH to
 # 10.47.0.1 while the Car Thing is in USB host mode. Unset generates one.
 PRELUDE_WIRELESS_PASSPHRASE ??= ""
@@ -173,6 +174,15 @@ do_install() {
         esac
         printf 'passphrase = "%s"\n' "$passphrase" >> ${D}${sysconfdir}/prelude/config-dev.toml
     fi
+
+    repository="${PRELUDE_UPDATES_REPOSITORY}"
+    if ! printf '%s' "$repository" | grep -Eqx '[A-Za-z0-9-]+/[A-Za-z0-9._-]+'; then
+        bbfatal "PRELUDE_UPDATES_REPOSITORY must be a GitHub owner/repo"
+    fi
+    printf '\n[updates]\nrepository = "%s"\n' "$repository" \
+        >> ${D}${sysconfdir}/prelude/config.toml
+    printf '\n[updates]\nrepository = "%s"\n' "$repository" \
+        >> ${D}${sysconfdir}/prelude/config-dev.toml
 }
 
 PACKAGES =+ "${PN}-dev-config"

@@ -152,6 +152,51 @@ impl std::fmt::Debug for AndroidAutoConfig {
     }
 }
 
+/// Where the Updates page looks for releases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdatesConfig {
+    pub enabled: bool,
+    /// GitHub `owner/repo` whose releases carry the update bundles.
+    pub repository: String,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            repository: "usenocturne/prelude".to_owned(),
+        }
+    }
+}
+
+impl UpdatesConfig {
+    fn validate(&self) -> Result<()> {
+        let valid = self
+            .repository
+            .split_once('/')
+            .is_some_and(|(owner, repo)| {
+                !owner.is_empty()
+                    && owner
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    && !repo.is_empty()
+                    && repo != "."
+                    && repo != ".."
+                    && repo.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+            });
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::Config(
+                "updates.repository must be a GitHub owner/repo".to_owned(),
+            ))
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WirelessConfig {
@@ -598,6 +643,7 @@ pub struct DaemonConfig {
     pub media: MediaConfig,
     pub platform: PlatformConfig,
     pub wireless: WirelessConfig,
+    pub updates: UpdatesConfig,
 }
 
 impl Default for DaemonConfig {
@@ -612,6 +658,7 @@ impl Default for DaemonConfig {
             media: MediaConfig::default(),
             platform: PlatformConfig::default(),
             wireless: WirelessConfig::default(),
+            updates: UpdatesConfig::default(),
         }
     }
 }
@@ -644,6 +691,7 @@ impl DaemonConfig {
             ));
         }
         self.wireless.validate()?;
+        self.updates.validate()?;
         if !self.state_dir.is_absolute() {
             return Err(Error::Config(
                 "state_dir must be an absolute path".to_owned(),
@@ -1083,6 +1131,44 @@ mod tests {
                 hardware_version: "Prelude".to_owned(),
             })
         }
+    }
+
+    #[test]
+    fn updates_config_defaults_to_upstream() {
+        assert_eq!(
+            DaemonConfig::default().updates,
+            UpdatesConfig {
+                enabled: true,
+                repository: "usenocturne/prelude".to_owned(),
+            }
+        );
+        assert_eq!(
+            DaemonConfig::from_toml("").expect("config").updates,
+            UpdatesConfig::default()
+        );
+    }
+
+    #[test]
+    fn updates_repository_must_be_owner_slash_repo() {
+        let config = |repository: &str| {
+            DaemonConfig::from_toml(&format!("[updates]\nrepository = \"{repository}\"\n"))
+        };
+        assert_eq!(
+            config("weazil/prelude").expect("valid").updates.repository,
+            "weazil/prelude"
+        );
+        assert!(config("usenocturne/prelude.fork_1").is_ok());
+        for bad in [
+            "weazil", "a/b/c", "../x", "a b/c", "/prelude", "weazil/", "",
+        ] {
+            assert!(config(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(
+            !DaemonConfig::from_toml("[updates]\nenabled = false\n")
+                .expect("disabled")
+                .updates
+                .enabled
+        );
     }
 
     #[test]
