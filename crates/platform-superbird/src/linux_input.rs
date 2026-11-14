@@ -3,9 +3,12 @@ use std::{
     ffi::OsStr,
     fs::{self, OpenOptions},
     io,
-    os::{fd::AsFd, unix::fs::OpenOptionsExt},
+    os::{
+        fd::{AsFd, BorrowedFd},
+        unix::fs::OpenOptionsExt,
+    },
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use evdev::{KeyCode, raw_stream::RawDevice};
@@ -167,6 +170,25 @@ pub struct LinuxInputBatch {
     pub terminal: Option<LinuxInputTerminal>,
 }
 
+/// How long touch events waited in the kernel before this backend read them,
+/// since the window was last taken.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TouchWaitWindow {
+    /// Raw touch events read, including the synchronization markers.
+    pub raw_events: u64,
+    pub total_micros: u64,
+    pub maximum_micros: u64,
+}
+
+impl TouchWaitWindow {
+    fn record(&mut self, waited: Duration) {
+        let micros = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);
+        self.raw_events = self.raw_events.saturating_add(1);
+        self.total_micros = self.total_micros.saturating_add(micros);
+        self.maximum_micros = self.maximum_micros.max(micros);
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum LinuxInputError {
     #[error("invalid Linux input configuration: {0}")]
@@ -275,6 +297,7 @@ pub struct LinuxInputBackend {
     parser: InputParser,
     clock: ReceiptClock,
     terminal: Option<LinuxInputTerminal>,
+    touch_wait: TouchWaitWindow,
 }
 
 impl LinuxInputBackend {
@@ -316,6 +339,7 @@ impl LinuxInputBackend {
             devices,
             clock: ReceiptClock::new(),
             terminal: None,
+            touch_wait: TouchWaitWindow::default(),
         })
     }
 
@@ -323,7 +347,54 @@ impl LinuxInputBackend {
         self.config.grab_policy
     }
 
+    /// Returns how long touch events waited in the kernel since the last call
+    /// and starts a new window.
+    pub fn take_touch_wait(&mut self) -> TouchWaitWindow {
+        std::mem::take(&mut self.touch_wait)
+    }
+
+    /// Waits until an input device or `other` has something to read, or
+    /// `timeout` passes, and returns whether `other` does. A caller that also
+    /// serves a socket uses this so neither side waits behind the other, and
+    /// then collects the input with [`Self::poll_ready`].
+    pub fn wait_with(
+        &self,
+        other: BorrowedFd<'_>,
+        timeout: Duration,
+    ) -> Result<bool, LinuxInputError> {
+        let readable =
+            PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL;
+        let mut descriptors = self
+            .devices
+            .iter()
+            .map(|device| PollFd::new(device.device.as_fd(), readable))
+            .collect::<Vec<_>>();
+        descriptors.push(PollFd::new(other, readable));
+        let timeout_ms = u16::try_from(timeout.as_millis())
+            .map_err(|_| LinuxInputError::InvalidConfig("input wait cannot be represented"))?;
+        match poll(&mut descriptors, timeout_ms) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => return Ok(false),
+            Err(error) => return Err(LinuxInputError::Poll(error)),
+        }
+        Ok(descriptors
+            .last()
+            .and_then(PollFd::revents)
+            .is_some_and(|ready| ready.intersects(readable)))
+    }
+
+    /// Collects the input that is ready now, waiting up to the configured
+    /// poll interval for some to arrive.
     pub fn poll(&mut self) -> Result<LinuxInputBatch, LinuxInputError> {
+        self.poll_within(self.config.poll_interval)
+    }
+
+    /// Collects the input that is ready now without waiting.
+    pub fn poll_ready(&mut self) -> Result<LinuxInputBatch, LinuxInputError> {
+        self.poll_within(Duration::ZERO)
+    }
+
+    fn poll_within(&mut self, timeout: Duration) -> Result<LinuxInputBatch, LinuxInputError> {
         if let Some(terminal) = self.terminal {
             return Err(LinuxInputError::Terminal(terminal));
         }
@@ -340,7 +411,7 @@ impl LinuxInputBackend {
                 )
             })
             .collect::<Vec<_>>();
-        let timeout_ms = u16::try_from(self.config.poll_interval.as_millis()).map_err(|_| {
+        let timeout_ms = u16::try_from(timeout.as_millis()).map_err(|_| {
             LinuxInputError::InvalidConfig("input poll interval cannot be represented")
         })?;
         poll(&mut descriptors, timeout_ms).map_err(LinuxInputError::Poll)?;
@@ -381,7 +452,16 @@ impl LinuxInputBackend {
                     });
                 }
             };
+            let fetched_at = SystemTime::now();
             for event in fetched {
+                if role == DeviceRole::Touch {
+                    // The kernel stamps each event when the panel reports it.
+                    self.touch_wait.record(
+                        fetched_at
+                            .duration_since(event.timestamp())
+                            .unwrap_or_default(),
+                    );
+                }
                 let timestamp = self.clock.now();
                 output.extend(self.parser.process(RawInputEvent::new(
                     role,

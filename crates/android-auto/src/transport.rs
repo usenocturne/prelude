@@ -59,6 +59,7 @@ pub struct UsbAoapTransport<H: UsbHandle> {
     device: UsbDeviceSnapshot,
     endpoints: BulkEndpoints,
     reset_on_close: bool,
+    release_on_close: bool,
     poll_interval: Duration,
 }
 
@@ -74,6 +75,7 @@ impl<H: UsbHandle> UsbAoapTransport<H> {
             device,
             endpoints,
             reset_on_close: true,
+            release_on_close: true,
             poll_interval,
         }
     }
@@ -88,6 +90,10 @@ impl<H: UsbHandle> UsbAoapTransport<H> {
 
     pub fn set_reset_on_close(&mut self, reset_on_close: bool) {
         self.reset_on_close = reset_on_close;
+    }
+
+    pub fn set_release_on_close(&mut self, release_on_close: bool) {
+        self.release_on_close = release_on_close;
     }
 
     pub fn into_io(
@@ -196,8 +202,10 @@ impl<H: UsbHandle> UsbAoapTransport<H> {
             return Ok(());
         };
         let mut first_error = None;
-        if let Err(source) = handle.release_interface(self.endpoints.interface) {
-            first_error = Some(Error::usb("releasing Android accessory interface", source));
+        if self.release_on_close {
+            if let Err(source) = handle.release_interface(self.endpoints.interface) {
+                first_error = Some(Error::usb("releasing Android accessory interface", source));
+            }
         }
         if self.reset_on_close {
             if let Err(source) = handle.reset() {
@@ -207,6 +215,22 @@ impl<H: UsbHandle> UsbAoapTransport<H> {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl<H: UsbHandle + Clone> UsbAoapTransport<H> {
+    pub fn try_clone(&self) -> Result<Self> {
+        let handle = self.handle.as_ref().cloned().ok_or(Error::Disconnected {
+            operation: "cloning closed Android accessory transport",
+        })?;
+        Ok(Self {
+            handle: Some(handle),
+            device: self.device.clone(),
+            endpoints: self.endpoints,
+            reset_on_close: false,
+            release_on_close: false,
+            poll_interval: self.poll_interval,
+        })
     }
 }
 
