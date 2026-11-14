@@ -29,6 +29,7 @@ use prelude_wireless::{
 use crate::{
     DaemonConfig, DisplayPlatform, Error, Result, WirelessConfig,
     hands_free::HandsFree,
+    internet::{ClientGate, Internet, StationBackend},
     known_phones::{self, KnownPhone},
     load_last_display_platform,
 };
@@ -541,6 +542,7 @@ pub struct WirelessService {
     hand_back: Arc<AtomicBool>,
     usb_ended: Arc<AtomicBool>,
     usb_projection: Arc<AtomicBool>,
+    internet: Internet,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -565,6 +567,13 @@ impl WirelessService {
         let hand_back = Arc::new(AtomicBool::new(false));
         let usb_ended = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
+        let client_gate = ClientGate::default();
+        let internet = Internet::start(
+            Box::new(StationBackend::new(wireless)),
+            client_gate.clone(),
+            config.state_dir.clone(),
+        )
+        .map_err(|error| Error::Runtime(format!("spawning prelude-internet failed: {error}")))?;
         let state_dir = wireless_state_dir(&config.state_dir);
         let hands_free = HandsFree::new(
             Arc::clone(&bluetooth_address),
@@ -595,6 +604,7 @@ impl WirelessService {
                 denied: Arc::clone(&directory.denied),
                 read_timeout: Duration::from_millis(config.android_auto.session_io_timeout_ms),
                 usb_projection: Arc::clone(&usb_projection),
+                client_gate: client_gate.clone(),
             };
             let access_point = Arc::clone(&access_point);
             let radio = Arc::clone(&radio);
@@ -671,9 +681,15 @@ impl WirelessService {
             hand_back,
             usb_ended,
             usb_projection,
+            internet,
             stop,
             threads,
         }))
+    }
+
+    /// Handle for getting online; client mode parks the access point.
+    pub fn internet(&self) -> Internet {
+        self.internet.clone()
     }
 
     #[cfg(all(target_os = "linux", feature = "linux-media"))]
@@ -840,6 +856,8 @@ struct ProjectionListener {
     denied: SharedDenied,
     read_timeout: Duration,
     usb_projection: Arc<AtomicBool>,
+    /// Client mode (getting online) parks the access point while requested.
+    client_gate: ClientGate,
 }
 
 fn supervise_access_point(
@@ -852,9 +870,18 @@ fn supervise_access_point(
     stop: &AtomicBool,
 ) {
     let usb_projection = &projection.usb_projection;
+    let client_gate = &projection.client_gate;
     let mut waiting_logged = false;
     crate::usb_monitor::start();
     while !stop.load(Ordering::Relaxed) {
+        // Client mode owns the adapter: stay down until it is released, then
+        // restart the access point from the unchanged configuration below.
+        if client_gate.requested() {
+            client_gate.set_parked(true);
+            sleep_unless_stopped(stop, SUPERVISOR_POLL);
+            continue;
+        }
+        client_gate.set_parked(false);
         if usb_projection.load(Ordering::Acquire) {
             sleep_unless_stopped(stop, SUPERVISOR_POLL);
             continue;
@@ -893,14 +920,14 @@ fn supervise_access_point(
             );
             continue;
         }
-        if usb_projection.load(Ordering::Acquire) {
+        if usb_projection.load(Ordering::Acquire) || client_gate.requested() {
             continue;
         }
         sleep_unless_stopped(stop, ACCESS_POINT_RETRY);
     }
 }
 
-fn wifi_interface(wireless: &WirelessConfig) -> Option<String> {
+pub(crate) fn wifi_interface(wireless: &WirelessConfig) -> Option<String> {
     match &wireless.wifi_interface {
         Some(interface) => Some(interface.clone())
             .filter(|interface| Path::new("/sys/class/net").join(interface).exists()),
@@ -936,6 +963,7 @@ fn run_access_point(
     let mut next_check = Instant::now() + ACCESS_POINT_CHECK_INTERVAL;
     while !stop.load(Ordering::Relaxed)
         && !projection.usb_projection.load(Ordering::Acquire)
+        && !projection.client_gate.requested()
         && current_radio(radio, wireless) == (wireless.channel, wireless.channel_width_mhz)
     {
         match listener.accept() {

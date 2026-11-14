@@ -22,6 +22,7 @@ mod heartbeat;
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 mod host_ui;
 mod iap2_runtime;
+pub mod internet;
 mod known_phones;
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 mod media_runtime;
