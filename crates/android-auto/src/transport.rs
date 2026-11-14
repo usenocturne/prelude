@@ -8,6 +8,8 @@ use crate::{
     UsbHandle, aoap::check_cancelled,
 };
 
+const MIN_TRANSFER_TIMEOUT: Duration = Duration::from_millis(1);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BulkEndpoints {
     pub configuration: u8,
@@ -124,14 +126,9 @@ impl<H: UsbHandle> UsbAoapTransport<H> {
         let endpoint = self.endpoints.bulk_in;
         loop {
             check_cancelled(cancellation, operation)?;
-            let elapsed = started.elapsed();
-            if elapsed >= timeout {
+            let Some(transfer_timeout) = self.transfer_timeout(started, timeout) else {
                 return Err(Error::Timeout { operation, timeout });
-            }
-            let transfer_timeout = self
-                .poll_interval
-                .max(Duration::from_millis(1))
-                .min(timeout.saturating_sub(elapsed));
+            };
             match self
                 .handle_mut()?
                 .read_bulk(endpoint, bytes, transfer_timeout)
@@ -161,14 +158,9 @@ impl<H: UsbHandle> UsbAoapTransport<H> {
         let mut offset = 0;
         while offset < bytes.len() {
             check_cancelled(cancellation, operation)?;
-            let elapsed = started.elapsed();
-            if elapsed >= timeout {
+            let Some(transfer_timeout) = self.transfer_timeout(started, timeout) else {
                 return Err(Error::Timeout { operation, timeout });
-            }
-            let transfer_timeout = self
-                .poll_interval
-                .max(Duration::from_millis(1))
-                .min(timeout.saturating_sub(elapsed));
+            };
             match self
                 .handle_mut()?
                 .write_bulk(endpoint, &bytes[offset..], transfer_timeout)
@@ -189,6 +181,12 @@ impl<H: UsbHandle> UsbAoapTransport<H> {
 
     pub fn close(mut self) -> Result<()> {
         self.cleanup()
+    }
+
+    fn transfer_timeout(&self, started: Instant, timeout: Duration) -> Option<Duration> {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        (remaining >= MIN_TRANSFER_TIMEOUT)
+            .then(|| self.poll_interval.min(remaining).max(MIN_TRANSFER_TIMEOUT))
     }
 
     fn handle_mut(&mut self) -> Result<&mut H> {
