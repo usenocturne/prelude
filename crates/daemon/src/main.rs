@@ -182,6 +182,8 @@ async fn main() -> Result<()> {
         wireless.show_pairing_codes(display.handle(), config.state_dir.clone())?;
     }
     let mut daemon = Daemon::new(config, discovery, runtime)?;
+    // Held for the life of the daemon; Task 6 hands it to the Updates page.
+    let _updater = start_updater(daemon.config(), wireless.as_ref());
 
     #[cfg(all(target_os = "linux", feature = "linux-media"))]
     let host_ui = display.as_ref().map(|display_runtime| {
@@ -522,4 +524,34 @@ async fn shutdown_signal() -> std::io::Result<()> {
 #[cfg(not(unix))]
 async fn shutdown_signal() -> std::io::Result<()> {
     tokio::signal::ctrl_c().await
+}
+
+/// Starts the updater worker unless updates are turned off in the config.
+fn start_updater(
+    config: &preluded::DaemonConfig,
+    wireless: Option<&WirelessService>,
+) -> Option<preluded::updater::Updater> {
+    use preluded::updater::{
+        Updater,
+        io::{GithubSource, InternetNetwork, SwupdateInstaller},
+        system::{SystemPaths, installed_version},
+    };
+    if !config.updates.enabled {
+        return None;
+    }
+    let installed = installed_version();
+    match Updater::start(
+        Box::new(GithubSource::new(&installed)),
+        Box::new(SwupdateInstaller::default()),
+        Box::new(InternetNetwork(wireless.map(WirelessService::internet))),
+        SystemPaths::real(config.state_dir.clone()),
+        config.updates.repository.clone(),
+        installed,
+    ) {
+        Ok(updater) => Some(updater),
+        Err(error) => {
+            warn!(%error, "could not start the updater");
+            None
+        }
+    }
 }

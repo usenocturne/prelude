@@ -284,7 +284,7 @@ impl Network for InternetNetwork {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{BufRead, BufReader, Write as _},
+        io::{BufRead, BufReader},
         net::TcpListener,
         sync::atomic::{AtomicBool, Ordering},
         thread,

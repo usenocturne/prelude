@@ -36,7 +36,7 @@ mod settings;
 mod shared_mfi;
 #[cfg(any(test, all(target_os = "linux", feature = "linux-media")))]
 mod status_screen;
-mod updater;
+pub mod updater;
 mod usb_monitor;
 mod wired_runtime;
 mod wireless_carplay;
@@ -71,7 +71,7 @@ pub use heartbeat::HeartbeatWriter;
 pub use host_ui::{HostUi, HostUiEvent, SettingsCommitted};
 pub use known_phones::{KnownPhone, MAXIMUM_KNOWN_PHONES};
 pub use presets::{PRESET_COUNT, PresetAction, PresetBindings};
-pub use settings::{RuntimeSettings, SettingsError};
+pub use settings::{RuntimeSettings, SettingsError, UpdateChannel};
 
 pub use wired_runtime::{
     DEFAULT_MAX_WORKER_STOP_WAIT, MAX_IAP2_BLOCKING_STAGE, SelectedRuntime, WiredCarkitRuntime,

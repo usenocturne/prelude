@@ -172,7 +172,25 @@ fn manifest_version(text: &str) -> Option<&str> {
     })
 }
 
+/// `VERSION_ID` from `/etc/os-release`, or the daemon's own version.
+pub fn installed_version() -> String {
+    fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|contents| os_release_version(&contents))
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+}
+
+pub fn os_release_version(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("VERSION_ID="))
+        .map(|value| value.trim().trim_matches('"').to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 /// Bytes available to the daemon at `path`.
+// statvfs field types differ between 32- and 64-bit targets.
+#[allow(clippy::useless_conversion)]
 pub fn free_bytes(path: &Path) -> io::Result<u64> {
     let stats = nix::sys::statvfs::statvfs(path).map_err(io::Error::from)?;
     Ok(u64::from(stats.blocks_available()) * u64::from(stats.fragment_size()))
@@ -238,6 +256,25 @@ pub(crate) mod tests {
             state_dir: dir.join("state"),
             free_bytes: |_| Ok(u64::MAX),
         }
+    }
+
+    #[test]
+    fn os_release_version_reads_version_id() {
+        assert_eq!(
+            os_release_version(
+                "NAME=Prelude
+VERSION_ID=\"1.0.12-test\"
+"
+            ),
+            Some("1.0.12-test".to_owned())
+        );
+        assert_eq!(
+            os_release_version(
+                "NAME=Prelude
+"
+            ),
+            None
+        );
     }
 
     #[test]
