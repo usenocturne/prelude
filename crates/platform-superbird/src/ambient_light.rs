@@ -1,18 +1,22 @@
 use std::{
     collections::VecDeque,
     fs,
+    ops::RangeInclusive,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
-    thread::{self, JoinHandle},
+    thread::{self, JoinHandle, Thread},
     time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, warn};
+
+pub const BRIGHTNESS_PERCENT_RANGE: RangeInclusive<u8> = 1..=100;
+pub const DEFAULT_BRIGHTNESS_PERCENT: u8 = 70;
 
 const IIO_BUS_DIR: &str = "/sys/bus/iio/devices";
 const BACKLIGHT_CLASS_DIR: &str = "/sys/class/backlight";
@@ -40,6 +44,7 @@ const INITIAL_DISCOVERY_POLL: Duration = Duration::from_millis(50);
 pub struct AmbientLightConfig {
     pub enabled: bool,
     pub automatic_brightness: bool,
+    pub brightness_percent: u8,
     pub automatic_night_mode: bool,
     pub poll_interval_ms: u64,
     pub median_window: usize,
@@ -59,6 +64,7 @@ impl Default for AmbientLightConfig {
         Self {
             enabled: true,
             automatic_brightness: true,
+            brightness_percent: DEFAULT_BRIGHTNESS_PERCENT,
             automatic_night_mode: true,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             median_window: DEFAULT_MEDIAN_WINDOW,
@@ -149,6 +155,33 @@ pub fn apply_initial_backlight(
     })
 }
 
+pub fn apply_manual_backlight(
+    config: &AmbientLightConfig,
+    timeout: Duration,
+) -> Result<InitialBacklight, AmbientLightError> {
+    let deadline = Instant::now() + timeout;
+    let backlight = loop {
+        if let Some(backlight) = discover_backlight_device() {
+            break backlight;
+        }
+        if Instant::now() >= deadline {
+            return Err(AmbientLightError::BacklightUnavailable);
+        }
+        thread::sleep(INITIAL_DISCOVERY_POLL);
+    };
+    let brightness = manual_backlight_target(
+        config.brightness_percent,
+        backlight.max_brightness,
+        config.minimum_brightness,
+    );
+    write_backlight(&backlight, brightness).map_err(AmbientLightError::BacklightWrite)?;
+    Ok(InitialBacklight {
+        raw: 0,
+        brightness,
+        max_brightness: backlight.max_brightness,
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AmbientLightState {
     night_mode: Arc<AtomicBool>,
@@ -167,8 +200,10 @@ impl AmbientLightState {
 #[derive(Debug, Clone)]
 pub struct AmbientLightControl {
     automatic_brightness: Arc<AtomicBool>,
+    brightness_percent: Arc<AtomicU8>,
     automatic_night_mode: Arc<AtomicBool>,
     state: AmbientLightState,
+    worker: Arc<OnceLock<Thread>>,
 }
 
 impl AmbientLightControl {
@@ -177,10 +212,20 @@ impl AmbientLightControl {
             automatic_brightness: Arc::new(AtomicBool::new(
                 config.enabled && config.automatic_brightness,
             )),
+            brightness_percent: Arc::new(AtomicU8::new(clamp_brightness_percent(
+                config.brightness_percent,
+            ))),
             automatic_night_mode: Arc::new(AtomicBool::new(
                 config.enabled && config.automatic_night_mode,
             )),
             state,
+            worker: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn wake_worker(&self) {
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
         }
     }
 
@@ -190,6 +235,17 @@ impl AmbientLightControl {
 
     pub fn set_automatic_brightness(&self, enabled: bool) {
         self.automatic_brightness.store(enabled, Ordering::Release);
+        self.wake_worker();
+    }
+
+    pub fn brightness_percent(&self) -> u8 {
+        self.brightness_percent.load(Ordering::Acquire)
+    }
+
+    pub fn set_brightness_percent(&self, percent: u8) {
+        self.brightness_percent
+            .store(clamp_brightness_percent(percent), Ordering::Release);
+        self.wake_worker();
     }
 
     pub fn automatic_night_mode(&self) -> bool {
@@ -221,12 +277,12 @@ impl AmbientLightMonitor {
             let worker_state = state.clone();
             let worker_control = control.clone();
             let worker_stop = Arc::clone(&stop);
-            Some(
-                thread::Builder::new()
-                    .name("ct-ambient-light".to_owned())
-                    .spawn(move || monitor_loop(config, worker_state, worker_control, worker_stop))
-                    .map_err(AmbientLightError::Thread)?,
-            )
+            let worker = thread::Builder::new()
+                .name("ct-ambient-light".to_owned())
+                .spawn(move || monitor_loop(config, worker_state, worker_control, worker_stop))
+                .map_err(AmbientLightError::Thread)?;
+            let _ = control.worker.set(worker.thread().clone());
+            Some(worker)
         } else {
             None
         };
@@ -251,6 +307,7 @@ impl Drop for AmbientLightMonitor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
             let _ = worker.join();
         }
     }
@@ -348,10 +405,12 @@ fn monitor_loop(
         }
 
         let mut ramping = false;
-        if !control.automatic_brightness() {
-            current_brightness = None;
-            ramp = BacklightRamp::default();
-        } else if let Some(median) = ambient {
+        let level = if control.automatic_brightness() {
+            ambient.map(BacklightLevel::Ambient)
+        } else {
+            Some(BacklightLevel::Manual(control.brightness_percent()))
+        };
+        if let Some(level) = level {
             if backlight.is_none() {
                 backlight = discover_backlight_device();
                 if let Some(device) = &backlight {
@@ -364,20 +423,37 @@ fn monitor_loop(
             }
 
             if let Some(device) = backlight.as_ref() {
-                let minimum = config.minimum_brightness.min(device.max_brightness);
-                let target = ambient_to_backlight_target(
-                    median,
-                    device.max_brightness,
-                    config.minimum_brightness,
-                    config.raw_at_max_brightness,
-                    config.dim_knee,
-                );
-                let current = current_brightness
-                    .or_else(|| read_backlight(device))
-                    .unwrap_or(device.max_brightness)
-                    .min(device.max_brightness);
-                let next = ramp.advance(current, target, minimum, device.max_brightness);
-                if next != current {
+                let (target, next) = match level {
+                    BacklightLevel::Ambient(median) => {
+                        let minimum = config.minimum_brightness.min(device.max_brightness);
+                        let target = ambient_to_backlight_target(
+                            median,
+                            device.max_brightness,
+                            config.minimum_brightness,
+                            config.raw_at_max_brightness,
+                            config.dim_knee,
+                        );
+                        let current = current_brightness
+                            .or_else(|| read_backlight(device))
+                            .unwrap_or(device.max_brightness)
+                            .min(device.max_brightness);
+                        current_brightness = Some(current);
+                        (
+                            target,
+                            ramp.advance(current, target, minimum, device.max_brightness),
+                        )
+                    }
+                    BacklightLevel::Manual(percent) => {
+                        ramp = BacklightRamp::default();
+                        let target = manual_backlight_target(
+                            percent,
+                            device.max_brightness,
+                            config.minimum_brightness,
+                        );
+                        (target, target)
+                    }
+                };
+                if current_brightness != Some(next) {
                     match write_backlight(device, next) {
                         Ok(()) => {
                             current_brightness = Some(next);
@@ -393,7 +469,7 @@ fn monitor_loop(
                                 warn!(
                                     error = %error,
                                     path = %device.brightness_path.display(),
-                                    "ambient-light backlight write failed"
+                                    "display backlight write failed"
                                 );
                                 brightness_write_failed = true;
                             }
@@ -404,12 +480,31 @@ fn monitor_loop(
         }
 
         let until_sample = next_sample.saturating_duration_since(Instant::now());
-        thread::sleep(if ramping {
+        thread::park_timeout(if ramping {
             until_sample.min(BACKLIGHT_TICK)
         } else {
             until_sample
         });
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BacklightLevel {
+    Ambient(u32),
+    Manual(u8),
+}
+
+fn clamp_brightness_percent(percent: u8) -> u8 {
+    percent.clamp(
+        *BRIGHTNESS_PERCENT_RANGE.start(),
+        *BRIGHTNESS_PERCENT_RANGE.end(),
+    )
+}
+
+fn manual_backlight_target(percent: u8, max_brightness: u32, minimum_brightness: u32) -> u32 {
+    let minimum = minimum_brightness.min(max_brightness);
+    let ratio = (f64::from(clamp_brightness_percent(percent)) / 100.0).powi(2);
+    minimum + ((f64::from(max_brightness - minimum) * ratio).round() as u32)
 }
 
 fn discover_ambient_light_device() -> Option<AmbientLightDevice> {
@@ -666,6 +761,32 @@ mod tests {
         control.set_automatic_night_mode(false);
         assert!(!control.automatic_night_mode());
         assert!(!state.night_mode());
+    }
+
+    #[test]
+    fn manual_brightness_is_clamped_and_follows_a_perceptual_curve() {
+        let control = AmbientLightControl::new(
+            &AmbientLightConfig {
+                brightness_percent: 0,
+                ..AmbientLightConfig::default()
+            },
+            AmbientLightState::default(),
+        );
+        assert_eq!(control.brightness_percent(), 1);
+        control.set_brightness_percent(200);
+        assert_eq!(control.brightness_percent(), 100);
+
+        let mut previous = 16;
+        for percent in 1..=100 {
+            let target = manual_backlight_target(percent, 160, 16);
+            assert!((16..=160).contains(&target));
+            assert!(target >= previous);
+            previous = target;
+        }
+        assert_eq!(manual_backlight_target(1, 160, 16), 16);
+        assert_eq!(manual_backlight_target(50, 160, 16), 52);
+        assert_eq!(manual_backlight_target(100, 160, 16), 160);
+        assert_eq!(manual_backlight_target(100, 8, 16), 8);
     }
 
     #[test]

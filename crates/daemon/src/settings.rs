@@ -5,6 +5,7 @@ use std::{
     path::Path,
 };
 
+use platform_superbird::BRIGHTNESS_PERCENT_RANGE;
 use prelude_wireless::access_point::{ChannelWidth, is_supported_channel};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -26,6 +27,8 @@ pub enum SettingsError {
     Encode(#[source] toml::ser::Error),
     #[error("reported DPI is outside the Android Auto range {minimum}..={maximum}")]
     InvalidDpi { minimum: u32, maximum: u32 },
+    #[error("brightness {0}% is outside 1..=100%")]
+    InvalidBrightness(u8),
     #[error("Wi-Fi channel {0} is not a supported 2.4 GHz or non-DFS 5 GHz channel")]
     InvalidWifiChannel(u8),
     #[error("Wi-Fi channel width {0} MHz is not 20, 40, or 80")]
@@ -38,6 +41,7 @@ pub enum SettingsError {
 #[serde(default)]
 pub struct RuntimeSettings {
     pub auto_brightness: bool,
+    pub brightness_percent: u8,
     pub auto_night_mode: bool,
     pub reported_dpi: u32,
     #[serde(default = "default_original_dpi")]
@@ -46,6 +50,7 @@ pub struct RuntimeSettings {
     pub phone_audio: bool,
     pub carplay_dock: CarPlayDock,
     pub presets: [PresetAction; PRESET_COUNT],
+    pub presets_enabled: bool,
     pub equalizer: prelude_media::EqualizerSettings,
     pub wifi_channel: Option<u8>,
     pub wifi_channel_width_mhz: Option<u16>,
@@ -55,6 +60,7 @@ impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             auto_brightness: true,
+            brightness_percent: platform_superbird::DEFAULT_BRIGHTNESS_PERCENT,
             auto_night_mode: true,
             reported_dpi: prelude_android_auto_protocol::DEFAULT_VIDEO_DENSITY_DPI,
             original_dpi: prelude_android_auto_protocol::DEFAULT_VIDEO_DENSITY_DPI,
@@ -62,6 +68,7 @@ impl Default for RuntimeSettings {
             phone_audio: false,
             carplay_dock: CarPlayDock::Left,
             presets: PresetAction::DEFAULTS,
+            presets_enabled: true,
             equalizer: Default::default(),
             wifi_channel: None,
             wifi_channel_width_mhz: None,
@@ -77,6 +84,7 @@ impl RuntimeSettings {
     pub fn from_config(config: &DaemonConfig) -> Self {
         Self {
             auto_brightness: config.platform.ambient_light.automatic_brightness,
+            brightness_percent: config.platform.ambient_light.brightness_percent,
             auto_night_mode: config.platform.ambient_light.automatic_night_mode,
             reported_dpi: config.android_auto.ui_density_dpi,
             original_dpi: config.android_auto.ui_density_dpi,
@@ -85,6 +93,7 @@ impl RuntimeSettings {
                 && config.android_auto.disable_audio_output,
             carplay_dock: config.airplay.dock,
             presets: config.platform.presets.actions(),
+            presets_enabled: config.platform.presets.enabled(),
             equalizer: config.media.equalizer.settings(),
             wifi_channel: Some(config.wireless.channel),
             wifi_channel_width_mhz: Some(config.wireless.channel_width_mhz),
@@ -113,6 +122,9 @@ impl RuntimeSettings {
                 minimum: prelude_android_auto_protocol::MIN_VIDEO_DENSITY_DPI,
                 maximum: prelude_android_auto_protocol::MAX_VIDEO_DENSITY_DPI,
             });
+        }
+        if !BRIGHTNESS_PERCENT_RANGE.contains(&self.brightness_percent) {
+            return Err(SettingsError::InvalidBrightness(self.brightness_percent));
         }
         if let Some(channel) = self
             .wifi_channel
@@ -145,12 +157,17 @@ impl RuntimeSettings {
     ) -> Result<(), SettingsError> {
         let settings = self.validate()?;
         config.platform.ambient_light.automatic_brightness = settings.auto_brightness;
+        config.platform.ambient_light.brightness_percent = settings.brightness_percent;
         config.platform.ambient_light.automatic_night_mode = settings.auto_night_mode;
         config.android_auto.ui_density_dpi = settings.reported_dpi;
         config.airplay.disable_audio_output = settings.phone_audio;
         config.android_auto.disable_audio_output = settings.phone_audio;
         config.airplay.dock = settings.carplay_dock;
         config.platform.presets.set(settings.presets);
+        config
+            .platform
+            .presets
+            .set_enabled(settings.presets_enabled);
         if let Some(channel) = settings.wifi_channel {
             config.wireless.channel = channel;
         }
@@ -241,6 +258,7 @@ mod tests {
         let directory = TempDir::new().expect("state directory");
         let settings = RuntimeSettings {
             auto_brightness: false,
+            brightness_percent: 35,
             auto_night_mode: true,
             reported_dpi: 220,
             original_dpi: 170,
@@ -253,6 +271,7 @@ mod tests {
                 PresetAction::EndCall,
                 PresetAction::None,
             ],
+            presets_enabled: false,
             equalizer: prelude_media::EqualizerSettings {
                 enabled: true,
                 bands_half_db: [24; 10],
@@ -462,10 +481,63 @@ mod tests {
             .apply_to_config(&mut config)
             .expect("apply settings");
         assert_eq!(shared.actions(), decoded.presets);
+        assert!(shared.enabled());
         assert!(toml::from_str::<RuntimeSettings>("presets = [\"home\"]\n").is_err());
         assert!(
             toml::from_str::<RuntimeSettings>("presets = [\"x\", \"x\", \"x\", \"x\"]\n").is_err()
         );
+    }
+
+    #[test]
+    fn disabled_presets_are_applied_live_and_default_to_enabled() {
+        let legacy: RuntimeSettings = toml::from_str("reported_dpi = 200\n").expect("legacy");
+        assert!(legacy.presets_enabled);
+        let mut config = DaemonConfig::default();
+        let shared = config.platform.presets.clone();
+        let settings: RuntimeSettings =
+            toml::from_str("presets_enabled = false\n").expect("decode");
+        settings.apply_to_config(&mut config).expect("apply");
+        assert_eq!(
+            shared.action(platform_superbird::LocalPreset::ONE),
+            PresetAction::None
+        );
+        assert!(!RuntimeSettings::from_config(&config).presets_enabled);
+        RuntimeSettings::default()
+            .apply_to_config(&mut config)
+            .expect("apply");
+        assert_eq!(
+            shared.action(platform_superbird::LocalPreset::ONE),
+            PresetAction::PreviousTrack
+        );
+    }
+
+    #[test]
+    fn manual_brightness_is_validated_and_applied() {
+        let legacy: RuntimeSettings = toml::from_str("auto_brightness = false\n").expect("legacy");
+        assert_eq!(
+            legacy.brightness_percent,
+            platform_superbird::DEFAULT_BRIGHTNESS_PERCENT
+        );
+        for brightness_percent in [0, 101] {
+            assert!(matches!(
+                RuntimeSettings {
+                    brightness_percent,
+                    ..RuntimeSettings::default()
+                }
+                .validate(),
+                Err(SettingsError::InvalidBrightness(_))
+            ));
+        }
+        let mut config = DaemonConfig::default();
+        RuntimeSettings {
+            auto_brightness: false,
+            brightness_percent: 40,
+            ..RuntimeSettings::default()
+        }
+        .apply_to_config(&mut config)
+        .expect("apply settings");
+        assert!(!config.platform.ambient_light.automatic_brightness);
+        assert_eq!(config.platform.ambient_light.brightness_percent, 40);
     }
 
     #[test]

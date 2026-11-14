@@ -12,7 +12,8 @@ mod usb_role;
 
 pub use ambient_light::{
     AmbientLightConfig, AmbientLightControl, AmbientLightError, AmbientLightMonitor,
-    AmbientLightState, InitialBacklight, apply_initial_backlight,
+    AmbientLightState, BRIGHTNESS_PERCENT_RANGE, DEFAULT_BRIGHTNESS_PERCENT, InitialBacklight,
+    apply_initial_backlight, apply_manual_backlight,
 };
 pub use audio_route::{AudioRoutePreference, AudioRouteStateError};
 pub use heartbeat::{HeartbeatStamp, HeartbeatStampError};

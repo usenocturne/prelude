@@ -61,11 +61,17 @@ const SWITCH_HEIGHT: i32 = 44;
 const SLIDER_X: i32 = CONTENT_X;
 const SLIDER_WIDTH: i32 = CONTENT_RIGHT - CONTENT_X;
 const SLIDER_TRACK_OFFSET: i32 = 86;
+const SLIDER_THUMB_RADIUS: i32 = 16;
+const SLIDER_TRAVEL_X: i32 = SLIDER_X + SLIDER_THUMB_RADIUS;
+const SLIDER_TRAVEL: i32 = SLIDER_WIDTH - SLIDER_THUMB_RADIUS * 2;
 const DRAG_THRESHOLD: i32 = 12;
 const BANDS: [Band; 2] = [Band::Ghz2_4, Band::Ghz5];
 const MIN_DPI: u32 = prelude_android_auto_protocol::MIN_VIDEO_DENSITY_DPI;
 const MAX_DPI: u32 = prelude_android_auto_protocol::MAX_VIDEO_DENSITY_DPI;
 const DPI_STEP: u32 = 10;
+const MIN_BRIGHTNESS: u8 = 5;
+const MAX_BRIGHTNESS: u8 = 100;
+const BRIGHTNESS_STEP: u8 = 5;
 const GROUP: [u8; 3] = [28, 28, 30];
 const FOCUS: [u8; 3] = [58, 58, 62];
 const DIVIDER: [u8; 3] = [46, 46, 50];
@@ -251,12 +257,14 @@ enum Item {
     Phones,
     Wifi,
     AutoBrightness,
+    BrightnessSlider,
     AutoNightMode,
     Density,
     CarPlayDock,
     PhoneAudio,
     Equalizer,
     Presets,
+    PresetsEnabled,
     Preset(usize),
     PresetsReset,
     Support,
@@ -276,6 +284,7 @@ impl Item {
         matches!(
             self,
             Self::DensitySlider
+                | Self::BrightnessSlider
                 | Self::CarPlayDock
                 | Self::Preset(_)
                 | Self::WifiBand
@@ -284,10 +293,15 @@ impl Item {
         )
     }
 
+    const fn slider(self) -> bool {
+        matches!(self, Self::DensitySlider | Self::BrightnessSlider)
+    }
+
     const fn height(self) -> i32 {
-        match self {
-            Self::DensitySlider => SLIDER_ROW_HEIGHT,
-            _ => ROW_HEIGHT,
+        if self.slider() {
+            SLIDER_ROW_HEIGHT
+        } else {
+            ROW_HEIGHT
         }
     }
 }
@@ -456,6 +470,7 @@ struct SettingsUi<D> {
     staged_dock: CarPlayDock,
     presets: PresetBindings,
     staged_presets: [PresetAction; PRESET_COUNT],
+    staged_presets_enabled: bool,
     staged_radio: Option<(u8, ChannelWidth)>,
     page: Page,
     focus: usize,
@@ -495,6 +510,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         wake: Arc<Notify>,
     ) -> Self {
         if let Some(control) = ambient_light.as_ref() {
+            control.set_brightness_percent(settings.brightness_percent);
             control.set_automatic_brightness(settings.auto_brightness);
             control.set_automatic_night_mode(settings.auto_night_mode);
         }
@@ -510,6 +526,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
             staged_dock: settings.carplay_dock,
             presets,
             staged_presets: settings.presets,
+            staged_presets_enabled: settings.presets_enabled,
             staged_radio: settings.wifi_radio(),
             page: Page::Settings,
             focus: 0,
@@ -631,26 +648,26 @@ impl<D: OverlaySurface> SettingsUi<D> {
             || self.staged_phone_audio != self.settings.phone_audio
             || self.staged_dock != self.settings.carplay_dock
             || self.staged_presets != self.settings.presets
+            || self.staged_presets_enabled != self.settings.presets_enabled
             || self.staged_radio != self.settings.wifi_radio()
     }
 
     fn sections(&self) -> Vec<Section> {
         match self.page {
-            Page::Settings => vec![
-                Section::plain(vec![Item::Phones]),
-                Section::titled(
-                    "Display",
-                    vec![
-                        Item::AutoBrightness,
-                        Item::AutoNightMode,
-                        Item::Density,
-                        Item::CarPlayDock,
-                    ],
-                ),
-                Section::titled("Audio", vec![Item::PhoneAudio, Item::Equalizer]),
-                Section::titled("Controls", vec![Item::Presets]),
-                Section::titled("Advanced", vec![Item::Wifi, Item::Support, Item::Version]),
-            ],
+            Page::Settings => {
+                let mut display = vec![Item::AutoBrightness];
+                if !self.settings.auto_brightness {
+                    display.push(Item::BrightnessSlider);
+                }
+                display.extend([Item::AutoNightMode, Item::Density, Item::CarPlayDock]);
+                vec![
+                    Section::plain(vec![Item::Phones]),
+                    Section::titled("Display", display),
+                    Section::titled("Audio", vec![Item::PhoneAudio, Item::Equalizer]),
+                    Section::titled("Controls", vec![Item::Presets]),
+                    Section::titled("Advanced", vec![Item::Wifi, Item::Support, Item::Version]),
+                ]
+            }
             Page::Phones => vec![Section::plain(
                 (0..self.phones.len()).map(Item::Phone).collect(),
             )],
@@ -667,10 +684,12 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 Section::plain(vec![Item::DensitySlider, Item::DensityReset])
                     .footer("CarPlay and Android Auto restart after settings close"),
             ],
-            Page::Presets => vec![
+            Page::Presets if self.staged_presets_enabled => vec![
+                Section::plain(vec![Item::PresetsEnabled]),
                 Section::plain((0..PRESET_COUNT).map(Item::Preset).collect()),
                 Section::plain(vec![Item::PresetsReset]),
             ],
+            Page::Presets => vec![Section::plain(vec![Item::PresetsEnabled])],
             Page::Wifi if self.wifi_available() => vec![
                 Section::plain(vec![Item::WifiBand, Item::WifiChannel, Item::WifiWidth])
                     .footer("Wi-Fi restarts after settings close"),
@@ -728,6 +747,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         self.staged_phone_audio = self.settings.phone_audio;
         self.staged_dock = self.settings.carplay_dock;
         self.staged_presets = self.settings.presets;
+        self.staged_presets_enabled = self.settings.presets_enabled;
         self.staged_radio = self.settings.wifi_radio();
         self.editing = false;
         self.touch = None;
@@ -750,6 +770,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         next.phone_audio = self.staged_phone_audio;
         next.carplay_dock = self.staged_dock;
         next.presets = self.staged_presets;
+        next.presets_enabled = self.staged_presets_enabled;
         if let Some((channel, width)) = self.staged_radio {
             next.wifi_channel = Some(channel);
             next.wifi_channel_width_mhz = Some(width.mhz());
@@ -766,6 +787,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
             || next.carplay_dock != self.settings.carplay_dock;
         let radio_changed = next.wifi_radio() != self.settings.wifi_radio();
         self.presets.set(next.presets);
+        self.presets.set_enabled(next.presets_enabled);
         self.settings = next;
         self.menu_open = false;
         self.leave_subpage();
@@ -877,7 +899,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         let (dx, dy) = (x - touch.x, y - touch.y);
         let maximum = self.layout().maximum_scroll();
         if !touch.scrolling && !touch.sliding {
-            let on_slider = touch.row.is_some() && self.focused_item() == Some(Item::DensitySlider);
+            let on_slider = touch.row.is_some() && self.focused_item().is_some_and(Item::slider);
             if on_slider && dx.abs() >= DRAG_THRESHOLD && dx.abs() > dy.abs() {
                 touch.sliding = true;
             } else if dy.abs() >= DRAG_THRESHOLD && dy.abs() >= dx.abs() && maximum > 0 {
@@ -886,7 +908,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
         }
         self.touch = Some(touch);
         if touch.sliding {
-            self.stage_dpi(dpi_from_x(x));
+            if let Some(item) = self.focused_item() {
+                self.slide(item, x);
+            }
         } else if touch.scrolling {
             self.scroll = (touch.scroll - dy).clamp(0, maximum);
             self.redraw();
@@ -915,10 +939,11 @@ impl<D: OverlaySurface> SettingsUi<D> {
             return;
         };
         match row.item {
-            Item::DensitySlider if content_y >= row.top + SLIDER_TRACK_OFFSET - 28 => {
-                self.stage_dpi(dpi_from_x(x));
+            item if item.slider() => {
+                if content_y >= row.top + SLIDER_TRACK_OFFSET - 28 {
+                    self.slide(item, x);
+                }
             }
-            Item::DensitySlider => {}
             item if item.adjustable() => self.adjust(item, 1, true),
             item => self.activate(item),
         }
@@ -937,6 +962,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
             Item::PhoneAudio => self.toggle_phone_audio(),
             Item::Equalizer => self.enter(Page::Equalizer),
             Item::Presets => self.enter(Page::Presets),
+            Item::PresetsEnabled => self.toggle_presets_enabled(),
             Item::PresetsReset => self.reset_presets(),
             Item::Support => self.enter(Page::Support),
             Item::Version => {}
@@ -945,11 +971,20 @@ impl<D: OverlaySurface> SettingsUi<D> {
             Item::Forget => self.forget_opened_phone(),
             Item::DensityReset => self.restore_original_dpi(),
             Item::DensitySlider
+            | Item::BrightnessSlider
             | Item::CarPlayDock
             | Item::Preset(_)
             | Item::WifiBand
             | Item::WifiChannel
             | Item::WifiWidth => self.adjust(item, 1, true),
+        }
+    }
+
+    fn slide(&mut self, item: Item, x: i32) {
+        match item {
+            Item::DensitySlider => self.stage_dpi(dpi_from_x(x)),
+            Item::BrightnessSlider => self.set_brightness(brightness_from_x(x)),
+            _ => {}
         }
     }
 
@@ -959,6 +994,13 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 let dpi = i64::from(self.staged_dpi) + delta as i64 * i64::from(DPI_STEP);
                 let dpi = dpi.clamp(i64::from(MIN_DPI), i64::from(MAX_DPI));
                 self.stage_dpi(u32::try_from(dpi).unwrap_or(MIN_DPI));
+            }
+            Item::BrightnessSlider => {
+                let percent = isize::from(self.settings.brightness_percent)
+                    + delta * isize::from(BRIGHTNESS_STEP);
+                let percent =
+                    percent.clamp(isize::from(MIN_BRIGHTNESS), isize::from(MAX_BRIGHTNESS));
+                self.set_brightness(u8::try_from(percent).unwrap_or(MAX_BRIGHTNESS));
             }
             Item::CarPlayDock => {
                 self.staged_dock = step_option(&CarPlayDock::ALL, self.staged_dock, delta, wrap);
@@ -986,6 +1028,15 @@ impl<D: OverlaySurface> SettingsUi<D> {
     fn stage_dpi(&mut self, dpi: u32) {
         self.staged_dpi = dpi;
         self.staged_dpi_customized = true;
+        self.error_message = None;
+        self.redraw();
+    }
+
+    fn set_brightness(&mut self, percent: u8) {
+        self.settings.brightness_percent = percent;
+        if let Some(control) = self.ambient_light.as_ref() {
+            control.set_brightness_percent(percent);
+        }
         self.error_message = None;
         self.redraw();
     }
@@ -1165,6 +1216,12 @@ impl<D: OverlaySurface> SettingsUi<D> {
         self.redraw();
     }
 
+    fn toggle_presets_enabled(&mut self) {
+        self.staged_presets_enabled = !self.staged_presets_enabled;
+        self.error_message = None;
+        self.redraw();
+    }
+
     fn apply_immediate_setting(&mut self, next: RuntimeSettings, brightness: bool) {
         if let Err(error) = next.persist(&self.state_dir) {
             warn!(%error, "could not persist host settings");
@@ -1174,6 +1231,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         }
         if let Some(control) = self.ambient_light.as_ref() {
             if brightness {
+                control.set_brightness_percent(next.brightness_percent);
                 control.set_automatic_brightness(next.auto_brightness);
             } else {
                 control.set_automatic_night_mode(next.auto_night_mode);
@@ -1488,8 +1546,8 @@ impl<D: OverlaySurface> SettingsUi<D> {
             if focused {
                 self.render_focus(canvas, row);
             }
-            if row.item == Item::DensitySlider {
-                self.render_density_slider(canvas, row, focused);
+            if row.item.slider() {
+                self.render_slider(canvas, row, focused);
             } else {
                 self.render_row(canvas, row);
             }
@@ -1568,15 +1626,34 @@ impl<D: OverlaySurface> SettingsUi<D> {
         }
     }
 
-    fn render_density_slider(&self, canvas: &mut Canvas, row: &Row, focused: bool) {
+    fn render_slider(&self, canvas: &mut Canvas, row: &Row, focused: bool) {
+        let (label, value, x, marker, captions) = match row.item {
+            Item::BrightnessSlider => {
+                let percent = self.settings.brightness_percent;
+                (
+                    "Brightness",
+                    format!("{percent}%"),
+                    brightness_x(percent),
+                    None,
+                    ("Dimmer", "Brighter"),
+                )
+            }
+            _ => (
+                "Density",
+                format!("{} dpi", self.staged_dpi),
+                dpi_x(self.staged_dpi),
+                Some(dpi_x(self.settings.original_dpi)),
+                ("Smaller", "Larger"),
+            ),
+        };
         let active = focused && (self.editing || self.touch.is_some_and(|touch| touch.sliding));
         let label_y = row.top + 42;
         canvas.text(
-            self.fonts, "Density", CONTENT_X, label_y, LABEL_SIZE, WHITE, false,
+            self.fonts, label, CONTENT_X, label_y, LABEL_SIZE, WHITE, false,
         );
         canvas.text_right(
             self.fonts,
-            &format!("{} dpi", self.staged_dpi),
+            &value,
             CONTENT_RIGHT,
             label_y,
             VALUE_SIZE,
@@ -1584,7 +1661,6 @@ impl<D: OverlaySurface> SettingsUi<D> {
             false,
         );
         let track_y = row.top + SLIDER_TRACK_OFFSET;
-        let x = dpi_x(self.staged_dpi);
         canvas.rounded_rect(SLIDER_X, track_y - 4, SLIDER_WIDTH, 8, 4, TRACK, 255);
         canvas.rounded_rect(
             SLIDER_X,
@@ -1595,13 +1671,14 @@ impl<D: OverlaySurface> SettingsUi<D> {
             if active { GREEN } else { WHITE },
             255,
         );
-        let default_x = dpi_x(self.settings.original_dpi);
-        canvas.rounded_rect(default_x - 1, track_y - 12, 2, 24, 1, SECONDARY, 255);
-        canvas.circle(x, track_y, 16, WHITE, 255);
+        if let Some(marker_x) = marker {
+            canvas.rounded_rect(marker_x - 1, track_y - 12, 2, 24, 1, SECONDARY, 255);
+        }
+        canvas.circle(x, track_y, SLIDER_THUMB_RADIUS, WHITE, 255);
         let caption_y = row.top + 116;
         canvas.text(
             self.fonts,
-            "Smaller",
+            captions.0,
             CONTENT_X,
             caption_y,
             CAPTION_SIZE,
@@ -1610,7 +1687,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         );
         canvas.text_right(
             self.fonts,
-            "Larger",
+            captions.1,
             CONTENT_RIGHT,
             caption_y,
             CAPTION_SIZE,
@@ -1673,8 +1750,14 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 "Equalizer",
                 Trailing::Link(on_off(self.equalizer_ui.settings.enabled), SECONDARY),
             ),
+            Item::PresetsEnabled => RowView::new(
+                "Preset buttons",
+                Trailing::Switch(self.staged_presets_enabled),
+            ),
             Item::Presets => {
-                let summary = if self.staged_presets == PresetAction::DEFAULTS {
+                let summary = if !self.staged_presets_enabled {
+                    "Off"
+                } else if self.staged_presets == PresetAction::DEFAULTS {
                     "Default"
                 } else {
                     "Custom"
@@ -1756,6 +1839,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 RowView::new(label, self.option_trailing(item, &value))
             }
             Item::DensitySlider => RowView::new("Density", Trailing::None),
+            Item::BrightnessSlider => RowView::new("Brightness", Trailing::None),
         }
     }
 }
@@ -1832,16 +1916,32 @@ fn selection_after_rotary(
 }
 
 fn dpi_from_x(x: i32) -> u32 {
-    let position = (x - SLIDER_X).clamp(0, SLIDER_WIDTH);
+    let position = (x - SLIDER_TRAVEL_X).clamp(0, SLIDER_TRAVEL);
     let raw = MIN_DPI
         + ((u32::try_from(position).unwrap_or(0) * (MAX_DPI - MIN_DPI))
-            / u32::try_from(SLIDER_WIDTH).unwrap_or(1));
+            / u32::try_from(SLIDER_TRAVEL).unwrap_or(1));
     ((raw + DPI_STEP / 2) / DPI_STEP * DPI_STEP).clamp(MIN_DPI, MAX_DPI)
+}
+
+fn brightness_from_x(x: i32) -> u8 {
+    let position = (x - SLIDER_TRAVEL_X).clamp(0, SLIDER_TRAVEL);
+    let span = i32::from(MAX_BRIGHTNESS - MIN_BRIGHTNESS);
+    let step = i32::from(BRIGHTNESS_STEP);
+    let raw = i32::from(MIN_BRIGHTNESS) + position * span / SLIDER_TRAVEL;
+    let snapped = (raw + step / 2) / step * step;
+    u8::try_from(snapped.clamp(i32::from(MIN_BRIGHTNESS), i32::from(MAX_BRIGHTNESS)))
+        .unwrap_or(MAX_BRIGHTNESS)
+}
+
+fn brightness_x(percent: u8) -> i32 {
+    let offset = i32::from(percent.clamp(MIN_BRIGHTNESS, MAX_BRIGHTNESS) - MIN_BRIGHTNESS);
+    SLIDER_TRAVEL_X + offset * SLIDER_TRAVEL / i32::from(MAX_BRIGHTNESS - MIN_BRIGHTNESS)
 }
 
 fn dpi_x(dpi: u32) -> i32 {
     let offset = dpi.clamp(MIN_DPI, MAX_DPI) - MIN_DPI;
-    SLIDER_X + (i64::from(offset) * i64::from(SLIDER_WIDTH) / i64::from(MAX_DPI - MIN_DPI)) as i32
+    SLIDER_TRAVEL_X
+        + (i64::from(offset) * i64::from(SLIDER_TRAVEL) / i64::from(MAX_DPI - MIN_DPI)) as i32
 }
 
 struct Canvas {
@@ -2286,6 +2386,25 @@ mod tests {
     }
 
     #[test]
+    fn slider_thumbs_stay_on_the_track_at_both_ends() {
+        let track = SLIDER_X..=SLIDER_X + SLIDER_WIDTH;
+        for x in [
+            dpi_x(MIN_DPI),
+            dpi_x(MAX_DPI),
+            brightness_x(MIN_BRIGHTNESS),
+            brightness_x(MAX_BRIGHTNESS),
+        ] {
+            assert!(track.contains(&(x - SLIDER_THUMB_RADIUS)), "{x}");
+            assert!(track.contains(&(x + SLIDER_THUMB_RADIUS)), "{x}");
+        }
+        assert_eq!(dpi_x(MIN_DPI) - SLIDER_THUMB_RADIUS, SLIDER_X);
+        assert_eq!(
+            brightness_x(MAX_BRIGHTNESS) + SLIDER_THUMB_RADIUS,
+            SLIDER_X + SLIDER_WIDTH
+        );
+    }
+
+    #[test]
     fn settings_sections_stack_without_overlap_and_scroll_to_the_last_row() {
         let harness = Harness::new();
         let layout = harness.ui.layout();
@@ -2488,6 +2607,78 @@ mod tests {
     }
 
     #[test]
+    fn preset_buttons_can_be_switched_off_and_keep_their_assignments() {
+        let mut harness = Harness::new();
+        let live = harness.ui.presets.clone();
+        harness.focus(Item::Presets);
+        harness.press(KnobInputButton::Select);
+        assert_eq!(harness.ui.focused_item(), Some(Item::PresetsEnabled));
+        harness.tap(400, harness.screen_y(Item::Preset(0)));
+        harness.focus(Item::PresetsEnabled);
+        harness.press(KnobInputButton::Select);
+        assert!(!harness.ui.staged_presets_enabled);
+        assert_eq!(harness.ui.layout().rows.len(), 1);
+        assert!(live.enabled());
+        harness.press(KnobInputButton::Back);
+        assert!(harness.ui.has_staged_changes());
+        harness.press(KnobInputButton::Back);
+        assert!(!harness.ui.menu_open);
+        assert!(!live.enabled());
+        assert_eq!(live.actions()[0], PresetAction::PlayPause);
+        assert!(!harness.ui.settings.presets_enabled);
+        assert!(harness.events.try_iter().next().is_none());
+        harness.send(PlatformInputEventKind::SettingsButton);
+        harness.focus(Item::Presets);
+        harness.press(KnobInputButton::Select);
+        harness.press(KnobInputButton::Select);
+        assert!(harness.ui.staged_presets_enabled);
+        assert_eq!(harness.ui.staged_presets[0], PresetAction::PlayPause);
+    }
+
+    #[test]
+    fn manual_brightness_appears_with_auto_brightness_off_and_follows_knob_and_touch() {
+        let mut harness = Harness::new();
+        let offered = |harness: &Harness| {
+            harness
+                .ui
+                .layout()
+                .rows
+                .iter()
+                .any(|row| row.item == Item::BrightnessSlider)
+        };
+        assert!(!offered(&harness));
+        harness.focus(Item::AutoBrightness);
+        harness.press(KnobInputButton::Select);
+        assert!(offered(&harness));
+        let original = harness.ui.settings.brightness_percent;
+        harness.focus(Item::BrightnessSlider);
+        harness.press(KnobInputButton::Select);
+        assert!(harness.ui.editing);
+        harness.turn(-2);
+        assert_eq!(harness.ui.settings.brightness_percent, original - 10);
+        harness.turn(100);
+        assert_eq!(harness.ui.settings.brightness_percent, MAX_BRIGHTNESS);
+        harness.press(KnobInputButton::Back);
+        let track_y =
+            harness.screen_y(Item::BrightnessSlider) - SLIDER_ROW_HEIGHT / 2 + SLIDER_TRACK_OFFSET;
+        harness.tap(SLIDER_X, track_y);
+        assert_eq!(harness.ui.settings.brightness_percent, MIN_BRIGHTNESS);
+        harness.touch(TouchInputPhase::Down, SLIDER_X, track_y);
+        harness.touch(TouchInputPhase::Move, SLIDER_X + SLIDER_WIDTH / 2, track_y);
+        harness.touch(TouchInputPhase::Up, SLIDER_X + SLIDER_WIDTH / 2, track_y);
+        assert_eq!(harness.ui.settings.brightness_percent, 50);
+        harness.press(KnobInputButton::Back);
+        assert!(!harness.ui.menu_open);
+        let saved = RuntimeSettings::load(harness._state.path(), RuntimeSettings::default())
+            .expect("saved settings");
+        assert!(!saved.auto_brightness);
+        assert_eq!(saved.brightness_percent, 50);
+        for percent in (MIN_BRIGHTNESS..=MAX_BRIGHTNESS).step_by(usize::from(BRIGHTNESS_STEP)) {
+            assert_eq!(brightness_from_x(brightness_x(percent)), percent);
+        }
+    }
+
+    #[test]
     fn wifi_values_are_edited_in_place_and_back_leaves_edit_mode_first() {
         let mut harness = Harness::new();
         harness.ui.wireless = true;
@@ -2659,7 +2850,7 @@ mod tests {
              Controls Preset buttons Default Custom Button 1 2 3 4 Previous track Play/Pause Next \
              Mute Home Back Voice assistant Answer call End Reset to default Support Prelude \
              Scan to donate Donations are split between the team and fund future features. \
-             Thank you! usenocturne.com/support"
+             Thank you! usenocturne.com/support Brightness Dimmer Brighter 50%"
                 .chars()
         {
             assert!(
@@ -2707,7 +2898,24 @@ mod tests {
         harness.turn(5);
         capture(&harness, "presets");
         harness.press(KnobInputButton::Back);
+        harness.focus(Item::PresetsEnabled);
+        harness.press(KnobInputButton::Select);
+        capture(&harness, "presets-off");
+        harness.press(KnobInputButton::Select);
         harness.press(KnobInputButton::Back);
+        harness.focus(Item::AutoBrightness);
+        harness.press(KnobInputButton::Select);
+        harness.focus(Item::BrightnessSlider);
+        harness.press(KnobInputButton::Select);
+        harness.turn(-4);
+        capture(&harness, "brightness-editing");
+        harness.turn(-100);
+        capture(&harness, "brightness-minimum");
+        harness.turn(100);
+        capture(&harness, "brightness-maximum");
+        harness.press(KnobInputButton::Back);
+        harness.focus(Item::AutoBrightness);
+        harness.press(KnobInputButton::Select);
         harness.focus(Item::Equalizer);
         harness.press(KnobInputButton::Select);
         capture(&harness, "equalizer");
