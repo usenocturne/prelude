@@ -6,6 +6,7 @@
 //! the reboot sit behind traits so the worker can be tested with fakes.
 
 pub mod release;
+pub mod system;
 
 pub use release::{Asset, Candidate, Flavour, Relation, Release};
 
