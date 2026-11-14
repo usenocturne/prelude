@@ -29,6 +29,7 @@ nix.workspace = true
 platform-superbird = { path = "../platform-superbird" }
 plist = "=1.7.0"
 serde.workspace = true
+semver.workspace = true
 serde_json.workspace = true
 sonora = "0.2.0"
 thiserror.workspace = true

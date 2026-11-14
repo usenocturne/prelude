@@ -36,6 +36,7 @@ mod settings;
 mod shared_mfi;
 #[cfg(any(test, all(target_os = "linux", feature = "linux-media")))]
 mod status_screen;
+mod updater;
 mod usb_monitor;
 mod wired_runtime;
 mod wireless_carplay;

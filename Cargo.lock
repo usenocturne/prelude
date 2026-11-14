@@ -1992,6 +1992,7 @@ dependencies = [
  "prelude-net",
  "prelude-usb-carkit",
  "prelude-wireless",
+ "semver",
  "serde",
  "serde_json",
  "sonora",
