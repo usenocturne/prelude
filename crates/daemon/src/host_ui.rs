@@ -2479,7 +2479,13 @@ mod tests {
             },
         )
         .expect("remember");
-        assert_eq!(summary(&harness), "Vegasector · not connected");
+        // Network name on the right, state on a second line: one combined
+        // value was too wide and got cut off on hardware.
+        assert_eq!(summary(&harness), "Vegasector");
+        assert_eq!(
+            harness.ui.row_view(Item::Internet).detail.as_deref(),
+            Some("Not connected")
+        );
         harness.set_internet(InternetState::Online {
             route: Route::Wifi {
                 ssid: "Vegasector".to_owned(),

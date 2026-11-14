@@ -250,23 +250,31 @@ impl<D: OverlaySurface> SettingsUi<D> {
 
     pub(super) fn internet_row_view(&self, item: Item) -> RowView {
         match item {
-            Item::Internet => {
-                let (summary, color) = match &self.internet_state {
-                    InternetState::Online { .. } => ("Online".to_owned(), GREEN),
-                    InternetState::Failed(error) => (error.message().to_owned(), SECONDARY),
-                    // "Off" read as "Wi-Fi is broken"; name the network instead.
-                    _ => (
-                        saved_networks::load(&self.state_dir).first().map_or_else(
-                            || "Not connected".to_owned(),
-                            |saved| {
-                                format!("{} · not connected", String::from_utf8_lossy(&saved.ssid))
-                            },
+            Item::Internet => match &self.internet_state {
+                InternetState::Online { .. } => {
+                    RowView::new("Internet", Trailing::Link("Online".to_owned(), GREEN))
+                }
+                InternetState::Failed(error) => RowView::new(
+                    "Internet",
+                    Trailing::Link(error.message().to_owned(), SECONDARY),
+                ),
+                // "Off" read as "Wi-Fi is broken": name the network, with the
+                // state on its own line so neither gets cut off.
+                _ => match saved_networks::load(&self.state_dir).first() {
+                    Some(saved) => RowView::new(
+                        "Internet",
+                        Trailing::Link(
+                            String::from_utf8_lossy(&saved.ssid).into_owned(),
+                            SECONDARY,
                         ),
-                        SECONDARY,
+                    )
+                    .detail("Not connected"),
+                    None => RowView::new(
+                        "Internet",
+                        Trailing::Link("Not connected".to_owned(), SECONDARY),
                     ),
-                };
-                RowView::new("Internet", Trailing::Link(summary, color))
-            }
+                },
+            },
             Item::InternetNetwork => {
                 let summary = saved_networks::load(&self.state_dir).first().map_or_else(
                     || "Choose…".to_owned(),
