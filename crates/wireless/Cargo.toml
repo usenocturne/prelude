@@ -8,9 +8,12 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+hex.workspace = true
 nix.workspace = true
+pbkdf2.workspace = true
 prost = "0.14.1"
 serde.workspace = true
+sha1.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

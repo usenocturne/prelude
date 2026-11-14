@@ -1690,6 +1690,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1931,9 +1941,12 @@ dependencies = [
 name = "prelude-wireless"
 version = "0.1.4"
 dependencies = [
+ "hex",
  "nix 0.30.1",
+ "pbkdf2",
  "prost",
  "serde",
+ "sha1",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

@@ -3,21 +3,16 @@ use std::{
     fmt, fs,
     io::{BufRead, BufReader},
     net::{Ipv4Addr, Ipv6Addr},
-    os::unix::net::UnixDatagram,
     path::{Path, PathBuf},
-    process::{self, Child, Command, Stdio},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    },
+    process::{Child, Command, Stdio},
+    sync::mpsc,
     thread,
     time::Duration,
 };
 
-use crate::{Error, Result};
+use crate::{Error, Result, control::ControlSocket};
 
 const HOSTAPD_START_TIMEOUT: Duration = Duration::from_secs(15);
-const HOSTAPD_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 pub const CHANNELS_2GHZ: [u8; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 pub const CHANNELS_5GHZ: [u8; 9] = [36, 40, 44, 48, 149, 153, 157, 161, 165];
 pub const FALLBACK_2GHZ_CHANNEL: u8 = 6;
@@ -395,12 +390,14 @@ impl AccessPoint {
 
     pub fn stations(&self) -> StationControl {
         StationControl {
-            socket: self
-                .config
-                .run_dir
-                .join("hostapd")
-                .join(&self.config.interface),
-            run_dir: self.config.run_dir.clone(),
+            control: ControlSocket::new(
+                self.config
+                    .run_dir
+                    .join("hostapd")
+                    .join(&self.config.interface),
+                self.config.run_dir.clone(),
+                "hostapd",
+            ),
         }
     }
 
@@ -444,8 +441,7 @@ impl Drop for AccessPoint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StationControl {
-    socket: PathBuf,
-    run_dir: PathBuf,
+    control: ControlSocket,
 }
 
 impl StationControl {
@@ -466,31 +462,13 @@ impl StationControl {
     }
 
     fn command(&self, command: &str) -> Result<()> {
-        static NEXT_CLIENT: AtomicU64 = AtomicU64::new(0);
-        let client = self.run_dir.join(format!(
-            "hostapd-client-{}-{}",
-            process::id(),
-            NEXT_CLIENT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_file(&client);
-        let exchange = || -> std::io::Result<Vec<u8>> {
-            let socket = UnixDatagram::bind(&client)?;
-            socket.set_read_timeout(Some(HOSTAPD_CONTROL_TIMEOUT))?;
-            socket.connect(&self.socket)?;
-            socket.send(command.as_bytes())?;
-            let mut reply = [0_u8; 64];
-            let length = socket.recv(&mut reply)?;
-            Ok(reply[..length].to_vec())
-        };
-        let reply = exchange();
-        let _ = fs::remove_file(&client);
-        let reply = reply.map_err(|error| Error::io_context("talking to hostapd", error))?;
-        if reply.starts_with(b"OK") {
+        let reply = self.control.request(command)?;
+        if reply.starts_with("OK") {
             Ok(())
         } else {
             Err(Error::CommandFailed {
                 command: format!("hostapd {command}"),
-                status: String::from_utf8_lossy(&reply).trim().to_owned(),
+                status: reply.trim().to_owned(),
             })
         }
     }
