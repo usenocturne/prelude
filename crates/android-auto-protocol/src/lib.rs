@@ -15,6 +15,7 @@ pub use proto::{
     MIN_VIDEO_DENSITY_DPI, service_discovery_payload, service_discovery_payload_with_density,
 };
 pub use session::{
-    AudioChannel, Button, CancellationToken, Command, DisconnectReason, Event, MediaKey, Session,
-    SessionConfig, SessionState, SessionTrace, TouchAction, TouchPointer,
+    AudioChannel, Button, CancellationToken, Command, DisconnectReason, Event, LINK_SAMPLES,
+    LinkWindow, MediaKey, Session, SessionConfig, SessionState, SessionTrace, TouchAction,
+    TouchPointer,
 };

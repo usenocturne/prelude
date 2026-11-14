@@ -141,6 +141,11 @@ pub(crate) struct MessageAssembler {
 }
 
 impl MessageAssembler {
+    /// Whether no fragmented message is waiting for its remaining fragments.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.channels.is_empty()
+    }
+
     pub(crate) fn push(
         &mut self,
         channel_id: u8,
@@ -309,6 +314,18 @@ mod tests {
         let frames = FrameDecoder::new().push(&[a, b].concat()).expect("frames");
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[1].channel_id, 2);
+    }
+
+    #[test]
+    fn coalesced_wire_reads_exceeding_single_physical_frame_are_decoded() {
+        let a = encode_plain_frame(3, BULK, 1, &vec![0x11; 40_000]).expect("a");
+        let b = encode_plain_frame(3, BULK, 2, &vec![0x22; 30_000]).expect("b");
+        let combined = [a, b].concat();
+        assert!(combined.len() > crate::constants::MAX_PHYSICAL_FRAME);
+        let frames = FrameDecoder::new().push(&combined).expect("frames");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].payload.len(), 40_002);
+        assert_eq!(frames[1].payload.len(), 30_002);
     }
 
     #[test]

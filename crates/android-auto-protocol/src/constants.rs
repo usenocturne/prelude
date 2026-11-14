@@ -18,7 +18,13 @@ pub const FLAG_ENCRYPTED_CONTROL: u8 = FLAG_ENCRYPTED_CONTROL_BASE | FRAME_TYPE_
 
 pub const MAX_PHYSICAL_PAYLOAD: usize = u16::MAX as usize;
 pub const MAX_REASSEMBLED_PAYLOAD: usize = 4 * 1024 * 1024;
-pub const MAX_BUFFERED_WIRE: usize = MAX_PHYSICAL_PAYLOAD + 8;
+#[allow(dead_code)]
+pub const MAX_PHYSICAL_FRAME: usize = MAX_PHYSICAL_PAYLOAD + 8;
+/// Maximum wire bytes that may be pushed or buffered in a single decoder pass.
+/// Transport stream sockets (Unix socket pairs, TCP) coalesce multiple discrete
+/// USB bulk transfers or TCP segments into one `read()` buffer up to `READ_BUFFER_LIMIT`
+/// (256 KB), which easily exceeds a single physical frame limit of 65,543 bytes.
+pub const MAX_BUFFERED_WIRE: usize = 512 * 1024;
 pub const MAX_PROTO_PAYLOAD: usize = 128 * 1024;
 pub const MAX_MIC_PCM: usize = 16 * 1024;
 pub const MAX_MIC_BACKLOG: usize = 64;
@@ -106,6 +112,9 @@ pub mod message {
 
 pub const MEDIA_CODEC_PCM: i32 = 1;
 pub const MEDIA_CODEC_H264_BASELINE: i32 = 3;
+pub const VIDEO_RESOLUTION_480P: i32 = 1;
+pub const VIDEO_FPS_60: i32 = 1;
+pub const VIDEO_FPS_30: i32 = 2;
 pub const AV_SETUP_OK: i32 = 2;
 pub const STATUS_OK: i32 = 0;
 pub const BLUETOOTH_PAIRING_NUMERIC_COMPARISON: i32 = 2;
