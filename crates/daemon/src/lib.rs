@@ -29,6 +29,7 @@ mod media_runtime;
 mod pairing_code;
 mod presets;
 pub mod readiness;
+mod saved_networks;
 mod settings;
 #[cfg(target_os = "linux")]
 mod shared_mfi;

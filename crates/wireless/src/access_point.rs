@@ -739,7 +739,7 @@ fn spawn_hostapd(config_path: &Path) -> Result<Child> {
     }
 }
 
-fn run(program: &str, args: &[&str]) -> Result<()> {
+pub(crate) fn run(program: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(program)
         .args(args)
         .stdin(Stdio::null())

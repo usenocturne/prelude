@@ -1,10 +1,276 @@
 //! Wi-Fi client ("station") mode: joining a home network or phone hotspot
 //! through the USB adapter that normally hosts the projection access point.
 
-use std::{collections::HashMap, fmt, path::Path};
+use std::{
+    collections::HashMap,
+    fmt,
+    fs::{self, OpenOptions},
+    io::Write,
+    net::Ipv4Addr,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use pbkdf2::pbkdf2_hmac;
 use sha1::Sha1;
+
+use crate::{Error, Result, access_point::run, control::ControlSocket};
+
+pub const UDHCPC_SCRIPT: &str = "/usr/libexec/prelude-udhcpc-script";
+const POLL: Duration = Duration::from_millis(500);
+const CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StationConfig {
+    pub interface: String,
+    pub country: String,
+    /// Owned by the station while it runs, e.g. `/run/prelude/client`.
+    pub run_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    pub address: String,
+    pub router: Option<Ipv4Addr>,
+    pub dns: Vec<Ipv4Addr>,
+}
+
+/// Parses the lease file written by `prelude-udhcpc-script`.
+pub fn parse_lease(text: &str) -> Option<Lease> {
+    let mut address = None;
+    let mut router = None;
+    let mut dns = Vec::new();
+    for line in text.lines() {
+        match line.split_once('=') {
+            Some(("address", value)) if !value.is_empty() => address = Some(value.to_owned()),
+            Some(("router", value)) => router = value.parse().ok(),
+            Some(("dns", value)) => {
+                dns = value
+                    .split_whitespace()
+                    .filter_map(|server| server.parse().ok())
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    Some(Lease {
+        address: address?,
+        router,
+        dns,
+    })
+}
+
+/// A running wpa_supplicant (and, once leased, udhcpc) on the adapter.
+/// Dropping it stops both and removes every address, route and DNS setting
+/// it added.
+#[derive(Debug)]
+pub struct Station {
+    config: StationConfig,
+    control: ControlSocket,
+    supplicant: Child,
+    dhcp: Option<Child>,
+}
+
+impl Station {
+    pub fn start(config: StationConfig) -> Result<Self> {
+        let control_dir = config.run_dir.join("wpa");
+        let _ = fs::remove_dir_all(&config.run_dir);
+        fs::create_dir_all(&control_dir)
+            .map_err(|error| Error::io_context("creating the Wi-Fi client run directory", error))?;
+        run("iw", &["reg", "set", &config.country])?;
+        run("ip", &["addr", "flush", "dev", &config.interface])?;
+        run("ip", &["link", "set", &config.interface, "up"])?;
+        let conf = config.run_dir.join("wpa_supplicant.conf");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&conf)
+            .map_err(|error| Error::io_context("writing wpa_supplicant.conf", error))?;
+        file.write_all(render_wpa_supplicant(&control_dir, &config.country).as_bytes())
+            .map_err(|error| Error::io_context("writing wpa_supplicant.conf", error))?;
+        let supplicant = Command::new("wpa_supplicant")
+            .args(["-i", &config.interface, "-D", "nl80211", "-c"])
+            .arg(&conf)
+            .stdin(Stdio::null())
+            .spawn()
+            .map_err(|error| Error::io_context("starting wpa_supplicant", error))?;
+        let socket = control_dir.join(&config.interface);
+        let control = ControlSocket::new(socket.clone(), config.run_dir.clone(), "wpa");
+        let mut station = Self {
+            config,
+            control,
+            supplicant,
+            dhcp: None,
+        };
+        let deadline = Instant::now() + CONTROL_SOCKET_TIMEOUT;
+        while !socket.exists() {
+            station.check()?;
+            if Instant::now() >= deadline {
+                return Err(Error::AccessPointStart(
+                    "wpa_supplicant control socket never appeared",
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Ok(station)
+    }
+
+    pub fn scan(&mut self, timeout: Duration) -> Result<Vec<ScanResult>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let reply = self.control.request("SCAN")?;
+            if reply.starts_with("OK") {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(self.failed("SCAN", &reply));
+            }
+            thread::sleep(POLL);
+        }
+        loop {
+            thread::sleep(POLL);
+            self.check()?;
+            let results = parse_scan_results(&self.control.request("SCAN_RESULTS")?);
+            if !results.is_empty() || Instant::now() >= deadline {
+                return Ok(results);
+            }
+        }
+    }
+
+    pub fn join(&mut self, credential: &Credential, timeout: Duration) -> Result<JoinProgress> {
+        self.expect_ok("REMOVE_NETWORK all")?;
+        let id = self.control.request("ADD_NETWORK")?.trim().to_owned();
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(self.failed("ADD_NETWORK", &id));
+        }
+        for command in network_commands(&id, credential) {
+            self.expect_ok(&command)?;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            thread::sleep(POLL);
+            self.check()?;
+            let progress = join_progress(
+                &self.control.request("STATUS")?,
+                &self.control.request("LIST_NETWORKS")?,
+            );
+            if progress != JoinProgress::Connecting || Instant::now() >= deadline {
+                return Ok(progress);
+            }
+        }
+    }
+
+    pub fn lease(&mut self, timeout: Duration) -> Result<Lease> {
+        let lease_path = self.config.run_dir.join("lease");
+        if self.dhcp.is_none() {
+            let child = Command::new("udhcpc")
+                .args(["-f", "-i", &self.config.interface, "-s", UDHCPC_SCRIPT])
+                .args(["-t", "5", "-T", "2", "-A", "3", "-x", "hostname:prelude"])
+                .env("PRELUDE_CLIENT_DIR", &self.config.run_dir)
+                .stdin(Stdio::null())
+                .spawn()
+                .map_err(|error| Error::io_context("starting udhcpc", error))?;
+            self.dhcp = Some(child);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(lease) = fs::read_to_string(&lease_path)
+                .ok()
+                .as_deref()
+                .and_then(parse_lease)
+            {
+                return Ok(lease);
+            }
+            self.check()?;
+            if Instant::now() >= deadline {
+                return Err(Error::Protocol("no DHCP lease"));
+            }
+            thread::sleep(POLL);
+        }
+    }
+
+    pub fn check(&mut self) -> Result<()> {
+        if !Path::new("/sys/class/net")
+            .join(&self.config.interface)
+            .exists()
+        {
+            return Err(Error::ProcessExited {
+                name: "wifi-adapter",
+                status: "removed".to_owned(),
+            });
+        }
+        let processes = [
+            ("wpa_supplicant", Some(&mut self.supplicant)),
+            ("udhcpc", self.dhcp.as_mut()),
+        ];
+        for (name, child) in processes {
+            if let Some(child) = child
+                && let Some(status) = child
+                    .try_wait()
+                    .map_err(|error| Error::io_context("polling Wi-Fi client processes", error))?
+            {
+                return Err(Error::ProcessExited {
+                    name,
+                    status: status.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn expect_ok(&self, command: &str) -> Result<()> {
+        let reply = self.control.request(command)?;
+        if reply.starts_with("OK") {
+            Ok(())
+        } else {
+            Err(self.failed(command, &reply))
+        }
+    }
+
+    fn failed(&self, command: &str, reply: &str) -> Error {
+        // Never echo the command: SET_NETWORK carries the PSK.
+        let verb = command
+            .split_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        Error::CommandFailed {
+            command: format!("wpa_supplicant {verb} on {}", self.config.interface),
+            status: reply.trim().to_owned(),
+        }
+    }
+}
+
+impl Drop for Station {
+    fn drop(&mut self) {
+        let children = self
+            .dhcp
+            .iter_mut()
+            .chain(std::iter::once(&mut self.supplicant));
+        for child in children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let interface = self.config.interface.as_str();
+        for (program, args) in [
+            ("ip", vec!["addr", "flush", "dev", interface]),
+            ("ip", vec!["route", "flush", "dev", interface]),
+            ("resolvectl", vec!["revert", interface]),
+        ] {
+            let _ = Command::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = fs::remove_dir_all(&self.config.run_dir);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Security {
@@ -219,6 +485,28 @@ mod tests {
             .iter()
             .find(|result| result.ssid == ssid)
             .expect("network listed")
+    }
+
+    #[test]
+    fn lease_file_parses() {
+        let lease =
+            parse_lease("address=192.168.1.23/24\nrouter=192.168.1.1\ndns=1.1.1.1 8.8.8.8\n")
+                .expect("lease");
+        assert_eq!(
+            lease,
+            Lease {
+                address: "192.168.1.23/24".to_owned(),
+                router: Some(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+                dns: vec![
+                    std::net::Ipv4Addr::new(1, 1, 1, 1),
+                    std::net::Ipv4Addr::new(8, 8, 8, 8)
+                ],
+            }
+        );
+        let bare = parse_lease("address=10.0.0.5/8\nrouter=\ndns=\n").expect("lease");
+        assert_eq!(bare.router, None);
+        assert!(bare.dns.is_empty());
+        assert_eq!(parse_lease("router=1.2.3.4\n"), None);
     }
 
     #[test]
