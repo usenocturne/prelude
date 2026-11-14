@@ -24,7 +24,7 @@ use crate::{
     VideoFrameDisposition, VideoIngressBuffer, VideoPipelinePlan,
     backend_plan::AudioGainRamp,
     backpressure::{DecodeStallWatchdog, StartupSampleDisposition, VideoStartupRenderGate},
-    decoder_flush::{DecoderFlush, take_flush_output},
+    decoder_flush::{DecoderFlush, FlushPacing, take_flush_output},
     pipeline_state::{PipelineLifecycleState, require_settled_state, video_start_is_settled},
     presentation_timing::{VideoPresentationClock, VideoPresentationSchedule},
     resolve_builtin_microphone, resolve_usb_dac, revalidate_usb_dac, validate_video_decoder_target,
@@ -54,6 +54,7 @@ const HARDWARE_STARTUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const HARDWARE_STARTUP_KEYFRAME_RETRY: Duration = Duration::from_secs(1);
 const HARDWARE_DECODER_PREROLL_BUFFERS: u32 = 4;
 const FLUSH_PICTURE_SPACING_NS: u64 = 1_000;
+const FLUSH_TAIL_DELAY: Duration = Duration::from_millis(25);
 const MAXIMUM_PENDING_FLUSH_PICTURES: usize = 64;
 const USB_MIXER_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const AUDIO_OUTPUT_PRIME_DURATION: Duration = Duration::from_millis(250);
@@ -623,6 +624,18 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
             Some(crate::backpressure::VideoCommand::Stop) => break,
             None => {}
         }
+        match pipeline.push_owed_flush_pictures(Instant::now()) {
+            Ok(pushed) => synchronization_telemetry
+                .latency()
+                .record_flush_pictures(pushed),
+            Err(error) => {
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                report_failure(&errors, "video", &error);
+                return Err(error);
+            }
+        }
         if let Err(error) = pipeline.check_bus() {
             report_failure(&errors, "hardware video decoder", &error);
             return Err(error);
@@ -722,9 +735,16 @@ struct VideoGstPipeline {
     last_keyframe_request: Option<Instant>,
     flush: Option<DecoderFlush>,
     flush_outputs: FlushOutputs,
+    flush_pacing: FlushPacing,
+    owed_flush: Option<OwedFlushPictures>,
 }
 
 type FlushOutputs = Arc<Mutex<VecDeque<u64>>>;
+
+struct OwedFlushPictures {
+    due: Instant,
+    pictures: Vec<(u64, Vec<u8>)>,
+}
 
 struct PushedFrame {
     presentation_time_ns: u64,
@@ -845,14 +865,16 @@ impl VideoGstPipeline {
             last_keyframe_request: None,
             flush: low_latency.then(|| DecoderFlush::new(configuration)),
             flush_outputs,
+            flush_pacing: FlushPacing::default(),
+            owed_flush: None,
         })
     }
 
-    fn push(&mut self, frame: EncryptedVideoFrame) -> Result<PushedFrame> {
+    fn push(&mut self, mut frame: EncryptedVideoFrame) -> Result<PushedFrame> {
         let followers = self
             .flush
             .as_mut()
-            .and_then(|flush| flush.followers(&frame));
+            .and_then(|flush| flush.prepare(&mut frame));
         let idr = frame
             .nal_units
             .iter()
@@ -889,38 +911,80 @@ impl VideoGstPipeline {
         self.source
             .push_buffer(buffer)
             .map_err(|error| Error::Backend(format!("video appsrc rejected a frame: {error:?}")))?;
+        self.owed_flush = None;
         let mut flush_pictures = 0;
         if let Some(followers) = followers {
-            for index in 1..=followers.count {
-                let pts_ns = pts_ns.saturating_add(index as u64 * FLUSH_PICTURE_SPACING_NS);
-                {
-                    let mut pending = self.flush_outputs.lock().map_err(|_| {
-                        Error::Backend("decoder flush bookkeeping is poisoned".to_owned())
-                    })?;
-                    if pending.len() >= MAXIMUM_PENDING_FLUSH_PICTURES {
-                        pending.pop_front();
-                    }
-                    pending.push_back(pts_ns);
-                }
-                let mut buffer = gst::Buffer::from_slice(followers.picture.clone());
-                {
-                    let buffer = buffer.get_mut().ok_or_else(|| {
-                        Error::Backend("video buffer is unexpectedly shared".to_owned())
-                    })?;
-                    let pts = gst::ClockTime::from_nseconds(pts_ns);
-                    buffer.set_pts(pts);
-                    buffer.set_dts(pts);
-                }
-                self.source.push_buffer(buffer).map_err(|error| {
-                    Error::Backend(format!("video appsrc rejected a flush picture: {error:?}"))
-                })?;
+            let now = Instant::now();
+            let immediate = self.flush_pacing.immediate_pictures(now);
+            let mut pictures =
+                followers
+                    .pictures
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, picture)| {
+                        let offset = (index as u64 + 1) * FLUSH_PICTURE_SPACING_NS;
+                        (pts_ns.saturating_add(offset), picture)
+                    });
+            for (pts_ns, picture) in pictures.by_ref().take(immediate) {
+                self.push_flush_picture(pts_ns, picture)?;
                 flush_pictures += 1;
+            }
+            let owed = pictures.collect::<Vec<_>>();
+            if !owed.is_empty() {
+                self.owed_flush = Some(OwedFlushPictures {
+                    due: now + FLUSH_TAIL_DELAY,
+                    pictures: owed,
+                });
             }
         }
         Ok(PushedFrame {
             presentation_time_ns: pts_ns,
             flush_pictures,
         })
+    }
+
+    fn push_owed_flush_pictures(&mut self, now: Instant) -> Result<usize> {
+        if self.owed_flush.as_ref().is_none_or(|owed| now < owed.due) {
+            return Ok(0);
+        }
+        let pictures = self
+            .owed_flush
+            .take()
+            .map(|owed| owed.pictures)
+            .unwrap_or_default();
+        let count = pictures.len();
+        for (pts_ns, picture) in pictures {
+            self.push_flush_picture(pts_ns, picture)?;
+        }
+        Ok(count)
+    }
+
+    fn push_flush_picture(&self, pts_ns: u64, picture: Vec<u8>) -> Result<()> {
+        {
+            let mut pending = self
+                .flush_outputs
+                .lock()
+                .map_err(|_| Error::Backend("decoder flush bookkeeping is poisoned".to_owned()))?;
+            if pending.len() >= MAXIMUM_PENDING_FLUSH_PICTURES {
+                pending.pop_front();
+            }
+            pending.push_back(pts_ns);
+        }
+        let mut buffer = gst::Buffer::from_slice(picture);
+        {
+            let buffer = buffer
+                .get_mut()
+                .ok_or_else(|| Error::Backend("video buffer is unexpectedly shared".to_owned()))?;
+            let pts = gst::ClockTime::from_nseconds(pts_ns);
+            buffer.set_pts(pts);
+            buffer.set_dts(pts);
+        }
+        self.source
+            .push_buffer(buffer)
+            .map(|_| ())
+            .map_err(|error| {
+                Error::Backend(format!("video appsrc rejected a flush picture: {error:?}"))
+            })
     }
 
     fn sample_disposition(&mut self, sample: &gst::Sample) -> Result<StartupSampleDisposition> {

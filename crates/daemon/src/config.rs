@@ -517,7 +517,7 @@ impl Default for AirPlayConfig {
             setup_code_file: None,
             display_width_physical_mm: 86,
             display_height_physical_mm: 52,
-            display_max_fps: 30,
+            display_max_fps: 60,
             accept_poll_interval_ms: 100,
             control_io_timeout_ms: 250,
             input_poll_interval_ms: 20,

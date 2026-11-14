@@ -36,7 +36,7 @@ prelude_validate_otg_topology() {
         'video = "amlogic_v4l2"' \
         'display_width_physical_mm = 86' \
         'display_height_physical_mm = 52' \
-        'display_max_fps = 30'; do
+        'display_max_fps = 60'; do
         if ! grep -Fqx "$setting" "$config"; then
             bbfatal "OTG topology configuration is missing: $setting"
         fi

@@ -1765,6 +1765,7 @@ fn run_event_listener(
             tracing::debug!("starting authenticated AirPlay event channel");
             stream
                 .set_nonblocking(false)
+                .and_then(|()| stream.set_nodelay(true))
                 .map_err(|error| format!("configuring the AirPlay event socket failed: {error}"))?;
             stream
                 .set_read_timeout(Some(read_timeout.min(RECORD_EVENT_POLL_INTERVAL)))

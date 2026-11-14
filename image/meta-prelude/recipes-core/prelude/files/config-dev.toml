@@ -31,7 +31,7 @@ enable_live_input = true
 disable_audio_output = false
 display_width_physical_mm = 86
 display_height_physical_mm = 52
-display_max_fps = 30
+display_max_fps = 60
 setup_code_file = "/var/lib/prelude/airplay/setup-code"
 
 [media]

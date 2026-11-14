@@ -14,7 +14,7 @@
   "display": {
     "uuid": "b7e6c5a0-1111-4000-8000-000000000001",
     "type": 110,
-    "maxFPS": 30,
+    "maxFPS": 60,
     "widthPixels": 800,
     "heightPixels": 480,
     "widthPhysical": 86,

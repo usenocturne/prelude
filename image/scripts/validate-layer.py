@@ -411,7 +411,7 @@ for setting in (
     "mux_io_timeout_ms = 5000",
     "display_width_physical_mm = 86",
     "display_height_physical_mm = 52",
-    "display_max_fps = 30",
+    "display_max_fps = 60",
 ):
     if setting not in config_dev:
         fail(f"direct-OTG daemon configuration is missing {setting}")

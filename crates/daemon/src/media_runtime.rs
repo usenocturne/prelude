@@ -44,6 +44,7 @@ type RecordedDuckingEvents = Arc<Mutex<Vec<(bool, Option<f64>, u32)>>>;
 
 const COMMAND_CAPACITY: usize = 32;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const VIDEO_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(10);
 const MAXIMUM_UDP_PACKET_BYTES: usize = 64 * 1024;
 const MAXIMUM_AUDIO_CONTROL_BYTES: usize = 2 * 1024;
 const MAXIMUM_AUDIO_PREROLL_BYTES: usize = 512 * 1024;
@@ -1848,7 +1849,13 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
     let mut backend: Option<LinuxVideoBackend> = None;
     let mut frame_ordinal = 0_u64;
     let mut input = [0_u8; 64 * 1024];
+    let mut next_diagnostic = Instant::now() + VIDEO_DIAGNOSTIC_INTERVAL;
     'screen: while !cancellation.is_cancelled() {
+        let now = Instant::now();
+        if now >= next_diagnostic {
+            next_diagnostic = now + VIDEO_DIAGNOSTIC_INTERVAL;
+            log_video_latency(&video_synchronization, display.as_ref(), now);
+        }
         let length = match stream.read(&mut input) {
             Ok(0) => break 'screen,
             Ok(length) => length,
@@ -1863,15 +1870,16 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
             }
             Err(error) => return Err(format!("reading screen stream failed: {error}")),
         };
+        let arrived_at = Instant::now();
         for event in decoder
             .push(&input[..length])
             .map_err(|error| format!("decoding screen stream failed: {error}"))?
         {
             match event {
                 ScreenWireEvent::Configuration(configuration) => {
-                    tracing::debug!(
+                    tracing::info!(
                         codec = ?configuration.codec,
-                        codec_data_bytes = configuration.codec_data.len(),
+                        codec_data = %hex::encode(&configuration.codec_data),
                         nal_length_bytes = configuration.nal_length_bytes,
                         "received CarPlay screen codec configuration"
                     );
@@ -1902,6 +1910,9 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
                 ScreenWireEvent::Frame(frame) => {
                     frame_ordinal = frame_ordinal.saturating_add(1);
                     screen_frames.fetch_add(1, Ordering::AcqRel);
+                    video_synchronization
+                        .latency()
+                        .record_arrival(frame.nonce_counter, arrived_at);
                     let idr = frame
                         .nal_units
                         .iter()
@@ -1957,6 +1968,47 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
     Ok(())
 }
 
+fn log_video_latency(
+    telemetry: &VideoSynchronizationTelemetry,
+    display: Option<&LinuxDisplayHandle>,
+    now: Instant,
+) {
+    let pipeline = telemetry.latency().take_window(now);
+    let commit = display
+        .map(LinuxDisplayHandle::take_video_commit_stats)
+        .unwrap_or_default();
+    if pipeline.pushed_frames == 0 && pipeline.decoded_frames == 0 {
+        return;
+    }
+    let millis = |micros: Option<u64>| micros.map(|micros| micros as f64 / 1_000.0);
+    tracing::info!(
+        pushed_frames = pipeline.pushed_frames,
+        decoded_frames = pipeline.decoded_frames,
+        rendered_frames = pipeline.rendered_frames,
+        skipped_frames = pipeline.skipped_frames,
+        unmatched_outputs = pipeline.unmatched_outputs,
+        pipeline_restarts = pipeline.pipeline_restarts,
+        decoder_flush_pictures = pipeline.flush_pictures,
+        ingress_wait_avg_ms = millis(pipeline.ingress_wait.average_micros()),
+        ingress_wait_max_ms = millis(pipeline.ingress_wait.maximum()),
+        decode_min_ms = millis(pipeline.decode.minimum()),
+        decode_avg_ms = millis(pipeline.decode.average_micros()),
+        decode_max_ms = millis(pipeline.decode.maximum()),
+        decoder_held_frames_min = pipeline.held_frames_minimum,
+        decoder_held_frames_max = pipeline.held_frames_maximum,
+        render_avg_ms = millis(pipeline.render.average_micros()),
+        render_max_ms = millis(pipeline.render.maximum()),
+        arrival_to_display_min_ms = millis(pipeline.arrival_to_display.minimum()),
+        arrival_to_display_avg_ms = millis(pipeline.arrival_to_display.average_micros()),
+        arrival_to_display_max_ms = millis(pipeline.arrival_to_display.maximum()),
+        display_commit_avg_ms = millis(commit.average_micros()),
+        display_commit_max_ms = millis(commit.maximum()),
+        in_flight_frames = pipeline.in_flight_frames,
+        oldest_in_flight_ms = millis(pipeline.oldest_in_flight_micros),
+        "CarPlay latency diagnostic: video pipeline"
+    );
+}
+
 fn poll_video_backend(
     backend: Option<&LinuxVideoBackend>,
     event_commands: &SyncSender<EventWorkerCommand>,
@@ -2004,6 +2056,7 @@ fn video_backend_config(
     }
     Ok(LinuxVideoBackendConfig {
         output_delay,
+        low_latency: true,
         ..LinuxVideoBackendConfig::default()
     })
 }
@@ -3263,6 +3316,7 @@ mod tests {
         )
         .expect("USB video configuration");
         assert_eq!(usb.output_delay, AudioOutputDelay::uncompensated());
+        assert!(usb.low_latency);
 
         let status = video_synchronization_status(VideoSynchronizationTelemetrySnapshot {
             output_delay: usb.output_delay,
