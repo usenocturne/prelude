@@ -3214,7 +3214,6 @@ fn run_usb_worker(
 
     set_stage(progress, WorkerStage::OpeningProtocol);
     if shutdown.is_requested() {
-        transport.set_reset_on_close(false);
         transport.close().map_err(|error| {
             format!("releasing cancelled Android Auto USB transport failed: {error}")
         })?;
@@ -3234,9 +3233,6 @@ fn run_usb_worker(
         Some(TransportReadiness::Unix(readiness)),
     )?;
     let mut transport = io.into_transport();
-    if result.is_ok() {
-        transport.set_reset_on_close(false);
-    }
     let transport_result = transport
         .close()
         .map_err(|error| format!("closing Android Auto USB transport failed: {error}"));

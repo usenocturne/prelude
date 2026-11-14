@@ -392,7 +392,7 @@ impl WirelessPhoneDirectory {
     }
 
     /// Soft-reset wireless AA by deauthenticating the station without DENY_ACL.
-    fn kick_android_auto_station(&self, reason: &str) -> bool {
+    pub(crate) fn kick_android_auto_station(&self, reason: &str) -> bool {
         let station = self.android_auto_station();
         let Some(station) = station else {
             tracing::debug!(reason, "no Android Auto Wi-Fi station to deauthenticate");
@@ -700,6 +700,7 @@ impl WirelessService {
     }
 
     pub fn reconnect_last_phone(&self) {
+        self.directory.kick_android_auto_station("reconnect last phone");
         self.page_now.store(true, Ordering::Release);
     }
 

@@ -383,6 +383,8 @@ impl<D: ProjectionDeviceDiscovery, P: ProjectionRuntime> Daemon<D, P> {
         }
         self.config = config;
         self.projection = projection;
+        self.devices.clear();
+        self.usb_session = false;
         Ok(())
     }
 
@@ -893,6 +895,7 @@ mod tests {
 
         assert_eq!(stops.load(Ordering::SeqCst), 1);
         assert!(!ready.load(Ordering::SeqCst));
+        daemon.poll().expect("poll");
         assert!(daemon.maintain_projection().expect("connect replacement"));
         assert_eq!(replacement_starts.load(Ordering::SeqCst), 1);
     }
