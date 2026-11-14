@@ -193,6 +193,7 @@ async fn main() -> Result<()> {
             daemon.config().platform.presets.clone(),
             ambient_control.clone(),
             wireless.as_ref().map(WirelessService::directory),
+            wireless.as_ref().map(WirelessService::internet),
         )
     });
     #[cfg(all(target_os = "linux", feature = "linux-media"))]

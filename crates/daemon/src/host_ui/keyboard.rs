@@ -234,7 +234,7 @@ impl Keyboard {
             255,
         );
         let field_y = FIELD_TOP + FIELD_HEIGHT / 2;
-        if self.text.is_empty() {
+        if self.text().is_empty() {
             canvas.text(
                 fonts,
                 "Password",

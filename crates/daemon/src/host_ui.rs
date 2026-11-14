@@ -23,9 +23,11 @@ use crate::{
     CarPlayDock, KnownPhone, PRESET_COUNT, PresetAction, PresetBindings, RuntimeSettings,
     WirelessPhoneDirectory,
     fonts::{self, FontSet},
+    internet::{Internet, InternetState},
 };
 
 mod equalizer_ui;
+mod internet_ui;
 mod keyboard;
 use equalizer_ui::EqualizerUi;
 
@@ -117,6 +119,7 @@ pub struct HostUi {
 }
 
 impl HostUi {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         display: LinuxDisplayHandle,
         state_dir: PathBuf,
@@ -125,6 +128,7 @@ impl HostUi {
         presets: PresetBindings,
         ambient_light: Option<AmbientLightControl>,
         phones: Option<WirelessPhoneDirectory>,
+        internet: Option<Internet>,
     ) -> Result<Self, String> {
         let (events_tx, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -144,6 +148,7 @@ impl HostUi {
                     presets,
                     ambient_light,
                     phones,
+                    internet,
                     events_tx,
                     worker_wake,
                 );
@@ -265,6 +270,9 @@ enum Page {
     Wifi,
     Equalizer,
     Support,
+    Internet,
+    WifiNetworks,
+    Keyboard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +300,11 @@ enum Item {
     WifiBand,
     WifiChannel,
     WifiWidth,
+    Internet,
+    InternetNetwork,
+    InternetTest,
+    Network(usize),
+    NetworkForget,
 }
 
 impl Item {
@@ -506,6 +519,12 @@ struct SettingsUi<D> {
     confirming_forget: bool,
     pending_connect: Option<String>,
     phones_refreshed: Instant,
+    internet: Option<Internet>,
+    internet_state: InternetState,
+    networks: Vec<prelude_wireless::station::ScanResult>,
+    keyboard: Option<keyboard::Keyboard>,
+    keyboard_ssid: Vec<u8>,
+    awaiting_connect: bool,
     events: Sender<HostUiEvent>,
     wake: Arc<Notify>,
     fonts: &'static FontSet,
@@ -521,6 +540,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         presets: PresetBindings,
         ambient_light: Option<AmbientLightControl>,
         directory: Option<WirelessPhoneDirectory>,
+        internet: Option<Internet>,
         events: Sender<HostUiEvent>,
         wake: Arc<Notify>,
     ) -> Self {
@@ -562,6 +582,12 @@ impl<D: OverlaySurface> SettingsUi<D> {
             confirming_forget: false,
             pending_connect: None,
             phones_refreshed: Instant::now(),
+            internet,
+            internet_state: InternetState::Idle,
+            networks: Vec::new(),
+            keyboard: None,
+            keyboard_ssid: Vec::new(),
+            awaiting_connect: false,
             events,
             wake,
             fonts: fonts::shared(),
@@ -580,14 +606,18 @@ impl<D: OverlaySurface> SettingsUi<D> {
             PlatformInputEventKind::KnobButton { button, pressed }
                 if self.menu_open && !pressed =>
             {
-                if self.page == Page::Equalizer {
+                if self.page == Page::Keyboard {
+                    self.handle_keyboard_button(button);
+                } else if self.page == Page::Equalizer {
                     self.handle_equalizer_button(button);
                 } else {
                     self.handle_button(button);
                 }
             }
             PlatformInputEventKind::Rotary { direction, steps } if self.menu_open => {
-                if self.page == Page::Equalizer {
+                if self.page == Page::Keyboard {
+                    self.handle_keyboard_rotary(direction, steps);
+                } else if self.page == Page::Equalizer {
                     self.equalizer_ui.rotary(direction, steps);
                     self.apply_equalizer();
                 } else {
@@ -600,7 +630,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 x,
                 y,
             } if self.menu_open => {
-                if self.page == Page::Equalizer {
+                if self.page == Page::Keyboard {
+                    self.handle_keyboard_touch(phase, i32::from(x), i32::from(y));
+                } else if self.page == Page::Equalizer {
                     self.handle_equalizer_touch(phase, x, y);
                 } else {
                     self.handle_touch(phase, i32::from(x), i32::from(y));
@@ -618,6 +650,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
     }
 
     fn tick(&mut self) {
+        if self.menu_open && self.poll_internet() {
+            self.redraw();
+        }
         if self.menu_open && self.phones_refreshed.elapsed() >= PHONES_REFRESH_INTERVAL {
             let phones = self.phones.clone();
             let active = self.active_phone.clone();
@@ -675,12 +710,17 @@ impl<D: OverlaySurface> SettingsUi<D> {
                     display.push(Item::BrightnessSlider);
                 }
                 display.extend([Item::AutoNightMode, Item::Density, Item::CarPlayDock]);
+                let advanced = if self.internet.is_some() {
+                    vec![Item::Wifi, Item::Internet, Item::Support, Item::Version]
+                } else {
+                    vec![Item::Wifi, Item::Support, Item::Version]
+                };
                 vec![
                     Section::plain(vec![Item::Phones]),
                     Section::titled("Display", display),
                     Section::titled("Audio", vec![Item::PhoneAudio, Item::Equalizer]),
                     Section::titled("Controls", vec![Item::Presets]),
-                    Section::titled("Advanced", vec![Item::Wifi, Item::Support, Item::Version]),
+                    Section::titled("Advanced", advanced),
                 ]
             }
             Page::Phones => vec![Section::plain(
@@ -709,6 +749,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 Section::plain(vec![Item::WifiBand, Item::WifiChannel, Item::WifiWidth])
                     .footer("Wi-Fi restarts after settings close"),
             ],
+            Page::Internet | Page::WifiNetworks | Page::Keyboard => self.internet_sections(),
             Page::Wifi | Page::Equalizer | Page::Support => Vec::new(),
         }
     }
@@ -805,6 +846,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
         self.presets.set_enabled(next.presets_enabled);
         self.settings = next;
         self.menu_open = false;
+        if self.in_internet_pages() || self.internet_state != InternetState::Idle {
+            self.release_internet();
+        }
         self.leave_subpage();
         if let Err(error) = self.display.clear_overlay() {
             warn!(%error, "could not clear the host settings UI");
@@ -832,6 +876,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 warn!(%error, "could not release the host settings UI during shutdown");
             }
             self.menu_open = false;
+            self.release_internet();
             self.leave_subpage();
             self.wake.notify_one();
         }
@@ -992,6 +1037,11 @@ impl<D: OverlaySurface> SettingsUi<D> {
             | Item::WifiBand
             | Item::WifiChannel
             | Item::WifiWidth => self.adjust(item, 1, true),
+            Item::Internet
+            | Item::InternetNetwork
+            | Item::InternetTest
+            | Item::Network(_)
+            | Item::NetworkForget => self.activate_internet(item),
         }
     }
 
@@ -1153,6 +1203,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
         match self.page {
             Page::Settings => {}
             Page::Phone => self.show_phones(self.phone_focus),
+            Page::Internet | Page::WifiNetworks | Page::Keyboard => self.go_back_internet(),
             _ => {
                 self.leave_subpage();
                 self.redraw();
@@ -1303,6 +1354,11 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 self.error_message,
             ),
             Page::Support => self.render_support(canvas),
+            Page::Keyboard => {
+                if let Some(keyboard) = self.keyboard.as_ref() {
+                    keyboard.render(canvas, self.fonts);
+                }
+            }
             _ if layout.rows.is_empty() => self.render_empty(canvas),
             _ => self.render_layout(canvas, &layout),
         }
@@ -1332,6 +1388,12 @@ impl<D: OverlaySurface> SettingsUi<D> {
             Page::Wifi => "Wi-Fi",
             Page::Equalizer => "Equalizer",
             Page::Support => "Support Prelude",
+            Page::Internet => "Internet",
+            Page::WifiNetworks => "Wi-Fi networks",
+            Page::Keyboard => self
+                .keyboard
+                .as_ref()
+                .map_or("Password", |keyboard| keyboard.title.as_str()),
         }
     }
 
@@ -1418,6 +1480,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 "Wireless is off",
                 "Enable wireless projection to change Wi-Fi settings",
             ),
+            Page::WifiNetworks => self.wifi_networks_empty_text(),
             _ => return,
         };
         let center_x = DISPLAY_WIDTH as i32 / 2;
@@ -1855,6 +1918,11 @@ impl<D: OverlaySurface> SettingsUi<D> {
             }
             Item::DensitySlider => RowView::new("Density", Trailing::None),
             Item::BrightnessSlider => RowView::new("Brightness", Trailing::None),
+            Item::Internet
+            | Item::InternetNetwork
+            | Item::InternetTest
+            | Item::Network(_)
+            | Item::NetworkForget => self.internet_row_view(item),
         }
     }
 }
@@ -2245,8 +2313,13 @@ mod tests {
     use platform_superbird::MonotonicMicros;
     use prelude_wireless::bluez::PhoneKind;
 
+    use prelude_wireless::station::{ScanResult, Security};
+
     use super::*;
-    use crate::fonts::bitmap_glyph;
+    use crate::{
+        fonts::bitmap_glyph,
+        internet::{InternetCommand, InternetError, Route},
+    };
 
     struct NullSurface;
 
@@ -2267,6 +2340,7 @@ mod tests {
     struct Harness {
         ui: SettingsUi<NullSurface>,
         events: Receiver<HostUiEvent>,
+        internet_commands: Option<Receiver<InternetCommand>>,
         _state: tempfile::TempDir,
     }
 
@@ -2287,6 +2361,7 @@ mod tests {
                 PresetBindings::default(),
                 None,
                 None,
+                None,
                 sender,
                 Arc::new(Notify::new()),
             );
@@ -2294,10 +2369,321 @@ mod tests {
             Self {
                 ui,
                 events,
+                internet_commands: None,
                 _state: state,
             }
         }
 
+        fn with_internet(mut self) -> Self {
+            let (internet, commands) = Internet::detached();
+            self.ui.internet = Some(internet);
+            self.ui.wireless = true;
+            self.internet_commands = Some(commands);
+            self
+        }
+
+        fn commands(&self) -> Vec<InternetCommand> {
+            self.internet_commands
+                .as_ref()
+                .expect("internet")
+                .try_iter()
+                .collect()
+        }
+
+        fn set_internet(&mut self, state: InternetState) {
+            self.ui
+                .internet
+                .as_ref()
+                .expect("internet")
+                .set_state(state);
+            self.ui.tick();
+        }
+
+        fn open_internet(&mut self) {
+            self.focus(Item::Internet);
+            self.press(KnobInputButton::Select);
+            assert_eq!(self.ui.page, Page::Internet);
+        }
+
+        fn open_networks(&mut self, networks: Vec<ScanResult>) {
+            self.open_internet();
+            self.focus(Item::InternetNetwork);
+            self.press(KnobInputButton::Select);
+            assert_eq!(self.ui.page, Page::WifiNetworks);
+            self.set_internet(InternetState::Networks(networks));
+        }
+
+        fn type_on_keyboard(&mut self, text: &str) {
+            for character in text.chars() {
+                self.press_key(keyboard::Key::Char(character));
+            }
+        }
+
+        fn press_key(&mut self, key: keyboard::Key) {
+            let keyboard = self.ui.keyboard.as_ref().expect("keyboard open");
+            let index = keyboard
+                .keys()
+                .iter()
+                .position(|candidate| *candidate == key)
+                .expect("key on the current layer");
+            let delta = index as i32 - keyboard.focus as i32;
+            if delta != 0 {
+                self.send(PlatformInputEventKind::Rotary {
+                    direction: if delta > 0 {
+                        RotaryDirection::Clockwise
+                    } else {
+                        RotaryDirection::CounterClockwise
+                    },
+                    steps: delta.unsigned_abs() as u8,
+                });
+            }
+            self.press(KnobInputButton::Select);
+        }
+    }
+
+    fn scanned(ssid: &str, signal_dbm: i32, security: Security) -> ScanResult {
+        ScanResult {
+            ssid: ssid.as_bytes().to_vec(),
+            signal_dbm,
+            frequency_mhz: 2437,
+            security,
+        }
+    }
+
+    fn sample_networks() -> Vec<ScanResult> {
+        vec![
+            scanned("Home", -60, Security::Psk),
+            scanned("Cafe", -75, Security::Open),
+            scanned("Corp", -76, Security::Unsupported),
+        ]
+    }
+
+    fn trailing_value(view: &RowView) -> String {
+        match &view.trailing {
+            Trailing::Value(value, _) | Trailing::Link(value, _) => value.clone(),
+            Trailing::Switch(on) => on.to_string(),
+            Trailing::None => String::new(),
+        }
+    }
+
+    #[test]
+    fn internet_row_sits_between_wifi_and_support() {
+        let harness = Harness::new().with_internet();
+        let items: Vec<Item> = harness
+            .ui
+            .layout()
+            .rows
+            .iter()
+            .map(|row| row.item)
+            .collect();
+        let wifi = items
+            .iter()
+            .position(|item| *item == Item::Wifi)
+            .expect("wifi row");
+        assert_eq!(items[wifi + 1], Item::Internet);
+        assert_eq!(items[wifi + 2], Item::Support);
+        assert!(
+            !Harness::new()
+                .ui
+                .layout()
+                .rows
+                .iter()
+                .any(|row| row.item == Item::Internet)
+        );
+    }
+
+    #[test]
+    fn choosing_network_scans_and_lists_results() {
+        let mut harness = Harness::new().with_internet();
+        harness.open_networks(sample_networks());
+        assert_eq!(harness.commands(), vec![InternetCommand::Scan]);
+        let items: Vec<Item> = harness
+            .ui
+            .layout()
+            .rows
+            .iter()
+            .map(|row| row.item)
+            .collect();
+        assert_eq!(
+            items,
+            vec![Item::Network(0), Item::Network(1), Item::Network(2)]
+        );
+        let views: Vec<RowView> = (0..3)
+            .map(|index| harness.ui.row_view(Item::Network(index)))
+            .collect();
+        assert_eq!(views[0].label, "Home");
+        assert_eq!(views[0].detail.as_deref(), Some("Secured"));
+        assert_eq!(views[1].detail.as_deref(), Some("Open"));
+        assert_eq!(views[2].detail.as_deref(), Some("Not supported"));
+        assert_eq!(trailing_value(&views[0]), "Strong");
+        assert_eq!(trailing_value(&views[1]), "Good");
+        assert_eq!(trailing_value(&views[2]), "Weak");
+    }
+
+    #[test]
+    fn secured_network_opens_keyboard_and_join_sends_passphrase() {
+        let mut harness = Harness::new().with_internet();
+        harness.open_networks(sample_networks());
+        harness.commands();
+        harness.focus(Item::Network(0));
+        harness.press(KnobInputButton::Select);
+        assert_eq!(harness.ui.page, Page::Keyboard);
+        assert_eq!(harness.ui.title(), "Home");
+        harness.type_on_keyboard("password");
+        harness.press_key(keyboard::Key::Join);
+        assert_eq!(
+            harness.commands(),
+            vec![InternetCommand::Join {
+                ssid: b"Home".to_vec(),
+                passphrase: Some("password".to_owned()),
+            }]
+        );
+        assert_eq!(harness.ui.page, Page::Internet);
+        assert!(harness.ui.keyboard.is_none());
+    }
+
+    #[test]
+    fn keyboard_back_returns_to_networks() {
+        let mut harness = Harness::new().with_internet();
+        harness.open_networks(sample_networks());
+        harness.focus(Item::Network(0));
+        harness.press(KnobInputButton::Select);
+        harness.press(KnobInputButton::Back);
+        assert_eq!(harness.ui.page, Page::WifiNetworks);
+        assert!(harness.ui.keyboard.is_none());
+    }
+
+    #[test]
+    fn open_network_joins_without_keyboard() {
+        let mut harness = Harness::new().with_internet();
+        harness.open_networks(sample_networks());
+        harness.commands();
+        harness.focus(Item::Network(1));
+        harness.press(KnobInputButton::Select);
+        assert_eq!(
+            harness.commands(),
+            vec![InternetCommand::Join {
+                ssid: b"Cafe".to_vec(),
+                passphrase: None,
+            }]
+        );
+        assert_eq!(harness.ui.page, Page::Internet);
+    }
+
+    #[test]
+    fn unsupported_network_does_nothing() {
+        let mut harness = Harness::new().with_internet();
+        harness.open_networks(sample_networks());
+        harness.commands();
+        harness.focus(Item::Network(2));
+        harness.press(KnobInputButton::Select);
+        assert!(harness.commands().is_empty());
+        assert_eq!(harness.ui.page, Page::WifiNetworks);
+    }
+
+    #[test]
+    fn saved_network_joins_without_keyboard() {
+        let mut harness = Harness::new().with_internet();
+        crate::saved_networks::remember(
+            &harness.ui.state_dir,
+            crate::saved_networks::SavedNetwork {
+                ssid: b"Home".to_vec(),
+                psk: Some([1; 32]),
+            },
+        )
+        .expect("remember");
+        harness.open_networks(sample_networks());
+        harness.commands();
+        harness.focus(Item::Network(0));
+        harness.press(KnobInputButton::Select);
+        assert_eq!(
+            harness.commands(),
+            vec![InternetCommand::JoinSaved {
+                ssid: b"Home".to_vec()
+            }]
+        );
+        assert_eq!(harness.ui.page, Page::Internet);
+    }
+
+    #[test]
+    fn test_connection_without_saved_network_opens_list() {
+        let mut harness = Harness::new().with_internet();
+        harness.open_internet();
+        harness.focus(Item::InternetTest);
+        harness.press(KnobInputButton::Select);
+        assert_eq!(harness.commands(), vec![InternetCommand::Connect]);
+        harness.set_internet(InternetState::Failed(InternetError::NoSavedNetwork));
+        assert_eq!(harness.ui.page, Page::WifiNetworks);
+        assert_eq!(harness.commands(), vec![InternetCommand::Scan]);
+    }
+
+    #[test]
+    fn internet_caption_follows_the_state() {
+        let mut harness = Harness::new().with_internet();
+        harness.open_internet();
+        let caption = |harness: &Harness| harness.ui.sections()[0].title.clone();
+        assert_eq!(caption(&harness), None);
+        harness.set_internet(InternetState::Joining {
+            ssid: "Home".to_owned(),
+        });
+        assert_eq!(caption(&harness).as_deref(), Some("Joining Home…"));
+        harness.set_internet(InternetState::Online {
+            route: Route::Wifi {
+                ssid: "Home".to_owned(),
+            },
+            address: "192.168.1.23".to_owned(),
+        });
+        assert_eq!(
+            caption(&harness).as_deref(),
+            Some("Online via Home · 192.168.1.23")
+        );
+        harness.set_internet(InternetState::Online {
+            route: Route::Wired {
+                interface: "eth0".to_owned(),
+            },
+            address: String::new(),
+        });
+        assert_eq!(caption(&harness).as_deref(), Some("Online via wired"));
+        harness.set_internet(InternetState::Failed(InternetError::WrongPassword));
+        assert_eq!(caption(&harness).as_deref(), Some("Wrong password"));
+    }
+
+    #[test]
+    fn closing_settings_releases_internet() {
+        let mut harness = Harness::new().with_internet();
+        harness.open_internet();
+        harness.send(PlatformInputEventKind::SettingsButton);
+        assert!(!harness.ui.menu_open);
+        assert_eq!(harness.commands(), vec![InternetCommand::Release]);
+    }
+
+    #[test]
+    fn back_from_internet_releases() {
+        let mut harness = Harness::new().with_internet();
+        harness.open_internet();
+        harness.press(KnobInputButton::Back);
+        assert_eq!(harness.ui.page, Page::Settings);
+        assert_eq!(harness.commands(), vec![InternetCommand::Release]);
+    }
+
+    #[test]
+    fn forgetting_saved_networks_clears_the_store() {
+        let mut harness = Harness::new().with_internet();
+        crate::saved_networks::remember(
+            &harness.ui.state_dir,
+            crate::saved_networks::SavedNetwork {
+                ssid: b"Home".to_vec(),
+                psk: None,
+            },
+        )
+        .expect("remember");
+        harness.open_networks(sample_networks());
+        harness.focus(Item::NetworkForget);
+        harness.press(KnobInputButton::Select);
+        assert!(crate::saved_networks::load(&harness.ui.state_dir).is_empty());
+    }
+
+    impl Harness {
         fn with_phones(mut self) -> Self {
             self.ui.wireless = true;
             self.ui.phones = vec![
@@ -2865,7 +3251,15 @@ mod tests {
              Controls Preset buttons Default Custom Button 1 2 3 4 Previous track Play/Pause Next \
              Mute Home Back Voice assistant Answer call End Reset to default Support Prelude \
              Scan to donate Donations are split between the team and fund future features. \
-             Thank you! usenocturne.com/support Brightness Dimmer Brighter 50%"
+             Thank you! usenocturne.com/support Brightness Dimmer Brighter 50% \
+             Internet Network Choose… Test connection \
+             Wireless CarPlay and Android Auto pause while online Pausing wireless projection… \
+             Searching… Joining Online via wired Wi-Fi networks Secured Open Not supported \
+             Strong Good Weak Forget saved networks No networks found Looking for Password \
+             Shift Delete Space Show Hide Join ABC 123 #+= Connect a USB Wi-Fi adapter adapter \
+             removed Wrong password Network not found This network's security is not supported \
+             Choose a network No address from the network Connected, but the internet is \
+             unreachable Wi-Fi failed Press Back to try again"
                 .chars()
         {
             assert!(
@@ -2877,7 +3271,7 @@ mod tests {
 
     #[test]
     fn every_page_renders_a_full_nv12_frame() {
-        let mut harness = Harness::new().with_phones();
+        let mut harness = Harness::new().with_phones().with_internet();
         let preview = std::env::var("PRELUDE_SETTINGS_PREVIEW")
             .ok()
             .map(PathBuf::from);
@@ -2959,6 +3353,31 @@ mod tests {
         harness.press(KnobInputButton::Select);
         capture(&harness, "wifi-off");
         harness.ui.go_back();
+        harness.ui.wireless = true;
+        harness.open_internet();
+        harness.set_internet(InternetState::Online {
+            route: Route::Wifi {
+                ssid: "Neel's iPhone".to_owned(),
+            },
+            address: "172.20.10.2".to_owned(),
+        });
+        capture(&harness, "internet");
+        harness.focus(Item::InternetNetwork);
+        harness.press(KnobInputButton::Select);
+        capture(&harness, "wifi-networks-searching");
+        harness.set_internet(InternetState::Networks(sample_networks()));
+        capture(&harness, "wifi-networks");
+        harness.focus(Item::Network(0));
+        harness.press(KnobInputButton::Select);
+        harness.type_on_keyboard("hunter");
+        capture(&harness, "keyboard");
+        harness.press_key(keyboard::Key::Layer(keyboard::Layer::Digits));
+        harness.type_on_keyboard("22");
+        capture(&harness, "keyboard-ready");
+        harness.press(KnobInputButton::Back);
+        harness.press(KnobInputButton::Back);
+        harness.press(KnobInputButton::Back);
+        assert_eq!(harness.ui.page, Page::Settings);
         harness.focus(Item::Density);
         harness.press(KnobInputButton::Select);
         capture(&harness, "density");
