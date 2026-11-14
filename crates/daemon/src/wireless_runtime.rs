@@ -655,6 +655,7 @@ impl WirelessService {
                 usb_ended: Arc::clone(&usb_ended),
                 aa_was_active: AtomicBool::new(false),
                 usb_projection: Arc::clone(&usb_projection),
+                client_gate: client_gate.clone(),
                 stop: Arc::clone(&stop),
             };
             move || dispatch.run(&bluetooth)
@@ -806,6 +807,22 @@ fn spawn_named(name: &str, body: impl FnOnce() + Send + 'static) -> Result<JoinH
         .name(name.to_owned())
         .spawn(body)
         .map_err(|error| Error::Runtime(format!("spawning {name} failed: {error}")))
+}
+
+/// Why wireless projection must not start right now, if it must not. While
+/// the Car Thing is online over Wi-Fi the access point is parked, so a phone
+/// told to join it would only fail and retry.
+fn wireless_projection_hold(
+    usb_projection: &AtomicBool,
+    client_gate: &ClientGate,
+) -> Option<&'static str> {
+    if usb_projection.load(Ordering::Acquire) {
+        Some("a phone projects over USB")
+    } else if client_gate.requested() {
+        Some("the Car Thing is online over Wi-Fi")
+    } else {
+        None
+    }
 }
 
 fn sleep_unless_stopped(stop: &AtomicBool, duration: Duration) {
@@ -1234,6 +1251,7 @@ struct BluetoothDispatch {
     usb_ended: Arc<AtomicBool>,
     aa_was_active: AtomicBool,
     usb_projection: Arc<AtomicBool>,
+    client_gate: ClientGate,
     stop: Arc<AtomicBool>,
 }
 
@@ -1433,6 +1451,9 @@ impl BluetoothDispatch {
             }
             return;
         }
+        if self.client_gate.requested() {
+            return;
+        }
         if !self.carplay.snapshot().is_empty() || !self.android_auto.snapshot().is_empty() {
             return;
         }
@@ -1506,11 +1527,9 @@ impl BluetoothDispatch {
             return;
         }
         if connection.profile == RfcommProfile::Iap2 {
-            if self.usb_projection.load(Ordering::Acquire) {
-                tracing::info!(
-                    peer,
-                    "ignoring wireless CarPlay while a phone projects over USB"
-                );
+            if let Some(reason) = wireless_projection_hold(&self.usb_projection, &self.client_gate)
+            {
+                tracing::info!(peer, reason, "ignoring wireless CarPlay for now");
                 return;
             }
             if self.carplay.offer(connection, peer.clone()) {
@@ -1533,6 +1552,7 @@ impl BluetoothDispatch {
             android_auto_peer: Arc::clone(&self.android_auto_peer),
             hands_free: self.hands_free.clone(),
             usb_projection: Arc::clone(&self.usb_projection),
+            client_gate: self.client_gate.clone(),
             calls_need_usb: mode == BluetoothMode::HandsFreeOnly,
             state_dir: self.state_dir.clone(),
         };
@@ -1556,6 +1576,7 @@ struct RfcommLinks {
     android_auto_peer: SharedPeer,
     hands_free: HandsFree,
     usb_projection: Arc<AtomicBool>,
+    client_gate: ClientGate,
     calls_need_usb: bool,
     state_dir: PathBuf,
 }
@@ -1623,11 +1644,15 @@ fn bootstrap_android_auto(
     if !wireless.android_auto {
         return Ok(());
     }
-    if links.hands_free.projecting_over_usb() || links.usb_projection.load(Ordering::Acquire) {
+    if links.hands_free.projecting_over_usb() {
         tracing::info!(
             peer,
             "declining wireless Android Auto while a phone projects over USB"
         );
+        return Ok(());
+    }
+    if let Some(reason) = wireless_projection_hold(&links.usb_projection, &links.client_gate) {
+        tracing::info!(peer, reason, "declining wireless Android Auto for now");
         return Ok(());
     }
     let info =
@@ -1695,6 +1720,24 @@ mod tests {
         let (server, _) = listener.accept().expect("accept");
         drop(client);
         (server, peer)
+    }
+
+    #[test]
+    fn wireless_projection_is_held_while_online_or_projecting_over_usb() {
+        let usb = AtomicBool::new(false);
+        let gate = ClientGate::default();
+        assert_eq!(wireless_projection_hold(&usb, &gate), None);
+        gate.request();
+        assert_eq!(
+            wireless_projection_hold(&usb, &gate),
+            Some("the Car Thing is online over Wi-Fi")
+        );
+        gate.release();
+        usb.store(true, Ordering::Release);
+        assert_eq!(
+            wireless_projection_hold(&usb, &gate),
+            Some("a phone projects over USB")
+        );
     }
 
     #[test]
