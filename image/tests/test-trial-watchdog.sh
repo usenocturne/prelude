@@ -44,6 +44,42 @@ expect_no_reboot() {
     fi
 }
 
+expect_trial() {
+    if "$watchdog" not-trial; then
+        echo "FAIL $1: expected a trial boot" >&2
+        exit 1
+    fi
+}
+
+expect_not_trial() {
+    if ! "$watchdog" not-trial; then
+        echo "FAIL $1: expected a non-trial boot" >&2
+        exit 1
+    fi
+}
+
+# not_trial_without_marker
+reset a a
+expect_not_trial not_trial_without_marker
+
+# not_trial_marker_for_other_slot
+reset a b; pending b
+expect_not_trial not_trial_marker_for_other_slot
+[ -f "$PRELUDE_STATE_DIR/pending-update" ] || { echo "FAIL not_trial_marker_for_other_slot: check must not remove the marker" >&2; exit 1; }
+
+# trial_marker_for_running_slot
+reset b b; pending b
+expect_trial trial_marker_for_running_slot
+expect_no_reboot trial_marker_for_running_slot
+
+# trial_check_ignores_ready
+reset b b; pending b; : > "$PRELUDE_RUN_DIR/ready"
+expect_trial trial_check_ignores_ready
+
+# not_trial_with_malformed_marker
+reset b b; printf 'slot=b\r\n' > "$PRELUDE_STATE_DIR/pending-update"
+expect_not_trial not_trial_with_malformed_marker
+
 # ready_present_no_reboot
 reset b b; pending b; : > "$PRELUDE_RUN_DIR/ready"
 "$watchdog"

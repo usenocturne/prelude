@@ -6,7 +6,12 @@
 # would otherwise sit on its trial forever without using up those attempts.
 # Five minutes after boot this reboots such a trial so the counter runs down,
 # and clears pending-update markers that no longer describe the running slot.
+#
+# `prelude-trial-watchdog not-trial` only answers whether this boot is an OTA
+# trial: it exits 0 when it is not (so the slot may be marked good by time, as
+# the BSP did) and 1 when the running slot is the pending update's slot.
 set -eu
+set -f
 
 run_dir=${PRELUDE_RUN_DIR:-/run/prelude}
 state_dir=${PRELUDE_STATE_DIR:-/var/lib/prelude}
@@ -18,6 +23,29 @@ pending="$state_dir/pending-update"
 log() {
     echo "prelude-trial-watchdog: $*"
 }
+
+running_slot() {
+    for arg in $(cat "$cmdline"); do
+        case "$arg" in
+            superbird.slot=*) echo "${arg#superbird.slot=}" ;;
+        esac
+    done
+}
+
+pending_slot() {
+    sed -n 's/^slot=\([ab]\)$/\1/p' "$pending" | head -n 1
+}
+
+if [ "${1:-}" = not-trial ]; then
+    [ -f "$pending" ] || exit 0
+    running=$(running_slot)
+    case "$running" in a|b) ;; *) exit 0 ;; esac
+    if [ "$(pending_slot)" = "$running" ]; then
+        log "slot $running is on its update trial; waiting for preluded to become ready"
+        exit 1
+    fi
+    exit 0
+fi
 
 if [ -e "$run_dir/ready" ]; then
     log "preluded is ready; nothing to do"
@@ -31,12 +59,7 @@ if [ ! -f "$pending" ]; then
     exit 0
 fi
 
-running_slot=""
-for arg in $(cat "$cmdline"); do
-    case "$arg" in
-        superbird.slot=*) running_slot=${arg#superbird.slot=} ;;
-    esac
-done
+running_slot=$(running_slot)
 case "$running_slot" in
     a|b) ;;
     *)
@@ -45,7 +68,7 @@ case "$running_slot" in
         ;;
 esac
 
-pending_slot=$(sed -n 's/^slot=\([ab]\)$/\1/p' "$pending" | head -n 1)
+pending_slot=$(pending_slot)
 case "$pending_slot" in
     a|b) ;;
     *)

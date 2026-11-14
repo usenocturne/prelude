@@ -228,5 +228,14 @@ slot_ok_append = (
 ).read_text(encoding="utf-8")
 assert "superbird-slot-ok.timer" not in slot_ok_append.split("SYSTEMD_SERVICE:${PN} =", 1)[1].splitlines()[0]
 assert "ln -sf /dev/null ${D}${sysconfdir}/systemd/system/superbird-slot-ok.timer" in slot_ok_append
+# Boots that are not an OTA trial (including images without preluded) are
+# still marked good by time, as the BSP did.
+time_timer = parse_unit("prelude-slot-ok-time.timer", SLOT_OK_UNIT_DIR)
+assert values(time_timer, "Timer", "OnBootSec") == ["60s"]
+assert values(time_timer, "Timer", "Unit") == ["prelude-slot-ok-time.service"]
+time_service = parse_unit("prelude-slot-ok-time.service", SLOT_OK_UNIT_DIR)
+assert values(time_service, "Service", "ExecCondition") == ["/usr/libexec/prelude-trial-watchdog not-trial"]
+assert values(time_service, "Service", "ExecStart") == ["/bin/systemctl --no-block start superbird-slot-ok.service"]
+assert "prelude-slot-ok-time.timer" in slot_ok_append.split("SYSTEMD_SERVICE:${PN} =", 1)[1].splitlines()[0]
 
 print("prelude systemd unit checks passed")

@@ -1,0 +1,10 @@
+[Unit]
+Description=Mark the A/B slot healthy by time unless this boot is an OTA trial
+
+[Service]
+Type=oneshot
+# OTA trial boots wait for /run/prelude/ready (prelude-slot-ok.path). Every
+# other boot keeps the BSP's time-based behaviour, including images that do not
+# run preluded at all.
+ExecCondition=/usr/libexec/prelude-trial-watchdog not-trial
+ExecStart=/bin/systemctl --no-block start superbird-slot-ok.service

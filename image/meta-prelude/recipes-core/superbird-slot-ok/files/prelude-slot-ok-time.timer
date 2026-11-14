@@ -1,0 +1,10 @@
+[Unit]
+Description=Mark a non-update boot's A/B slot healthy a short time after boot
+
+[Timer]
+OnBootSec=60s
+AccuracySec=2s
+Unit=prelude-slot-ok-time.service
+
+[Install]
+WantedBy=timers.target
