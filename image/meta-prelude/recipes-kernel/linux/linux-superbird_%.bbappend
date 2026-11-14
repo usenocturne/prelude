@@ -5,7 +5,6 @@ SRC_URI:append = " \
     file://prelude-wireless.cfg \
     file://prelude-crash-recovery.cfg \
     file://prelude-ramoops.dtsi \
-    file://0001-meson-vdec-zero-reorder-delay.patch \
 "
 
 # The BSP reinstalls its DTS on every configure, so appending here stays

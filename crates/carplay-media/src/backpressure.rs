@@ -42,7 +42,6 @@ pub struct VideoBackpressureStats {
     pub queued_frames: u64,
     pub replaced_frames: u64,
     pub dropped_frames: u64,
-    /// Frames currently buffered in the ingress command queue (not cumulative).
     pub live_depth: u64,
 }
 
@@ -61,7 +60,6 @@ pub(crate) enum StartupSampleDisposition {
 #[cfg(any(test, all(target_os = "linux", feature = "linux-backend")))]
 #[derive(Debug, Default)]
 pub(crate) struct VideoStartupRenderGate {
-    immediate: bool,
     first_idr_seen: bool,
     render_from_pts_ns: Option<u64>,
     keyframe_requested: bool,
@@ -71,13 +69,6 @@ pub(crate) struct VideoStartupRenderGate {
 
 #[cfg(any(test, all(target_os = "linux", feature = "linux-backend")))]
 impl VideoStartupRenderGate {
-    pub(crate) fn immediate() -> Self {
-        Self {
-            immediate: true,
-            ..Self::default()
-        }
-    }
-
     pub(crate) fn register_input(&mut self, idr: bool, pts_ns: u64) {
         if idr {
             if self.first_idr_seen {
@@ -104,8 +95,7 @@ impl VideoStartupRenderGate {
             ));
         }
         self.last_output_pts_ns = Some(pts_ns);
-        if self.opened || self.immediate {
-            self.opened = true;
+        if self.opened {
             return Ok(StartupSampleDisposition::Render);
         }
         let Some(render_from) = self.render_from_pts_ns else {
@@ -631,16 +621,6 @@ mod tests {
             gate.observe_output(Some(99)).expect("clean delta"),
             StartupSampleDisposition::Render
         );
-    }
-
-    #[test]
-    fn startup_gate_immediate_mode_opens_on_first_output_sample() {
-        let mut gate = VideoStartupRenderGate::immediate();
-        assert_eq!(
-            gate.observe_output(Some(1_000)).expect("observe"),
-            StartupSampleDisposition::Render
-        );
-        assert!(gate.is_open());
     }
 
     #[test]

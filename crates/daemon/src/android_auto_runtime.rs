@@ -1589,14 +1589,10 @@ fn apply_local_mute(
     Ok(next)
 }
 
-/// The phone encodes on demand and waits for each frame to be acknowledged,
-/// so the decoder must return a frame without waiting for later ones.
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
 fn android_auto_video_config() -> LinuxVideoBackendConfig {
     LinuxVideoBackendConfig {
-        flush_decoder: true,
-        immediate_startup: false,
-        held_flush_frames: Some(0),
+        low_latency: true,
         ..LinuxVideoBackendConfig::default()
     }
 }

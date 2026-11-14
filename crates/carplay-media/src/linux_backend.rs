@@ -41,7 +41,8 @@ use gstreamer_video::{VideoFrameExt, VideoFrameRef, VideoInfo};
 mod output_equalizer;
 use output_equalizer::OutputEqualizer;
 
-const WORKER_POLL: Duration = Duration::from_millis(1);
+const WORKER_POLL: Duration = Duration::from_millis(10);
+const LOW_LATENCY_VIDEO_POLL: Duration = Duration::from_millis(1);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const GST_STATE_TIMEOUT: gst::ClockTime = gst::ClockTime::from_seconds(2);
 const DEFAULT_COMMAND_CAPACITY: usize = 64;
@@ -51,9 +52,7 @@ const AUDIO_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const VIDEO_FRAME_DURATION_NS: u64 = 1_000_000_000 / 60;
 const HARDWARE_STARTUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const HARDWARE_STARTUP_KEYFRAME_RETRY: Duration = Duration::from_secs(1);
-/// Distance between a frame's presentation time and each skipped picture
-/// that follows it; far below a frame interval, so every picture keeps a
-/// distinct and ordered time.
+const HARDWARE_DECODER_PREROLL_BUFFERS: u32 = 4;
 const FLUSH_PICTURE_SPACING_NS: u64 = 1_000;
 const MAXIMUM_PENDING_FLUSH_PICTURES: usize = 64;
 const USB_MIXER_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -226,7 +225,6 @@ impl VideoSynchronizationTelemetry {
         }
     }
 
-    /// Per-frame latency measurements for the pipeline this telemetry follows.
     pub const fn latency(&self) -> &crate::VideoLatencyProbe {
         &self.latency
     }
@@ -260,16 +258,7 @@ impl VideoSynchronizationTelemetry {
 pub struct LinuxVideoBackendConfig {
     pub backpressure: VideoBackpressureConfig,
     pub output_delay: AudioOutputDelay,
-    /// Follow every frame with skipped pictures so the hardware decoder
-    /// returns it without waiting for the next frames to arrive.
-    pub flush_decoder: bool,
-    /// Open the startup gate on the first decoded frame instead of waiting
-    /// for a second IDR keyframe to warm up the decoder.
-    pub immediate_startup: bool,
-    /// Pictures to send after each frame beyond reference frames. Defaults to 2 (total 3).
-    /// For low-latency streams with rewritten SPS (max_dec_frame_buffering=1), setting to 0
-    /// pushes 1 picture per frame instead of 3.
-    pub held_flush_frames: Option<u32>,
+    pub low_latency: bool,
 }
 
 pub struct LinuxVideoBackend {
@@ -382,9 +371,7 @@ impl LinuxVideoBackend {
                     events: event_tx,
                     synchronization_telemetry: worker_synchronization_telemetry,
                     output_delay: config.output_delay,
-                    flush_decoder: config.flush_decoder,
-                    immediate_startup: config.immediate_startup,
-                    held_flush_frames: config.held_flush_frames,
+                    low_latency: config.low_latency,
                     display,
                 });
                 if let Err(error) = &result {
@@ -476,9 +463,7 @@ struct VideoWorkerContext {
     events: SyncSender<VideoBackendEvent>,
     synchronization_telemetry: VideoSynchronizationTelemetry,
     output_delay: AudioOutputDelay,
-    flush_decoder: bool,
-    immediate_startup: bool,
-    held_flush_frames: Option<u32>,
+    low_latency: bool,
     display: Option<LinuxDisplayHandle>,
 }
 
@@ -519,11 +504,14 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
         events,
         synchronization_telemetry,
         output_delay,
-        flush_decoder,
-        immediate_startup,
-        held_flush_frames,
+        low_latency,
         display,
     } = context;
+    let worker_poll = if low_latency {
+        LOW_LATENCY_VIDEO_POLL
+    } else {
+        WORKER_POLL
+    };
     let display_registration = match DisplayVideoRegistration::new(display.clone()) {
         Ok(registration) => registration,
         Err(error) => {
@@ -553,19 +541,14 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
         return ingress.stats();
     };
     let mut active_configuration = initial_configuration;
-    let mut pipeline = match VideoGstPipeline::start(
-        &active_configuration,
-        output_delay,
-        flush_decoder,
-        immediate_startup,
-        held_flush_frames,
-    ) {
-        Ok(pipeline) => pipeline,
-        Err(error) => {
-            let _ = startup.send(Err(error));
-            return ingress.stats();
-        }
-    };
+    let mut pipeline =
+        match VideoGstPipeline::start(&active_configuration, output_delay, low_latency) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                let _ = startup.send(Err(error));
+                return ingress.stats();
+            }
+        };
     if let Err(error) = register_pipeline(&pipeline_control, &pipeline.pipeline) {
         let _ = startup.send(Err(error));
         pipeline.stop()?;
@@ -588,17 +571,11 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
         if let Some(display) = &display {
             display.check()?;
         }
-        match ingress.pop_timeout(WORKER_POLL)? {
+        match ingress.pop_timeout(worker_poll)? {
             Some(crate::backpressure::VideoCommand::Configuration(configuration)) => {
                 pipeline.stop()?;
                 active_configuration = configuration;
-                match VideoGstPipeline::start(
-                    &active_configuration,
-                    output_delay,
-                    flush_decoder,
-                    immediate_startup,
-                    held_flush_frames,
-                ) {
+                match VideoGstPipeline::start(&active_configuration, output_delay, low_latency) {
                     Ok(started) => {
                         if let Err(error) = register_pipeline(&pipeline_control, &started.pipeline)
                         {
@@ -651,14 +628,11 @@ fn video_worker(context: VideoWorkerContext) -> Result<VideoBackpressureStats> {
             return Err(error);
         }
         while let Some(sample) = pipeline.sink.try_pull_sample(gst::ClockTime::ZERO) {
-            let decoded_frame = sample
-                .buffer()
-                .and_then(gst::BufferRef::pts)
-                .map(|pts| {
-                    synchronization_telemetry
-                        .latency()
-                        .record_output(pts.nseconds(), Instant::now())
-                });
+            let decoded_frame = sample.buffer().and_then(gst::BufferRef::pts).map(|pts| {
+                synchronization_telemetry
+                    .latency()
+                    .record_output(pts.nseconds(), Instant::now())
+            });
             let disposition = match pipeline.sample_disposition(&sample) {
                 Ok(disposition) => disposition,
                 Err(error) => {
@@ -750,11 +724,8 @@ struct VideoGstPipeline {
     flush_outputs: FlushOutputs,
 }
 
-/// Presentation times of the skipped pictures that are still inside the
-/// decoder, oldest first.
 type FlushOutputs = Arc<Mutex<VecDeque<u64>>>;
 
-/// What one call to [`VideoGstPipeline::push`] handed to the decoder.
 struct PushedFrame {
     presentation_time_ns: u64,
     flush_pictures: usize,
@@ -764,9 +735,7 @@ impl VideoGstPipeline {
     fn start(
         configuration: &VideoCodecConfiguration,
         output_delay: AudioOutputDelay,
-        flush_decoder: bool,
-        immediate_startup: bool,
-        held_flush_frames: Option<u32>,
+        low_latency: bool,
     ) -> Result<Self> {
         let plan = VideoPipelinePlan::h264(configuration)?;
         let pipeline = gst::Pipeline::new();
@@ -785,10 +754,20 @@ impl VideoGstPipeline {
                 .build(),
         )?;
         let decoder_queue = make("queue", "decoder-input-queue")?;
-        set_checked(&decoder_queue, "max-size-time", 200_000_000_u64)?;
         set_checked(&decoder_queue, "max-size-bytes", 0_u32)?;
-        set_checked(&decoder_queue, "max-size-buffers", 8_u32)?;
-        set_checked(&decoder_queue, "min-threshold-buffers", 0_u32)?;
+        if low_latency {
+            set_checked(&decoder_queue, "max-size-time", 200_000_000_u64)?;
+            set_checked(&decoder_queue, "max-size-buffers", 8_u32)?;
+            set_checked(&decoder_queue, "min-threshold-buffers", 0_u32)?;
+        } else {
+            set_checked(&decoder_queue, "max-size-time", 2_000_000_000_u64)?;
+            set_checked(&decoder_queue, "max-size-buffers", 0_u32)?;
+            set_checked(
+                &decoder_queue,
+                "min-threshold-buffers",
+                HARDWARE_DECODER_PREROLL_BUFFERS,
+            )?;
+        }
         let decoder = make("v4l2h264dec", "hardware-decoder")?;
         require_string_property_equals(&decoder, "device", TARGET_VIDEO_DEVICE)?;
         set_enum_checked(&decoder, "output-io-mode", "mmap")?;
@@ -796,12 +775,16 @@ impl VideoGstPipeline {
         set_checked(&decoder, "discard-corrupted-frames", true)?;
         install_h264_decoder_caps_adapter(&parser)?;
         let flush_outputs = FlushOutputs::default();
-        if flush_decoder {
+        if low_latency {
             discard_flush_pictures(&decoder, Arc::clone(&flush_outputs))?;
         }
         let renderer_queue = make("queue", "renderer-queue")?;
         set_enum_checked(&renderer_queue, "leaky", "downstream")?;
-        set_checked(&renderer_queue, "max-size-buffers", 1_u32)?;
+        set_checked(
+            &renderer_queue,
+            "max-size-buffers",
+            if low_latency { 1_u32 } else { 2_u32 },
+        )?;
         set_checked(&renderer_queue, "max-size-bytes", 0_u32)?;
         set_checked(&renderer_queue, "max-size-time", 0_u64)?;
         let sink_element = make("appsink", "screen-sink")?;
@@ -857,23 +840,14 @@ impl VideoGstPipeline {
             clock,
             presentation_clock: VideoPresentationClock::new(output_delay),
             next_pts_ns: 0,
-            startup_gate: if immediate_startup {
-                Some(VideoStartupRenderGate::immediate())
-            } else {
-                Some(VideoStartupRenderGate::default())
-            },
+            startup_gate: Some(VideoStartupRenderGate::default()),
             startup_recovery_deadline: None,
             last_keyframe_request: None,
-            flush: flush_decoder.then(|| match held_flush_frames {
-                Some(held) => DecoderFlush::with_held_frames(configuration, held),
-                None => DecoderFlush::new(configuration),
-            }),
+            flush: low_latency.then(|| DecoderFlush::new(configuration)),
             flush_outputs,
         })
     }
 
-    /// Hands one frame to the decoder, followed by the skipped pictures that
-    /// make the decoder return it.
     fn push(&mut self, frame: EncryptedVideoFrame) -> Result<PushedFrame> {
         let followers = self
             .flush
@@ -1064,8 +1038,6 @@ fn video_sink_capacity(output_delay: AudioOutputDelay) -> u32 {
         .saturating_add(2)
 }
 
-/// Drops the skipped pictures as they leave the decoder, so only the phone's
-/// frames reach the renderer.
 fn discard_flush_pictures(decoder: &gst::Element, pending: FlushOutputs) -> Result<()> {
     let source_pad = decoder
         .static_pad("src")
@@ -3873,7 +3845,7 @@ mod tests {
     fn video_delay_queue_and_telemetry_are_bounded_and_saturating() {
         let delay = AudioOutputDelay::configured_calibration(275).expect("calibration");
         assert_eq!(video_sink_capacity(AudioOutputDelay::uncompensated()), 2);
-        assert_eq!(video_sink_capacity(delay), 11);
+        assert_eq!(video_sink_capacity(delay), 19);
 
         let telemetry = VideoSynchronizationTelemetry::new(delay);
         {
