@@ -23,6 +23,10 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 /// abandoned: generous for a phone hotspot, but never unbounded.
 const DOWNLOAD_BASE_TIMEOUT: Duration = Duration::from_secs(120);
 const DOWNLOAD_MIN_RATE: u64 = 64 * 1024;
+/// Longest wait for any single network read. A connection that goes
+/// silent (the adapter unplugged, the network gone) fails after this
+/// instead of running out the whole download budget.
+const READ_STALL_TIMEOUT: Duration = Duration::from_secs(20);
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(90);
 const ACQUIRE_POLL: Duration = Duration::from_millis(200);
 
@@ -72,13 +76,21 @@ fn request_error(error: ureq::Error, otherwise: UpdateError) -> UpdateError {
 #[derive(Debug)]
 pub struct GithubSource {
     user_agent: String,
+    read_stall: Duration,
 }
 
 impl GithubSource {
     pub fn new(installed_version: &str) -> Self {
         Self {
             user_agent: format!("prelude-updater/{installed_version}"),
+            read_stall: READ_STALL_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    const fn with_read_stall(mut self, read_stall: Duration) -> Self {
+        self.read_stall = read_stall;
+        self
     }
 
     fn agent(&self, body_timeout: Option<Duration>) -> ureq::Agent {
@@ -87,6 +99,7 @@ impl GithubSource {
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_recv_response(Some(RESPONSE_TIMEOUT))
             .timeout_recv_body(body_timeout)
+            .timeout_per_read(Some(self.read_stall))
             .build()
             .into()
     }
@@ -421,6 +434,32 @@ mod tests {
             &|| cancelled.load(Ordering::Relaxed),
         );
         assert_eq!(result, Err(UpdateError::Cancelled));
+        assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
+    }
+
+    #[test]
+    fn stalled_download_fails_instead_of_hanging() {
+        let dir = tempfile::tempdir().expect("dir");
+        let dest = dir.path().join("bundle.swu");
+        let body = vec![1_u8; 1024 * 1024];
+        let started = std::time::Instant::now();
+        let result = GithubSource::new("1.0.0")
+            .with_read_stall(Duration::from_millis(300))
+            .download(
+                &asset(
+                    serve(body.clone(), body.len(), Some(Duration::from_secs(30))),
+                    body.len() as u64,
+                    None,
+                ),
+                &dest,
+                &mut |_| {},
+                &|| false,
+            );
+        assert_eq!(result, Err(UpdateError::DownloadFailed));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "gave up promptly"
+        );
         assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
     }
 

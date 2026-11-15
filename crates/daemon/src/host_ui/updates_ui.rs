@@ -57,6 +57,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
     /// The centred message for progress steps that offer no buttons.
     pub(super) const fn update_progress_text(&self) -> Option<(&'static str, &'static str)> {
         match self.update_state {
+            UpdateState::Connecting | UpdateState::Downloading { .. } if self.update_cancelling => {
+                Some(("Cancelling…", "Waiting for the download to stop"))
+            }
             UpdateState::Verifying => Some(("Verifying…", "Checking the download")),
             UpdateState::Installing { .. } => Some(("Installing…", "Keep power connected")),
             UpdateState::Restarting => Some(("Restarting…", "Back in a moment")),
@@ -75,6 +78,12 @@ impl<D: OverlaySurface> SettingsUi<D> {
         }
         if let UpdateState::Versions(list) = &state {
             self.update_versions.clone_from(list);
+        }
+        if !matches!(
+            state,
+            UpdateState::Connecting | UpdateState::Downloading { .. }
+        ) {
+            self.update_cancelling = false;
         }
         self.update_state = state;
         self.scroll = self.scroll.min(self.layout().maximum_scroll());
@@ -104,6 +113,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
 
     pub(super) fn update_caption(&self) -> Option<String> {
         Some(match &self.update_state {
+            UpdateState::Connecting | UpdateState::Downloading { .. } if self.update_cancelling => {
+                "Cancelling…".to_owned()
+            }
             UpdateState::Unavailable(error) | UpdateState::Failed(error) => {
                 error.message().to_owned()
             }
@@ -183,7 +195,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
             }
             Page::UpdateProgress => {
                 let items = match self.update_state {
-                    UpdateState::Connecting | UpdateState::Downloading { .. } => {
+                    UpdateState::Connecting | UpdateState::Downloading { .. }
+                        if !self.update_cancelling =>
+                    {
                         vec![Item::CancelUpdate]
                     }
                     UpdateState::Installed { .. } => vec![Item::RestartNow, Item::Later],
@@ -212,6 +226,12 @@ impl<D: OverlaySurface> SettingsUi<D> {
             self.refresh_pending();
             self.enter(Page::Updates);
         }
+    }
+
+    fn cancel_update(&mut self) {
+        self.send_update(UpdateCommand::Cancel);
+        self.update_cancelling = true;
+        self.redraw();
     }
 
     fn confirm(&mut self, candidate: Candidate) {
@@ -264,9 +284,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
                     self.enter(Page::UpdateProgress);
                 }
             }
-            Item::CancelUpdate if self.page == Page::UpdateProgress => {
-                self.send_update(UpdateCommand::Cancel);
-            }
+            Item::CancelUpdate if self.page == Page::UpdateProgress => self.cancel_update(),
             Item::CancelUpdate => self.enter(Page::Updates),
             Item::RestartNow => {
                 self.send_update(UpdateCommand::Restart);
@@ -283,9 +301,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
     pub(super) fn go_back_updates(&mut self) {
         match self.page {
             Page::UpdateProgress => match self.update_state {
-                UpdateState::Connecting | UpdateState::Downloading { .. } => {
-                    self.send_update(UpdateCommand::Cancel);
-                }
+                UpdateState::Connecting | UpdateState::Downloading { .. } => self.cancel_update(),
                 UpdateState::Verifying
                 | UpdateState::Installing { .. }
                 | UpdateState::Restarting => {}

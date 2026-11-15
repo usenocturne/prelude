@@ -555,6 +555,8 @@ struct SettingsUi<D> {
     /// Kernel command line, read for the running slot.
     cmdline: PathBuf,
     update_pending: Pending,
+    /// Cancel was pressed; the download stops at its next read.
+    update_cancelling: bool,
     events: Sender<HostUiEvent>,
     wake: Arc<Notify>,
     fonts: &'static FontSet,
@@ -626,6 +628,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
             internet_return: false,
             cmdline: PathBuf::from("/proc/cmdline"),
             update_pending: Pending::None,
+            update_cancelling: false,
             events,
             wake,
             fonts: fonts::shared(),
@@ -2949,6 +2952,35 @@ mod tests {
     }
 
     #[test]
+    fn cancel_shows_cancelling_until_the_download_stops() {
+        let mut harness = Harness::new().with_updater();
+        harness.ui.enter(Page::UpdateProgress);
+        let downloading = UpdateState::Downloading {
+            version: "1.0.21-test".to_owned(),
+            done: 3,
+            total: 100,
+        };
+        harness.set_update(downloading.clone());
+        harness.focus(Item::CancelUpdate);
+        harness.press(KnobInputButton::Select);
+        assert!(harness.cancelled());
+        assert_eq!(harness.ui.update_caption().as_deref(), Some("Cancelling…"));
+        assert_eq!(page_items(&harness), Vec::<Item>::new());
+        assert_eq!(
+            harness.ui.update_progress_text().map(|(text, _)| text),
+            Some("Cancelling…")
+        );
+        harness.set_update(UpdateState::Idle);
+        assert_eq!(page_items(&harness), vec![Item::Later]);
+        harness.set_update(downloading);
+        assert_eq!(
+            harness.ui.update_caption().as_deref(),
+            Some("Downloading 3%"),
+            "a later download starts clean"
+        );
+    }
+
+    #[test]
     fn check_status_shows_under_the_check_row() {
         let mut harness = Harness::new().with_updater();
         harness.open_updates();
@@ -3848,7 +3880,7 @@ mod tests {
              need a healthy start first. Try again in a minute. This system's slot could not be \
              read All versions Install update Updating No versions found Looking for Prelude \
              releases Restarting… Finishing update… Checking the download Keep power \
-             connected Back in a moment"
+             connected Back in a moment Cancelling… Waiting for the download to stop"
                 .chars()
         {
             assert!(
