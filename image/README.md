@@ -310,6 +310,52 @@ The boot environment is only changed after every image has been written and
 verified, so the running slot stays active, but the inactive slot is not a
 usable fallback until the next successful install.
 
+### Updating from the Car Thing
+
+Settings > Version opens Updates. "Check for updates" gets online by itself:
+it uses a wired route if one reaches the internet, otherwise it joins the
+saved Wi-Fi network (Settings > Internet, under Advanced). It then reads the
+GitHub releases of the configured repository, downloads the matching bundle
+to `/var/lib/prelude/ota/`, checks it, writes the pending marker and runs
+`swupdate` itself. "Show all versions" lists every release with a bundle for
+this image, including older ones for rollback. Nothing is checked or
+installed in the background.
+
+The repository is baked in at build time:
+
+```sh
+export PRELUDE_UPDATES_REPOSITORY=usenocturne/prelude   # the default
+```
+
+A fork can publish its own releases signed with its own key. A device only
+checks the repository its image was built with, and only installs bundles
+signed with the key its image trusts.
+
+### Publishing OTA releases
+
+For each release, upload the bundles as assets of a GitHub release whose tag
+is `v<DISTRO_VERSION>`:
+
+- `prelude_update_prod_v<version>.swu` for production images, and
+  `prelude_update_dev_v<version>.swu` for development images. The names must
+  match exactly; a device only downloads its own flavour.
+- A normal release appears on the Stable channel. Mark a release as a
+  pre-release on GitHub to offer it only to devices on the Beta channel.
+- Drafts are ignored, as are tags that are not `v` followed by a semantic
+  version.
+- Sign every bundle with the release key (`PRELUDE_OTA_SIGNING_KEY`). Devices
+  reject anything else, and the bundle's signed `sw-description` version
+  (without any `+build` suffix) must equal the release version.
+
+The public key built into the first OTA-capable official image becomes the
+long-term trust anchor: every later bundle must be signed with the matching
+private key. Keep it offline and backed up. Moving devices to a new key takes
+one update signed with the old key that ships the new public key.
+
+The Car Thing reads the releases API without a token, which GitHub limits to
+60 requests an hour per network. The repository and its releases must be
+public.
+
 ### Health gate and fallback
 
 U-Boot gives a newly installed slot three boot attempts. Prelude replaces the
