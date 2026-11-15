@@ -129,15 +129,17 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 if self.internet.is_some() {
                     items.push(Item::UpdateNetwork);
                 }
-                items.extend([Item::CheckUpdates, Item::ShowAllVersions]);
-                if matches!(self.update_state, UpdateState::Available(_)) {
-                    items.push(Item::InstallUpdate);
-                }
-                if self.restart_pending() {
-                    items.push(Item::RestartNow);
-                }
-                // The status sits under Check for updates, which stays in
-                // view when the list is scrolled.
+                // One action row, with the status under it: whatever comes
+                // next takes the place of Check for updates, so it is never
+                // below the fold.
+                items.push(if self.restart_pending() {
+                    Item::RestartNow
+                } else if matches!(self.update_state, UpdateState::Available(_)) {
+                    Item::InstallUpdate
+                } else {
+                    Item::CheckUpdates
+                });
+                items.push(Item::ShowAllVersions);
                 vec![Section::plain(items)]
             }
             Page::AllVersions if !self.update_versions.is_empty() => vec![Section::plain(
@@ -278,6 +280,14 @@ impl<D: OverlaySurface> SettingsUi<D> {
         }
     }
 
+    /// The Updates page's action row carries the status line under it.
+    fn with_status(&self, view: RowView) -> RowView {
+        match self.update_caption() {
+            Some(status) => view.detail(status),
+            None => view,
+        }
+    }
+
     pub(super) fn updates_row_view(&self, item: Item) -> RowView {
         match item {
             Item::UpdateInstalled => RowView::new(
@@ -303,21 +313,17 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 RowView::new("Network", Trailing::Link(summary, SECONDARY))
             }
             Item::CheckUpdates => {
-                let view = RowView::new("Check for updates", Trailing::None);
-                match self.update_caption() {
-                    Some(status) => view.detail(status),
-                    None => view,
-                }
+                self.with_status(RowView::new("Check for updates", Trailing::None))
             }
             Item::ShowAllVersions => RowView::new(
                 "Show all versions",
                 Trailing::Link(String::new(), SECONDARY),
             ),
             Item::InstallUpdate => match &self.update_state {
-                UpdateState::Available(candidate) => {
+                UpdateState::Available(candidate) => self.with_status(
                     RowView::new(format!("Install {}", candidate.version), Trailing::None)
-                        .color(GREEN)
-                }
+                        .color(GREEN),
+                ),
                 _ => RowView::new("", Trailing::None),
             },
             Item::UpdateVersion(index) => {
@@ -345,6 +351,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
             )
             .color(GREEN),
             Item::CancelUpdate => RowView::new("Cancel", Trailing::None),
+            Item::RestartNow if self.page == Page::Updates => {
+                self.with_status(RowView::new("Restart now", Trailing::None).color(GREEN))
+            }
             Item::RestartNow => RowView::new("Restart now", Trailing::None).color(GREEN),
             Item::Later => RowView::new("Later", Trailing::None),
             _ => RowView::new("", Trailing::None),

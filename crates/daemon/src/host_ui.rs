@@ -2866,6 +2866,52 @@ mod tests {
     }
 
     #[test]
+    fn found_update_and_restart_take_the_check_row() {
+        let mut harness = Harness::new().with_updater();
+        on_slot_b(&mut harness);
+        harness.open_updates();
+        harness.set_update(UpdateState::Available(candidate(
+            "1.0.22-test",
+            crate::updater::Relation::Newer,
+        )));
+        assert_eq!(
+            page_items(&harness),
+            vec![
+                Item::UpdateInstalled,
+                Item::UpdateChannel,
+                Item::InstallUpdate,
+                Item::ShowAllVersions
+            ]
+        );
+        assert_eq!(
+            harness.ui.row_view(Item::InstallUpdate).detail.as_deref(),
+            Some("1.0.22-test available")
+        );
+
+        harness.set_update(UpdateState::Idle);
+        crate::updater::system::write_pending(
+            &harness.ui.state_dir,
+            crate::updater::system::Slot::A,
+            "1.0.22-test",
+        )
+        .expect("pending");
+        harness.ui.poll_updates();
+        assert_eq!(
+            page_items(&harness),
+            vec![
+                Item::UpdateInstalled,
+                Item::UpdateChannel,
+                Item::RestartNow,
+                Item::ShowAllVersions
+            ]
+        );
+        assert_eq!(
+            harness.ui.row_view(Item::RestartNow).detail.as_deref(),
+            Some("Installed - restart to finish")
+        );
+    }
+
+    #[test]
     fn check_status_shows_under_the_check_row() {
         let mut harness = Harness::new().with_updater();
         harness.open_updates();
