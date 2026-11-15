@@ -26,7 +26,7 @@ use crate::{
     WirelessPhoneDirectory,
     fonts::{self, FontSet},
     internet::{Internet, InternetState},
-    updater::{Candidate, UpdateState, Updater},
+    updater::{Candidate, UpdateState, Updater, system::Pending},
 };
 
 mod equalizer_ui;
@@ -552,6 +552,9 @@ struct SettingsUi<D> {
     update_choice: Option<Candidate>,
     /// The Internet page was opened from Updates; Back returns there.
     internet_return: bool,
+    /// Kernel command line, read for the running slot.
+    cmdline: PathBuf,
+    update_pending: Pending,
     events: Sender<HostUiEvent>,
     wake: Arc<Notify>,
     fonts: &'static FontSet,
@@ -621,6 +624,8 @@ impl<D: OverlaySurface> SettingsUi<D> {
             update_versions: Vec::new(),
             update_choice: None,
             internet_return: false,
+            cmdline: PathBuf::from("/proc/cmdline"),
+            update_pending: Pending::None,
             events,
             wake,
             fonts: fonts::shared(),
@@ -2809,6 +2814,74 @@ mod tests {
         );
     }
 
+    fn on_slot_b(harness: &mut Harness) {
+        let cmdline = harness.ui.state_dir.join("cmdline");
+        std::fs::write(&cmdline, "console=ttyAML0 superbird.slot=b").expect("cmdline");
+        harness.ui.cmdline = cmdline;
+    }
+
+    #[test]
+    fn restart_now_shows_restarting_and_holds_the_screen() {
+        let mut harness = Harness::new().with_updater();
+        on_slot_b(&mut harness);
+        crate::updater::system::write_pending(
+            &harness.ui.state_dir,
+            crate::updater::system::Slot::A,
+            "1.0.13",
+        )
+        .expect("pending");
+        harness.open_updates();
+        harness.focus(Item::RestartNow);
+        harness.press(KnobInputButton::Select);
+        assert_eq!(harness.update_commands(), vec![UpdateCommand::Restart]);
+        assert_eq!(harness.ui.page, Page::UpdateProgress);
+        harness.set_update(UpdateState::Restarting);
+        assert_eq!(harness.ui.update_caption().as_deref(), Some("Restarting…"));
+        assert_eq!(page_items(&harness), Vec::<Item>::new());
+        harness.press(KnobInputButton::Back);
+        harness.send(PlatformInputEventKind::SettingsButton);
+        assert!(harness.ui.menu_open);
+        assert_eq!(harness.ui.page, Page::UpdateProgress);
+    }
+
+    #[test]
+    fn trial_boot_shows_finishing_instead_of_restart() {
+        let mut harness = Harness::new().with_updater();
+        on_slot_b(&mut harness);
+        crate::updater::system::write_pending(
+            &harness.ui.state_dir,
+            crate::updater::system::Slot::B,
+            "1.0.13",
+        )
+        .expect("pending");
+        harness.open_updates();
+        assert!(!page_items(&harness).contains(&Item::RestartNow));
+        assert_eq!(
+            harness.ui.update_caption().as_deref(),
+            Some("Finishing update…")
+        );
+        crate::updater::system::clear_pending(&harness.ui.state_dir);
+        assert!(harness.ui.poll_updates(), "redraws once marked good");
+        assert_eq!(harness.ui.update_caption(), None);
+    }
+
+    #[test]
+    fn check_status_shows_under_the_check_row() {
+        let mut harness = Harness::new().with_updater();
+        harness.open_updates();
+        assert_eq!(harness.ui.row_view(Item::CheckUpdates).detail, None);
+        harness.set_update(UpdateState::Checking);
+        assert_eq!(
+            harness.ui.row_view(Item::CheckUpdates).detail.as_deref(),
+            Some("Checking…")
+        );
+        assert_eq!(
+            harness.ui.updates_sections()[0].title,
+            None,
+            "not repeated above the list"
+        );
+    }
+
     #[test]
     fn unavailable_build_shows_message_only() {
         let mut harness = Harness::new().with_updater();
@@ -3691,7 +3764,7 @@ mod tests {
              file Install failed. Nothing was changed. Restart to finish the last update Updates \
              need a healthy start first. Try again in a minute. This system's slot could not be \
              read All versions Install update Updating No versions found Looking for Prelude \
-             releases"
+             releases Restarting… Finishing update…"
                 .chars()
         {
             assert!(

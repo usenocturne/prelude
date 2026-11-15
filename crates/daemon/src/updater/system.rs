@@ -49,6 +49,34 @@ pub fn running_slot(cmdline: &str) -> Option<Slot> {
         })
 }
 
+/// What a pending-update marker means for this boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    None,
+    /// Installed into the other slot; a restart switches to it.
+    NeedsRestart,
+    /// Already running the new slot; the marker is cleared once this boot
+    /// is marked good.
+    OnTrial,
+}
+
+/// Reads the marker against the running slot. A marker whose slot cannot
+/// be matched counts as needing a restart, which blocks further installs.
+pub fn pending_update(state_dir: &Path, cmdline: &Path) -> Pending {
+    let Ok(marker) = fs::read_to_string(state_dir.join(PENDING)) else {
+        return Pending::None;
+    };
+    let marked = marker.lines().find_map(|line| line.strip_prefix("slot="));
+    let running = fs::read_to_string(cmdline)
+        .ok()
+        .as_deref()
+        .and_then(running_slot);
+    match (marked, running) {
+        (Some(marked), Some(running)) if marked.trim() == running.as_str() => Pending::OnTrial,
+        _ => Pending::NeedsRestart,
+    }
+}
+
 /// Where the updater looks; tests point these at a temporary directory.
 #[derive(Debug, Clone)]
 pub struct SystemPaths {
@@ -92,8 +120,10 @@ pub fn install_guard(paths: &SystemPaths) -> Result<(Slot, Flavour), UpdateError
         .as_deref()
         .and_then(running_slot)
         .ok_or(UpdateError::SlotUnknown)?;
-    if pending_exists(&paths.state_dir) {
-        return Err(UpdateError::RestartPending);
+    match pending_update(&paths.state_dir, &paths.cmdline) {
+        Pending::NeedsRestart => return Err(UpdateError::RestartPending),
+        Pending::OnTrial => return Err(UpdateError::NotHealthy),
+        Pending::None => {}
     }
     if !paths.ready.exists() {
         return Err(UpdateError::NotHealthy);
@@ -333,6 +363,32 @@ VERSION_ID=\"1.0.12-test\"
         write_pending(&paths.state_dir, Slot::A, "1.0.6").expect("pending");
         fs::remove_file(&paths.ready).expect("not ready either");
         assert_eq!(install_guard(&paths), Err(UpdateError::RestartPending));
+    }
+
+    #[test]
+    fn pending_update_compares_marker_slot_with_running_slot() {
+        let dir = tempfile::tempdir().expect("dir");
+        let paths = paths(dir.path());
+        let pending = || pending_update(&paths.state_dir, &paths.cmdline);
+        assert_eq!(pending(), Pending::None);
+        write_pending(&paths.state_dir, Slot::A, "1.0.6").expect("pending");
+        assert_eq!(pending(), Pending::NeedsRestart);
+        write_pending(&paths.state_dir, Slot::B, "1.0.6").expect("pending");
+        assert_eq!(pending(), Pending::OnTrial, "running the new slot already");
+        fs::remove_file(&paths.cmdline).expect("cmdline");
+        assert_eq!(
+            pending(),
+            Pending::NeedsRestart,
+            "unknown slot stays cautious"
+        );
+    }
+
+    #[test]
+    fn guard_trial_boot_is_not_healthy() {
+        let dir = tempfile::tempdir().expect("dir");
+        let paths = paths(dir.path());
+        write_pending(&paths.state_dir, Slot::B, "1.0.6").expect("pending");
+        assert_eq!(install_guard(&paths), Err(UpdateError::NotHealthy));
     }
 
     #[test]

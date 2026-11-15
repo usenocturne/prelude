@@ -8,7 +8,10 @@ use crate::{
     internet::{InternetState, Route},
     saved_networks,
     settings::UpdateChannel,
-    updater::{Candidate, Relation, UpdateCommand, UpdateState, system::pending_exists},
+    updater::{
+        Candidate, Relation, UpdateCommand, UpdateState,
+        system::{Pending, pending_update},
+    },
 };
 
 pub(super) const CONFIRM_TEXT: &str =
@@ -38,6 +41,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
                     | UpdateState::Downloading { .. }
                     | UpdateState::Verifying
                     | UpdateState::Installing { .. }
+                    | UpdateState::Restarting
             )
     }
 
@@ -46,8 +50,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
         let Some(state) = self.updater.as_ref().map(crate::updater::Updater::state) else {
             return false;
         };
+        let pending_changed = self.in_updates_pages() && self.refresh_pending();
         if state == self.update_state {
-            return false;
+            return pending_changed;
         }
         if let UpdateState::Versions(list) = &state {
             self.update_versions.clone_from(list);
@@ -65,9 +70,17 @@ impl<D: OverlaySurface> SettingsUi<D> {
         }
     }
 
+    /// Re-reads the pending-update marker; returns whether it changed.
+    fn refresh_pending(&mut self) -> bool {
+        let pending = pending_update(&self.state_dir, &self.cmdline);
+        let changed = pending != self.update_pending;
+        self.update_pending = pending;
+        changed
+    }
+
     fn restart_pending(&self) -> bool {
         matches!(self.update_state, UpdateState::Installed { .. })
-            || pending_exists(&self.state_dir)
+            || self.update_pending == Pending::NeedsRestart
     }
 
     pub(super) fn update_caption(&self) -> Option<String> {
@@ -90,8 +103,14 @@ impl<D: OverlaySurface> SettingsUi<D> {
             UpdateState::Verifying => "Verifying…".to_owned(),
             UpdateState::Installing { .. } => "Installing… keep power connected".to_owned(),
             UpdateState::Installed { .. } => "Installed - restart to finish".to_owned(),
+            UpdateState::Restarting => "Restarting…".to_owned(),
             UpdateState::Idle | UpdateState::Versions(_) if self.restart_pending() => {
                 "Installed - restart to finish".to_owned()
+            }
+            UpdateState::Idle | UpdateState::Versions(_)
+                if self.update_pending == Pending::OnTrial =>
+            {
+                "Finishing update…".to_owned()
             }
             UpdateState::Idle | UpdateState::Versions(_) => return None,
         })
@@ -117,10 +136,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 if self.restart_pending() {
                     items.push(Item::RestartNow);
                 }
-                vec![Section {
-                    title: self.update_caption(),
-                    ..Section::plain(items)
-                }]
+                // The status sits under Check for updates, which stays in
+                // view when the list is scrolled.
+                vec![Section::plain(items)]
             }
             Page::AllVersions if !self.update_versions.is_empty() => vec![Section::plain(
                 (0..self.update_versions.len())
@@ -170,6 +188,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
 
     pub(super) fn open_updates(&mut self) {
         if self.updater.is_some() {
+            self.refresh_pending();
             self.enter(Page::Updates);
         }
     }
@@ -228,7 +247,10 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 self.send_update(UpdateCommand::Cancel);
             }
             Item::CancelUpdate => self.enter(Page::Updates),
-            Item::RestartNow => self.send_update(UpdateCommand::Restart),
+            Item::RestartNow => {
+                self.send_update(UpdateCommand::Restart);
+                self.enter(Page::UpdateProgress);
+            }
             Item::Later => {
                 self.send_update(UpdateCommand::Dismiss);
                 self.enter(Page::Updates);
@@ -243,7 +265,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 UpdateState::Connecting | UpdateState::Downloading { .. } => {
                     self.send_update(UpdateCommand::Cancel);
                 }
-                UpdateState::Verifying | UpdateState::Installing { .. } => {}
+                UpdateState::Verifying
+                | UpdateState::Installing { .. }
+                | UpdateState::Restarting => {}
                 _ => self.enter(Page::Updates),
             },
             Page::AllVersions | Page::UpdateConfirm => self.enter(Page::Updates),
@@ -278,7 +302,13 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 };
                 RowView::new("Network", Trailing::Link(summary, SECONDARY))
             }
-            Item::CheckUpdates => RowView::new("Check for updates", Trailing::None),
+            Item::CheckUpdates => {
+                let view = RowView::new("Check for updates", Trailing::None);
+                match self.update_caption() {
+                    Some(status) => view.detail(status),
+                    None => view,
+                }
+            }
             Item::ShowAllVersions => RowView::new(
                 "Show all versions",
                 Trailing::Link(String::new(), SECONDARY),

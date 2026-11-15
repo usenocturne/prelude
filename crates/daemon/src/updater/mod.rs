@@ -27,7 +27,8 @@ use self::{
     io::{Installer, Network, ReleaseSource},
     release::{candidates, newest_update, parse_releases},
     system::{
-        SystemPaths, bundle_version, clear_pending, install_guard, pending_exists, write_pending,
+        Pending, SystemPaths, bundle_version, clear_pending, install_guard, pending_update,
+        write_pending,
     },
 };
 use crate::settings::UpdateChannel;
@@ -72,6 +73,8 @@ pub enum UpdateState {
     Installed {
         version: String,
     },
+    /// The restart has been asked for; the screen holds until power-off.
+    Restarting,
     Failed(UpdateError),
 }
 
@@ -184,11 +187,17 @@ impl Worker {
                 UpdateCommand::ListAll { channel } => self.check(channel, true),
                 UpdateCommand::Install(candidate) => self.install(&candidate),
                 UpdateCommand::Restart => {
-                    let installed = matches!(self.state(), UpdateState::Installed { .. });
-                    if (installed || pending_exists(&self.paths.state_dir))
-                        && let Err(error) = self.installer.reboot()
+                    let previous = self.state();
+                    let installed = matches!(previous, UpdateState::Installed { .. });
+                    if installed
+                        || pending_update(&self.paths.state_dir, &self.paths.cmdline)
+                            == Pending::NeedsRestart
                     {
-                        warn!(?error, "could not restart");
+                        self.set(UpdateState::Restarting);
+                        if let Err(error) = self.installer.reboot() {
+                            warn!(?error, "could not restart");
+                            self.set(previous);
+                        }
                     }
                 }
                 UpdateCommand::Dismiss => {
@@ -803,6 +812,31 @@ mod tests {
             assert!(Instant::now() < deadline, "no reboot");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn restart_shows_restarting_before_reboot() {
+        let rig = Rig::new(Setup::default());
+        write_pending(&rig.state_dir(), Slot::A, "1.0.6").expect("pending");
+        rig.updater.send(UpdateCommand::Restart);
+        rig.settle(|state| *state == UpdateState::Restarting);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rig.log.lock().expect("log").reboots == 0 {
+            assert!(Instant::now() < deadline, "no reboot");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn restart_during_trial_boot_does_nothing() {
+        let rig = Rig::new(Setup::default());
+        write_pending(&rig.state_dir(), Slot::B, "1.0.6").expect("pending");
+        rig.updater.send(UpdateCommand::Restart);
+        rig.updater.send(UpdateCommand::Check {
+            channel: UpdateChannel::Stable,
+        });
+        rig.settle(terminal);
+        assert_eq!(rig.log.lock().expect("log").reboots, 0);
     }
 
     #[test]
