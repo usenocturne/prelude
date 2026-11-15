@@ -139,7 +139,9 @@ pub fn bundle_version(bundle: &Path) -> Result<String, UpdateError> {
 
 fn first_newc_entry<'a>(archive: &'a [u8], expected: &str) -> Option<&'a [u8]> {
     let header = archive.get(..NEWC_HEADER)?;
-    if !header.starts_with(b"070701") {
+    // 070701 is plain newc; 070702 (used by SWUpdate) adds a checksum field
+    // that sits in the same header slot, so both parse the same way.
+    if !(header.starts_with(b"070701") || header.starts_with(b"070702")) {
         return None;
     }
     // After the 6-byte magic: 13 fields of 8 hex digits. filesize is the
@@ -371,6 +373,24 @@ VERSION_ID=\"1.0.12-test\"
         )
         .expect("bundle");
         assert_eq!(bundle_version(&bundle), Ok("1.0.11-test".to_owned()));
+    }
+
+    #[test]
+    fn bundle_version_reads_crc_format_archives() {
+        // SWUpdate bundles use the CRC newc variant (magic 070702).
+        let dir = tempfile::tempdir().expect("dir");
+        let bundle = dir.path().join("b.swu");
+        let mut archive = newc(&[(
+            "sw-description",
+            b"software =
+{
+    version = \"1.0.21-test+20261114215338\";
+};
+",
+        )]);
+        archive[..6].copy_from_slice(b"070702");
+        fs::write(&bundle, archive).expect("bundle");
+        assert_eq!(bundle_version(&bundle), Ok("1.0.21-test".to_owned()));
     }
 
     #[test]
