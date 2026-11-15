@@ -39,6 +39,11 @@ upstream `bc140af`.
 | 8 | Wi-Fi adapter pulled mid-download gives "The download failed" | Pass after fix 5: about 5-10 s |
 | 9 | Tampered 1.0.23-test: downloads and verifies (digest and version match the tampered asset), SWUpdate rejects it ("Image invalid or corrupted"), page shows "Install failed. Nothing was changed."; still on the old slot, no marker, no leftover download | Pass |
 
+The Car Thing's own access point came back each time the updater let go
+of the adapter: after the check and install runs, after Cancel, after the
+adapter was pulled and plugged back in, and after the tampered install; the
+contributor's PC rejoined it for SSH each time.
+
 Not run: the phone hotspot as the update network (same code path as the
 saved network, covered in the Wi-Fi client validation), and an image built
 without an OTA key (covered by unit tests).
@@ -72,6 +77,13 @@ without an OTA key (covered by unit tests).
    caps any read at 20 s, and Cancel shows "Cancelling…" (tests
    `stalled_download_fails_instead_of_hanging`,
    `cancel_shows_cancelling_until_the_download_stops`).
+
+## After the final review
+
+The review fixes (commit `375d89f`) were installed as 1.0.24-test. It booted
+healthy on the other slot, and `/proc/<preluded>/task/*/stat` shows the
+`prelude-updater` thread at `SCHED_OTHER`, nice 19, while every media and UI
+thread keeps `SCHED_RR` at nice -20.
 
 ## Known behaviour, not fixed here
 
