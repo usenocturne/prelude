@@ -92,6 +92,24 @@ fn sweep_leftovers(state_dir: &Path) {
     let _ = fs::remove_file(state_dir.join("pending-update.tmp"));
 }
 
+/// preluded runs at real-time priority for media. Downloading, hashing and
+/// `swupdate` (which inherits this thread's scheduling) must not compete
+/// with it, so the updater thread drops to normal scheduling at the lowest
+/// priority.
+fn run_in_background() {
+    use thread_priority::{
+        NormalThreadSchedulePolicy, ThreadPriority, ThreadSchedulePolicy,
+        set_thread_priority_and_policy, thread_native_id,
+    };
+    if let Err(error) = set_thread_priority_and_policy(
+        thread_native_id(),
+        ThreadPriority::Min,
+        ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Other),
+    ) {
+        warn!(?error, "could not lower the updater's priority");
+    }
+}
+
 /// Cloneable handle to the updater worker.
 #[derive(Debug, Clone)]
 pub struct Updater {
@@ -115,6 +133,25 @@ impl Updater {
             UpdateState::Idle
         };
         sweep_leftovers(&paths.state_dir);
+        let initial = match system::reconcile_pending(
+            &paths.state_dir,
+            &paths.cmdline,
+            system::current_boot().as_deref(),
+            (paths.active_slot)(),
+        ) {
+            system::Reconciled::FellBack { version } if initial == UpdateState::Idle => {
+                warn!(
+                    version,
+                    "the last update did not start; the previous version is running"
+                );
+                UpdateState::Failed(UpdateError::DidNotStart)
+            }
+            system::Reconciled::Removed => {
+                info!("removed the marker of an install that never switched slots");
+                initial
+            }
+            _ => initial,
+        };
         let state = Arc::new(Mutex::new(initial));
         let cancel = Arc::new(AtomicBool::new(false));
         let (commands, receiver) = mpsc::channel();
@@ -130,7 +167,10 @@ impl Updater {
         };
         thread::Builder::new()
             .name("prelude-updater".to_owned())
-            .spawn(move || worker.run(&receiver))?;
+            .spawn(move || {
+                run_in_background();
+                worker.run(&receiver);
+            })?;
         Ok(Self {
             state,
             commands,
@@ -348,7 +388,10 @@ impl Worker {
             &|| self.cancelled(),
         )?;
         self.set(UpdateState::Verifying);
-        if bundle_version(bundle)? != version {
+        // The bundle's version carries no build metadata; a tag may.
+        let mut expected = candidate.version.clone();
+        expected.build = semver::BuildMetadata::EMPTY;
+        if bundle_version(bundle)? != expected.to_string() {
             return Err(UpdateError::BadBundle);
         }
         if self.cancelled() {
@@ -384,6 +427,8 @@ pub enum UpdateError {
     DownloadFailed,
     BadBundle,
     InstallFailed,
+    InstallBusy,
+    DidNotStart,
     RestartPending,
     NotHealthy,
     SlotUnknown,
@@ -401,9 +446,11 @@ impl UpdateError {
             Self::NoSpace => "Not enough free space",
             Self::DownloadFailed => "The download failed",
             Self::BadBundle => "The download is not the expected file",
-            Self::InstallFailed => "Install failed. Nothing was changed.",
+            Self::InstallFailed => "Install failed. Still on this version.",
+            Self::InstallBusy => "Another install is already running",
+            Self::DidNotStart => "The last update did not start",
             Self::RestartPending => "Restart to finish the last update",
-            Self::NotHealthy => "Updates need a healthy start first. Try again in a minute.",
+            Self::NotHealthy => "Not ready yet. Try again in a minute.",
             Self::SlotUnknown => "This system's slot could not be read",
             Self::Cancelled => "",
         }
@@ -571,6 +618,8 @@ mod tests {
         ota_disabled: bool,
         hold_install: Option<Arc<AtomicBool>>,
         leftovers: bool,
+        active_slot: fn() -> Option<Slot>,
+        marker: Option<&'static str>,
     }
 
     impl Default for Setup {
@@ -585,6 +634,8 @@ mod tests {
                 ota_disabled: false,
                 hold_install: None,
                 leftovers: false,
+                active_slot: || Some(Slot::B),
+                marker: None,
             }
         }
     }
@@ -602,6 +653,9 @@ mod tests {
             }
             fs::write(dir.path().join("cmdline"), "superbird.slot=b").expect("cmdline");
             fs::write(dir.path().join("ready"), "").expect("ready");
+            if let Some(marker) = setup.marker {
+                fs::write(state.join("pending-update"), marker).expect("marker");
+            }
             if setup.leftovers {
                 fs::create_dir_all(state.join("ota")).expect("ota");
                 fs::write(
@@ -619,6 +673,7 @@ mod tests {
                 ready: dir.path().join("ready"),
                 state_dir: state.clone(),
                 free_bytes: setup.free_bytes,
+                active_slot: setup.active_slot,
             };
             let downloads = Arc::new(AtomicUsize::new(0));
             let log = Arc::new(Mutex::new(InstallLog::default()));
@@ -765,7 +820,11 @@ mod tests {
         assert_eq!(log.installs.len(), 1);
         let (bundle, slot, marker) = &log.installs[0];
         assert_eq!(*slot, Slot::A);
-        assert_eq!(marker.as_deref(), Some("slot=a\nversion=1.0.6\n"));
+        assert!(
+            marker
+                .as_deref()
+                .is_some_and(|marker| marker.starts_with("slot=a\nversion=1.0.6\n"))
+        );
         assert!(!bundle.exists(), "the bundle is deleted after install");
         assert_eq!(rig.ota_files(), 0);
         assert!(rig.released());
@@ -905,6 +964,58 @@ mod tests {
     }
 
     #[test]
+    fn release_tag_with_build_metadata_installs() {
+        let rig = Rig::new(Setup {
+            releases: vec![release("v1.0.6+abc", false)],
+            ..Setup::default()
+        });
+        let candidate = rig.candidate();
+        rig.updater.send(UpdateCommand::Install(candidate));
+        assert!(matches!(
+            rig.settle(terminal),
+            UpdateState::Installed { .. }
+        ));
+    }
+
+    #[test]
+    fn updater_work_runs_below_realtime_priority() {
+        thread::spawn(|| {
+            run_in_background();
+            let stat = fs::read_to_string("/proc/thread-self/stat").expect("stat");
+            let fields: Vec<&str> = stat
+                .rsplit_once(") ")
+                .expect("comm")
+                .1
+                .split_whitespace()
+                .collect();
+            // Fields after the command name start at field 3 (state).
+            assert_eq!(fields[41 - 3], "0", "SCHED_OTHER");
+            assert!(
+                fields[19 - 3].parse::<i32>().expect("nice") > 0,
+                "nice raised"
+            );
+        })
+        .join()
+        .expect("thread");
+    }
+
+    #[test]
+    fn a_fallback_after_restart_is_reported_once() {
+        let rig = Rig::new(Setup {
+            active_slot: || Some(Slot::A),
+            marker: Some("slot=a\nversion=1.0.6\nboot=earlier\n"),
+            ..Setup::default()
+        });
+        assert_eq!(
+            rig.updater.state(),
+            UpdateState::Failed(UpdateError::DidNotStart)
+        );
+        assert!(!pending_exists(&rig.state_dir()));
+        rig.updater.send(UpdateCommand::Dismiss);
+        rig.settle(|state| *state == UpdateState::Idle);
+    }
+
+    #[test]
     fn restart_needs_an_installed_update() {
         let rig = Rig::new(Setup::default());
         rig.updater.send(UpdateCommand::Restart);
@@ -1021,7 +1132,12 @@ mod tests {
             ),
             (
                 UpdateError::InstallFailed,
-                "Install failed. Nothing was changed.",
+                "Install failed. Still on this version.",
+            ),
+            (UpdateError::DidNotStart, "The last update did not start"),
+            (
+                UpdateError::InstallBusy,
+                "Another install is already running",
             ),
             (
                 UpdateError::RestartPending,
@@ -1029,7 +1145,7 @@ mod tests {
             ),
             (
                 UpdateError::NotHealthy,
-                "Updates need a healthy start first. Try again in a minute.",
+                "Not ready yet. Try again in a minute.",
             ),
             (
                 UpdateError::SlotUnknown,

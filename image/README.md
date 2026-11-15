@@ -294,7 +294,8 @@ the pending marker before installing:
 test -e /run/prelude/ready || exit 1
 running=$(sed -n 's/.*superbird\.slot=\([ab]\).*/\1/p' /proc/cmdline)
 target=$([ "$running" = a ] && echo b || echo a)
-printf 'slot=%s\nversion=%s\n' "$target" 1.0.5 > /var/lib/prelude/pending-update
+printf 'slot=%s\nversion=%s\nboot=%s\n' "$target" 1.0.5 \
+    "$(cat /proc/sys/kernel/random/boot_id)" > /var/lib/prelude/pending-update
 sync
 systemctl stop swupdate.socket swupdate.service
 swupdate -f /etc/swupdate.cfg -e "stable,slot_$target" -i prelude_update_prod_v1.0.5.swu
@@ -320,6 +321,15 @@ to `/var/lib/prelude/ota/`, checks it, writes the pending marker and runs
 `swupdate` itself. "Show all versions" lists every release with a bundle for
 this image, including older ones for rollback. Nothing is checked or
 installed in the background.
+
+The download and `swupdate` run at normal priority, not the daemon's
+real-time priority, so wired projection keeps running smoothly. The updater
+will not start while another `swupdate -i` is running, so do not install by
+hand while the Car Thing is updating. The pending marker records the boot it
+was written in: if a restarted update fails its health check and U-Boot falls
+back, the next start says "The last update did not start" under Settings >
+Version. Downloads left behind by a power cut are removed when `preluded`
+starts.
 
 The repository is baked in at build time:
 

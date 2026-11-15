@@ -557,6 +557,8 @@ struct SettingsUi<D> {
     update_pending: Pending,
     /// Cancel was pressed; the download stops at its next read.
     update_cancelling: bool,
+    /// When the pending-update marker was last read.
+    pending_checked: Option<Instant>,
     events: Sender<HostUiEvent>,
     wake: Arc<Notify>,
     fonts: &'static FontSet,
@@ -629,6 +631,7 @@ impl<D: OverlaySurface> SettingsUi<D> {
             cmdline: PathBuf::from("/proc/cmdline"),
             update_pending: Pending::None,
             update_cancelling: false,
+            pending_checked: None,
             events,
             wake,
             fonts: fonts::shared(),
@@ -903,7 +906,10 @@ impl<D: OverlaySurface> SettingsUi<D> {
         self.presets.set_enabled(next.presets_enabled);
         self.settings = next;
         self.menu_open = false;
-        if self.in_internet_pages() || self.internet_state != InternetState::Idle {
+        // A running check or install hands its connection back itself.
+        if (self.in_internet_pages() || self.internet_state != InternetState::Idle)
+            && !self.updater_busy()
+        {
             self.release_internet();
         }
         self.leave_subpage();
@@ -1949,7 +1955,14 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 RowView::new("Support Prelude", Trailing::Link(String::new(), SECONDARY))
             }
             Item::Version if self.updater.is_some() => {
-                RowView::new("Version", Trailing::Link(self.version.clone(), SECONDARY))
+                let view = RowView::new("Version", Trailing::Link(self.version.clone(), SECONDARY));
+                if self.update_state
+                    == UpdateState::Failed(crate::updater::UpdateError::DidNotStart)
+                {
+                    view.detail(crate::updater::UpdateError::DidNotStart.message())
+                } else {
+                    view
+                }
             }
             Item::Version => {
                 RowView::new("Version", Trailing::Value(self.version.clone(), SECONDARY))
@@ -2870,6 +2883,7 @@ mod tests {
             Some("Finishing update…")
         );
         crate::updater::system::clear_pending(&harness.ui.state_dir);
+        harness.ui.pending_checked = None;
         assert!(harness.ui.poll_updates(), "redraws once marked good");
         assert_eq!(harness.ui.update_caption(), None);
     }
@@ -2904,6 +2918,7 @@ mod tests {
             "1.0.22-test",
         )
         .expect("pending");
+        harness.ui.pending_checked = None;
         harness.ui.poll_updates();
         assert_eq!(
             page_items(&harness),
@@ -2978,6 +2993,144 @@ mod tests {
             Some("Downloading 3%"),
             "a later download starts clean"
         );
+    }
+
+    #[test]
+    fn pending_marker_is_rechecked_at_most_once_a_second() {
+        let mut harness = Harness::new().with_updater();
+        on_slot_b(&mut harness);
+        crate::updater::system::write_pending(
+            &harness.ui.state_dir,
+            crate::updater::system::Slot::B,
+            "1.0.13",
+        )
+        .expect("pending");
+        harness.open_updates();
+        crate::updater::system::clear_pending(&harness.ui.state_dir);
+        assert!(!harness.ui.poll_updates(), "not re-read on every tick");
+        harness.ui.pending_checked = None;
+        assert!(harness.ui.poll_updates());
+    }
+
+    #[test]
+    fn version_row_says_when_the_last_update_did_not_start() {
+        let mut harness = Harness::new().with_updater();
+        assert_eq!(harness.ui.row_view(Item::Version).detail, None);
+        harness.set_update(UpdateState::Failed(
+            crate::updater::UpdateError::DidNotStart,
+        ));
+        assert_eq!(
+            harness.ui.row_view(Item::Version).detail.as_deref(),
+            Some("The last update did not start")
+        );
+    }
+
+    #[test]
+    fn closing_settings_during_a_check_keeps_its_connection() {
+        let mut harness = Harness::new().with_internet().with_updater();
+        harness.open_updates();
+        harness.set_internet(InternetState::Online {
+            route: Route::Wifi {
+                ssid: "Home".to_owned(),
+            },
+            address: "10.0.0.2".to_owned(),
+        });
+        harness.set_update(UpdateState::Checking);
+        harness.send(PlatformInputEventKind::SettingsButton);
+        assert!(!harness.ui.menu_open);
+        assert_eq!(
+            harness.commands(),
+            Vec::<InternetCommand>::new(),
+            "the updater hands the connection back itself"
+        );
+    }
+
+    #[test]
+    fn offline_without_a_saved_network_points_to_the_network_row() {
+        let mut harness = Harness::new().with_internet().with_updater();
+        harness.open_updates();
+        harness.set_update(UpdateState::Failed(crate::updater::UpdateError::Offline));
+        assert_eq!(
+            harness.ui.update_caption().as_deref(),
+            Some("Choose a network first")
+        );
+        crate::saved_networks::remember(
+            &harness.ui.state_dir,
+            crate::saved_networks::SavedNetwork {
+                ssid: b"Home".to_vec(),
+                psk: Some([7; 32]),
+            },
+        )
+        .expect("remember");
+        assert_eq!(
+            harness.ui.update_caption().as_deref(),
+            Some("Could not get online")
+        );
+    }
+
+    #[test]
+    fn confirm_text_names_wireless_projection() {
+        assert!(updates_ui::CONFIRM_TEXT.starts_with("Wireless CarPlay and Android Auto"));
+        assert!(updates_ui::CONFIRM_OLDER_TEXT.starts_with(updates_ui::CONFIRM_TEXT));
+    }
+
+    #[test]
+    fn updates_pages_fit() {
+        use crate::updater::UpdateError;
+        let harness = Harness::new().with_updater();
+        let fonts = &harness.ui.fonts;
+        let detail_width = CONTENT_RIGHT - CONTENT_X;
+        let mut details: Vec<&str> = [
+            UpdateError::Unavailable,
+            UpdateError::WrongFlavour,
+            UpdateError::Offline,
+            UpdateError::GithubBusy,
+            UpdateError::GithubUnreachable,
+            UpdateError::NoSpace,
+            UpdateError::DownloadFailed,
+            UpdateError::BadBundle,
+            UpdateError::InstallFailed,
+            UpdateError::InstallBusy,
+            UpdateError::RestartPending,
+            UpdateError::NotHealthy,
+            UpdateError::SlotUnknown,
+            UpdateError::DidNotStart,
+        ]
+        .iter()
+        .map(UpdateError::message)
+        .collect();
+        details.extend([
+            "Installed - restart to finish",
+            "Finishing update…",
+            "Choose a network first",
+            "1.0.123-beta.10 available",
+            "Downloading 100%",
+            "Cancelling…",
+        ]);
+        let cut: Vec<&str> = details
+            .into_iter()
+            .filter(|text| fonts.fit(text, DETAIL_SIZE, false, detail_width) != *text)
+            .collect();
+        assert!(cut.is_empty(), "status lines cut off: {cut:?}");
+        for label in [
+            "Install 1.0.123-beta.10",
+            "Check for updates",
+            "Show all versions",
+        ] {
+            assert!(
+                CONTENT_X + fonts.text_width(label, LABEL_SIZE, false) < CONTENT_RIGHT,
+                "{label} too wide"
+            );
+        }
+        for (headline, detail) in [
+            ("Verifying…", "Checking the download"),
+            ("Installing…", "Keep power connected"),
+            ("Restarting…", "Back in a moment"),
+            ("Cancelling…", "Waiting for the download to stop"),
+        ] {
+            assert!(fonts.text_width(headline, LABEL_SIZE, true) < DISPLAY_WIDTH as i32);
+            assert!(fonts.text_width(detail, DETAIL_SIZE, false) < DISPLAY_WIDTH as i32);
+        }
     }
 
     #[test]
@@ -3876,11 +4029,13 @@ mod tests {
              than the installed version. Updates are not available on this build No update for \
              this build type Could not get online GitHub is busy. Try again later. Could not reach \
              GitHub Not enough free space The download failed The download is not the expected \
-             file Install failed. Nothing was changed. Restart to finish the last update Updates \
-             need a healthy start first. Try again in a minute. This system's slot could not be \
+             file Install failed. Nothing was changed. Restart to finish the last update Not \
+             ready yet. Try again in a minute. This system's slot could not be \
              read All versions Install update Updating No versions found Looking for Prelude \
              releases Restarting… Finishing update… Checking the download Keep power \
-             connected Back in a moment Cancelling… Waiting for the download to stop"
+             connected Back in a moment Cancelling… Waiting for the download to stop \
+             Wireless while it downloads. Still on this version. The last update did not \
+             start Another install is already running Choose a network first"
                 .chars()
         {
             assert!(

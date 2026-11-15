@@ -9,14 +9,16 @@ use crate::{
     saved_networks,
     settings::UpdateChannel,
     updater::{
-        Candidate, Relation, UpdateCommand, UpdateState,
+        Candidate, Relation, UpdateCommand, UpdateError, UpdateState,
         system::{Pending, pending_update},
     },
 };
 
 pub(super) const CONFIRM_TEXT: &str =
-    "CarPlay and Android Auto pause during the update. Keep power connected.";
-pub(super) const CONFIRM_OLDER_TEXT: &str = "CarPlay and Android Auto pause during the update. Keep power connected. This is older than the installed version.";
+    "Wireless CarPlay and Android Auto pause while it downloads. Keep power connected.";
+pub(super) const CONFIRM_OLDER_TEXT: &str = "Wireless CarPlay and Android Auto pause while it downloads. Keep power connected. This is older than the installed version.";
+/// How often an open Updates page re-reads the pending-update marker.
+const PENDING_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl<D: OverlaySurface> SettingsUi<D> {
     pub(super) const fn in_updates_pages(&self) -> bool {
@@ -72,7 +74,10 @@ impl<D: OverlaySurface> SettingsUi<D> {
         let Some(state) = self.updater.as_ref().map(crate::updater::Updater::state) else {
             return false;
         };
-        let pending_changed = self.in_updates_pages() && self.refresh_pending();
+        let pending_due = self
+            .pending_checked
+            .is_none_or(|checked| checked.elapsed() >= PENDING_RECHECK);
+        let pending_changed = self.in_updates_pages() && pending_due && self.refresh_pending();
         if state == self.update_state {
             return pending_changed;
         }
@@ -100,10 +105,36 @@ impl<D: OverlaySurface> SettingsUi<D> {
 
     /// Re-reads the pending-update marker; returns whether it changed.
     fn refresh_pending(&mut self) -> bool {
+        self.pending_checked = Some(std::time::Instant::now());
         let pending = pending_update(&self.state_dir, &self.cmdline);
         let changed = pending != self.update_pending;
         self.update_pending = pending;
         changed
+    }
+
+    /// Checking or installing; the updater owns the connection meanwhile.
+    pub(super) const fn updater_busy(&self) -> bool {
+        matches!(
+            self.update_state,
+            UpdateState::Connecting
+                | UpdateState::Checking
+                | UpdateState::Downloading { .. }
+                | UpdateState::Verifying
+                | UpdateState::Installing { .. }
+        )
+    }
+
+    /// Offline with nothing to join: no saved network and no wired route.
+    fn needs_network(&self) -> bool {
+        self.internet.is_some()
+            && !matches!(
+                self.internet_state,
+                InternetState::Online {
+                    route: Route::Wired { .. },
+                    ..
+                }
+            )
+            && saved_networks::load(&self.state_dir).is_empty()
     }
 
     fn restart_pending(&self) -> bool {
@@ -115,6 +146,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
         Some(match &self.update_state {
             UpdateState::Connecting | UpdateState::Downloading { .. } if self.update_cancelling => {
                 "Cancelling…".to_owned()
+            }
+            UpdateState::Failed(UpdateError::Offline) if self.needs_network() => {
+                "Choose a network first".to_owned()
             }
             UpdateState::Unavailable(error) | UpdateState::Failed(error) => {
                 error.message().to_owned()

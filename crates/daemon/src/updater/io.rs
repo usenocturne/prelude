@@ -77,6 +77,7 @@ fn request_error(error: ureq::Error, otherwise: UpdateError) -> UpdateError {
 pub struct GithubSource {
     user_agent: String,
     read_stall: Duration,
+    https_only: bool,
 }
 
 impl GithubSource {
@@ -84,7 +85,15 @@ impl GithubSource {
         Self {
             user_agent: format!("prelude-updater/{installed_version}"),
             read_stall: READ_STALL_TIMEOUT,
+            https_only: true,
         }
+    }
+
+    /// Tests serve bundles from a plain-HTTP server on localhost.
+    #[cfg(test)]
+    const fn allowing_http(mut self) -> Self {
+        self.https_only = false;
+        self
     }
 
     #[cfg(test)]
@@ -100,6 +109,8 @@ impl GithubSource {
             .timeout_recv_response(Some(RESPONSE_TIMEOUT))
             .timeout_recv_body(body_timeout)
             .timeout_per_read(Some(self.read_stall))
+            // Asset URLs and redirects come from untrusted JSON.
+            .https_only(self.https_only)
             .build()
             .into()
     }
@@ -197,6 +208,8 @@ impl GithubSource {
 pub struct SwupdateInstaller {
     pub program: PathBuf,
     pub env: Vec<(String, String)>,
+    /// Where to look for another `swupdate -i` already writing a slot.
+    pub proc_root: PathBuf,
 }
 
 impl Default for SwupdateInstaller {
@@ -204,12 +217,43 @@ impl Default for SwupdateInstaller {
         Self {
             program: PathBuf::from("swupdate"),
             env: Vec::new(),
+            proc_root: PathBuf::from("/proc"),
         }
     }
 }
 
+/// Whether another `swupdate ... -i <bundle>` is running, such as an
+/// install by hand over SSH. The system swupdate daemon (no `-i`) is idle
+/// unless something talks to its socket, so it does not count.
+fn another_install_running(proc_root: &Path) -> bool {
+    let own = std::process::id().to_string();
+    let Ok(entries) = fs::read_dir(proc_root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.bytes().all(|byte| byte.is_ascii_digit()) || name == own {
+            return false;
+        }
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            return false;
+        };
+        let mut args = cmdline.split(|byte| *byte == 0);
+        let is_swupdate = args
+            .next()
+            .and_then(|program| program.rsplit(|byte| *byte == b'/').next())
+            .is_some_and(|program| program == b"swupdate");
+        is_swupdate && args.any(|arg| arg == b"-i")
+    })
+}
+
 impl Installer for SwupdateInstaller {
     fn install(&self, bundle: &Path, slot: Slot) -> Result<(), UpdateError> {
+        if another_install_running(&self.proc_root) {
+            warn!("another swupdate install is running; not starting one");
+            return Err(UpdateError::InstallBusy);
+        }
         let output = Command::new(&self.program)
             .args(["-f", "/etc/swupdate.cfg", "-e"])
             .arg(format!("stable,slot_{}", slot.as_str()))
@@ -371,7 +415,7 @@ mod tests {
         let dest = dir.path().join("bundle.swu");
         let body = vec![7_u8; 100_000];
         let digest: [u8; 32] = Sha256::digest(&body).into();
-        let source = GithubSource::new("1.0.0");
+        let source = GithubSource::new("1.0.0").allowing_http();
         let mut seen = 0;
         source
             .download(
@@ -423,7 +467,7 @@ mod tests {
         let dest = dir.path().join("bundle.swu");
         let body = vec![1_u8; 1024 * 1024];
         let cancelled = AtomicBool::new(false);
-        let result = GithubSource::new("1.0.0").download(
+        let result = GithubSource::new("1.0.0").allowing_http().download(
             &asset(
                 serve(body.clone(), body.len(), Some(Duration::from_millis(20))),
                 body.len() as u64,
@@ -444,6 +488,7 @@ mod tests {
         let body = vec![1_u8; 1024 * 1024];
         let started = std::time::Instant::now();
         let result = GithubSource::new("1.0.0")
+            .allowing_http()
             .with_read_stall(Duration::from_millis(300))
             .download(
                 &asset(
@@ -461,6 +506,73 @@ mod tests {
             "gave up promptly"
         );
         assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
+    }
+
+    #[test]
+    fn plain_http_download_is_refused() {
+        let dir = tempfile::tempdir().expect("dir");
+        let dest = dir.path().join("bundle.swu");
+        let body = vec![1_u8; 1000];
+        let result = GithubSource::new("1.0.0").download(
+            &asset(
+                serve(body.clone(), body.len(), None),
+                body.len() as u64,
+                None,
+            ),
+            &dest,
+            &mut |_| {},
+            &|| false,
+        );
+        assert_eq!(result, Err(UpdateError::DownloadFailed));
+        assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
+    }
+
+    #[test]
+    fn another_running_install_is_refused() {
+        let dir = tempfile::tempdir().expect("dir");
+        let proc_root = dir.path().join("proc");
+        let daemon = proc_root.join("456");
+        std::fs::create_dir_all(&daemon).expect("daemon");
+        std::fs::write(
+            daemon.join("cmdline"),
+            "/usr/bin/swupdate\0-v\0-f\0/etc/swupdate.cfg\0",
+        )
+        .expect("cmdline");
+        std::fs::create_dir_all(proc_root.join("self")).expect("self");
+        std::fs::write(proc_root.join("self/cmdline"), "x\0-i\0").expect("self");
+        let log = dir.path().join("ran");
+        let script = dir.path().join("fake-swupdate");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\n", log.display())).expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+        let installer = SwupdateInstaller {
+            program: script,
+            env: Vec::new(),
+            proc_root: proc_root.clone(),
+        };
+        let bundle = dir.path().join("b.swu");
+        std::fs::write(&bundle, "x").expect("bundle");
+        assert_eq!(
+            installer.install(&bundle, Slot::A),
+            Ok(()),
+            "an idle daemon is fine"
+        );
+        assert!(log.exists());
+        std::fs::remove_file(&log).expect("reset");
+
+        let manual = proc_root.join("789");
+        std::fs::create_dir_all(&manual).expect("manual");
+        std::fs::write(
+            manual.join("cmdline"),
+            "swupdate\0-f\0/etc/swupdate.cfg\0-e\0stable,slot_a\0-i\0/var/manual.swu\0",
+        )
+        .expect("cmdline");
+        assert_eq!(
+            installer.install(&bundle, Slot::A),
+            Err(UpdateError::InstallBusy)
+        );
+        assert!(!log.exists(), "swupdate is not started");
     }
 
     #[test]
@@ -483,6 +595,7 @@ mod tests {
         let installer = SwupdateInstaller {
             program: script.clone(),
             env: Vec::new(),
+            proc_root: dir.path().join("no-proc"),
         };
         installer.install(&bundle, Slot::A).expect("install");
         assert_eq!(
@@ -495,6 +608,7 @@ mod tests {
         let failing = SwupdateInstaller {
             program: script,
             env: vec![("FAKE_EXIT".to_owned(), "1".to_owned())],
+            proc_root: dir.path().join("no-proc"),
         };
         assert_eq!(
             failing.install(&bundle, Slot::B),
