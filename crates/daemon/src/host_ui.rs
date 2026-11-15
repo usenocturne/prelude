@@ -1496,7 +1496,9 @@ impl<D: OverlaySurface> SettingsUi<D> {
                 }
                 None => CONTENT_RIGHT,
             };
-            canvas.chevron(BACK_X, TITLE_Y, 12, false, WHITE, 4.0);
+            if self.shows_back() {
+                canvas.chevron(BACK_X, TITLE_Y, 12, false, WHITE, 4.0);
+            }
             let title = self
                 .fonts
                 .fit(self.title(), TITLE_SIZE, true, right - BACK_TITLE_X);
@@ -1554,6 +1556,10 @@ impl<D: OverlaySurface> SettingsUi<D> {
             ),
             Page::WifiNetworks => self.wifi_networks_empty_text(),
             Page::AllVersions => self.all_versions_empty_text(),
+            Page::UpdateProgress => match self.update_progress_text() {
+                Some(text) => text,
+                None => return,
+            },
             _ => return,
         };
         let center_x = DISPLAY_WIDTH as i32 / 2;
@@ -2912,6 +2918,37 @@ mod tests {
     }
 
     #[test]
+    fn progress_without_buttons_still_says_what_is_happening() {
+        let mut harness = Harness::new().with_updater();
+        harness.ui.enter(Page::UpdateProgress);
+        for (state, headline) in [
+            (UpdateState::Verifying, "Verifying…"),
+            (
+                UpdateState::Installing {
+                    version: "1.0.19-test".to_owned(),
+                },
+                "Installing…",
+            ),
+            (UpdateState::Restarting, "Restarting…"),
+        ] {
+            harness.set_update(state);
+            assert!(page_items(&harness).is_empty());
+            assert_eq!(
+                harness.ui.update_progress_text().map(|(text, _)| text),
+                Some(headline)
+            );
+            assert!(!harness.ui.shows_back(), "Back does nothing here");
+        }
+        harness.set_update(UpdateState::Downloading {
+            version: "1.0.19-test".to_owned(),
+            done: 1,
+            total: 2,
+        });
+        assert!(harness.ui.shows_back(), "Back cancels a download");
+        assert_eq!(harness.ui.update_progress_text(), None);
+    }
+
+    #[test]
     fn check_status_shows_under_the_check_row() {
         let mut harness = Harness::new().with_updater();
         harness.open_updates();
@@ -3810,7 +3847,8 @@ mod tests {
              file Install failed. Nothing was changed. Restart to finish the last update Updates \
              need a healthy start first. Try again in a minute. This system's slot could not be \
              read All versions Install update Updating No versions found Looking for Prelude \
-             releases Restarting… Finishing update…"
+             releases Restarting… Finishing update… Checking the download Keep power \
+             connected Back in a moment"
                 .chars()
         {
             assert!(

@@ -45,6 +45,25 @@ impl<D: OverlaySurface> SettingsUi<D> {
             )
     }
 
+    /// Steps where Back does nothing, so the header shows no back arrow.
+    pub(super) const fn shows_back(&self) -> bool {
+        !(matches!(self.page, Page::UpdateProgress)
+            && matches!(
+                self.update_state,
+                UpdateState::Verifying | UpdateState::Installing { .. } | UpdateState::Restarting
+            ))
+    }
+
+    /// The centred message for progress steps that offer no buttons.
+    pub(super) const fn update_progress_text(&self) -> Option<(&'static str, &'static str)> {
+        match self.update_state {
+            UpdateState::Verifying => Some(("Verifying…", "Checking the download")),
+            UpdateState::Installing { .. } => Some(("Installing…", "Keep power connected")),
+            UpdateState::Restarting => Some(("Restarting…", "Back in a moment")),
+            _ => None,
+        }
+    }
+
     /// Picks up worker state changes; returns whether the screen changed.
     pub(super) fn poll_updates(&mut self) -> bool {
         let Some(state) = self.updater.as_ref().map(crate::updater::Updater::state) else {
