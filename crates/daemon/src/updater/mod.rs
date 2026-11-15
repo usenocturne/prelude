@@ -78,6 +78,20 @@ pub enum UpdateState {
     Failed(UpdateError),
 }
 
+/// Removes downloads that an earlier run left behind (power lost or the
+/// daemon stopped mid-download) and a half-written pending marker. Nothing
+/// is downloading when the updater starts, so all of it is stale.
+fn sweep_leftovers(state_dir: &Path) {
+    if let Ok(entries) = fs::read_dir(state_dir.join("ota")) {
+        for entry in entries.flatten() {
+            if let Err(error) = fs::remove_file(entry.path()) {
+                warn!(%error, path = %entry.path().display(), "could not remove a leftover download");
+            }
+        }
+    }
+    let _ = fs::remove_file(state_dir.join("pending-update.tmp"));
+}
+
 /// Cloneable handle to the updater worker.
 #[derive(Debug, Clone)]
 pub struct Updater {
@@ -100,6 +114,7 @@ impl Updater {
         } else {
             UpdateState::Idle
         };
+        sweep_leftovers(&paths.state_dir);
         let state = Arc::new(Mutex::new(initial));
         let cancel = Arc::new(AtomicBool::new(false));
         let (commands, receiver) = mpsc::channel();
@@ -244,13 +259,21 @@ impl Worker {
         }
     }
 
+    /// Gets online. A connect that was started is handed back even when it
+    /// is cancelled or fails, so the access point always returns.
+    fn go_online(&self) -> Result<(), UpdateError> {
+        self.network.acquire(&|| self.cancelled()).inspect_err(|_| {
+            self.network.release();
+        })
+    }
+
     fn check(&self, channel: UpdateChannel, list_all: bool) {
         let Some(flavour) = self.paths.flavour() else {
             self.finish(Err(UpdateError::Unavailable));
             return;
         };
         self.set(UpdateState::Connecting);
-        if let Err(error) = self.network.acquire(&|| self.cancelled()) {
+        if let Err(error) = self.go_online() {
             self.finish(Err(error));
             return;
         }
@@ -289,7 +312,7 @@ impl Worker {
                 return Err(UpdateError::NoSpace);
             }
             self.set(UpdateState::Connecting);
-            self.network.acquire(&|| self.cancelled())?;
+            self.go_online()?;
             let bundle = ota_dir.join(&candidate.asset.name);
             let result = self.download_and_install(candidate, &bundle, slot);
             let _ = fs::remove_file(&bundle);
@@ -547,6 +570,7 @@ mod tests {
         free_bytes: fn(&Path) -> std::io::Result<u64>,
         ota_disabled: bool,
         hold_install: Option<Arc<AtomicBool>>,
+        leftovers: bool,
     }
 
     impl Default for Setup {
@@ -560,6 +584,7 @@ mod tests {
                 free_bytes: |_| Ok(u64::MAX),
                 ota_disabled: false,
                 hold_install: None,
+                leftovers: false,
             }
         }
     }
@@ -577,6 +602,17 @@ mod tests {
             }
             fs::write(dir.path().join("cmdline"), "superbird.slot=b").expect("cmdline");
             fs::write(dir.path().join("ready"), "").expect("ready");
+            if setup.leftovers {
+                fs::create_dir_all(state.join("ota")).expect("ota");
+                fs::write(
+                    state.join("ota/prelude_update_prod_v1.0.6.swu.part"),
+                    "half",
+                )
+                .expect("part");
+                fs::write(state.join("ota/prelude_update_prod_v1.0.4.swu"), "whole")
+                    .expect("bundle");
+                fs::write(state.join("pending-update.tmp"), "slot=a\n").expect("tmp");
+            }
             let paths = SystemPaths {
                 etc_prelude: etc,
                 cmdline: dir.path().join("cmdline"),
@@ -837,6 +873,35 @@ mod tests {
         });
         rig.settle(terminal);
         assert_eq!(rig.log.lock().expect("log").reboots, 0);
+    }
+
+    #[test]
+    fn failing_to_get_online_still_releases_the_network() {
+        let rig = Rig::new(Setup {
+            offline: true,
+            ..Setup::default()
+        });
+        rig.updater.send(UpdateCommand::Check {
+            channel: UpdateChannel::Stable,
+        });
+        assert_eq!(
+            rig.settle(terminal),
+            UpdateState::Failed(UpdateError::Offline)
+        );
+        assert!(
+            rig.released(),
+            "a connect that was started is handed back even when it fails"
+        );
+    }
+
+    #[test]
+    fn leftover_downloads_are_removed_when_the_updater_starts() {
+        let rig = Rig::new(Setup {
+            leftovers: true,
+            ..Setup::default()
+        });
+        assert_eq!(rig.ota_files(), 0);
+        assert!(!rig.state_dir().join("pending-update.tmp").exists());
     }
 
     #[test]
