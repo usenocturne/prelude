@@ -34,6 +34,7 @@ struct HandleState {
     claim_results: VecDeque<std::result::Result<(), rusb::Error>>,
     read_results: VecDeque<std::result::Result<usize, rusb::Error>>,
     write_results: VecDeque<std::result::Result<usize, rusb::Error>>,
+    stalled_writes: bool,
 }
 
 impl Default for HandleState {
@@ -44,6 +45,7 @@ impl Default for HandleState {
             claim_results: VecDeque::new(),
             read_results: VecDeque::new(),
             write_results: VecDeque::new(),
+            stalled_writes: false,
         }
     }
 }
@@ -186,7 +188,12 @@ impl UsbHandle for MockHandle {
         state
             .calls
             .push(Call::Write(endpoint, bytes.to_vec(), timeout));
-        state.write_results.pop_front().unwrap_or(Ok(bytes.len()))
+        let stalled = state.stalled_writes;
+        state.write_results.pop_front().unwrap_or(if stalled {
+            Err(rusb::Error::Timeout)
+        } else {
+            Ok(bytes.len())
+        })
     }
 }
 
@@ -637,6 +644,38 @@ fn transport_observes_deadline_cancellation_disconnect_and_partial_writes() {
         .filter(|call| matches!(call, Call::Write(..)))
         .count();
     assert_eq!(writes, 2);
+}
+
+#[test]
+fn transfers_never_get_a_timeout_that_rounds_down_to_libusbs_wait_forever() {
+    let handle = MockHandle::default();
+    handle.0.lock().expect("mock handle lock").stalled_writes = true;
+    let mut transport = open_mock_transport(&handle);
+    let deadline = Duration::from_millis(5);
+    let error = transport
+        .read(&mut [0_u8; 1], deadline, &CancellationToken::default())
+        .expect_err("idle read times out");
+    assert!(matches!(error, Error::Timeout { .. }));
+    let error = transport
+        .write_all(&[1], deadline, &CancellationToken::default())
+        .expect_err("stalled write times out");
+    assert!(matches!(error, Error::Timeout { .. }));
+
+    let calls = handle.calls();
+    let timeouts: Vec<Duration> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::Read(_, timeout) | Call::Write(_, _, timeout) => Some(*timeout),
+            _ => None,
+        })
+        .collect();
+    assert!(!timeouts.is_empty(), "transfers were attempted");
+    for timeout in timeouts {
+        assert!(
+            timeout.as_millis() >= 1,
+            "{timeout:?} reaches libusb as 0 ms, which waits forever"
+        );
+    }
 }
 
 #[test]
