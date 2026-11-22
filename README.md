@@ -47,7 +47,7 @@ Flashing will likely take about 5-10 minutes, depending on your USB ports and so
 Prelude supports both wired and wireless connections.
 
 <details>
-<summary><img src="https://camo.githubusercontent.com/b9c79d36777ba11fe5423f498b522f7b786898772a1ddbb44074fb6bc59adf06/68747470733a2f2f7573656e6f637475726e652e636f6d2f696d616765732f6c6f676f2e706e67" height="14" style="vertical-align: middle;"> Apple CarPlay (Wired)</summary>
+<summary><img src="https://usenocturne.com/images/logo.png" height="14" style="vertical-align: middle;"> Apple CarPlay (Wired)</summary>
 
 1. Plug your USB OTG adapter into the Car Thing, and plug power into the USB-C port, and the USB hub into the USB-A port. If required, plug in your USB DAC into the hub as well.
 2. Plug in your phone to the USB hub.
@@ -56,7 +56,7 @@ Prelude supports both wired and wireless connections.
 </details>
 
 <details>
-<summary><img src="https://camo.githubusercontent.com/b9c79d36777ba11fe5423f498b522f7b786898772a1ddbb44074fb6bc59adf06/68747470733a2f2f7573656e6f637475726e652e636f6d2f696d616765732f6c6f676f2e706e67" height="14" style="vertical-align: middle;"> Apple CarPlay (Wireless)</summary>
+<summary><img src="https://usenocturne.com/images/logo.png" height="14" style="vertical-align: middle;"> Apple CarPlay (Wireless)</summary>
 
 1. Plug your USB OTG adapter into the Car Thing, and plug power into the USB-C port, and the USB hub into the USB-A port. Plug your USB Wi-Fi adapter (and USB DAC, if required) into the hub.
 2. On your iPhone, make sure Bluetooth and Wi-Fi are on, then open **Settings → General → CarPlay → Available Cars** and pick **Prelude**.
