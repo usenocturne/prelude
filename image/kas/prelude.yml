@@ -29,7 +29,7 @@ env:
 repos:
   yocto-superbird:
     url: https://github.com/JoeyEamigh/yocto-superbird.git
-    commit: bcba74441aa9e35b3a07cc8f087277e8281a5a46
+    commit: 6c72b0afe0c461f5e14b6256d949737f32d74055
     path: sources/yocto-superbird
     layers:
       meta-superbird:
