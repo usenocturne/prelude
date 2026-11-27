@@ -38,6 +38,9 @@ use prelude_control::{
 };
 
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
+use crate::carplay_video::GstPlayerFactory;
+use crate::carplay_video::{self, PlayerFactory, VideoSession};
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
 use crate::media_runtime::{LiveMediaRuntime, MediaCapabilities, MediaController};
 #[cfg(target_os = "linux")]
 use crate::shared_mfi::SharedMfi;
@@ -158,6 +161,7 @@ const MAIN_DISPLAY_UUID: &str = "b7e6c5a0-1111-4000-8000-000000000001";
 const DISPLAY_WIDTH_PIXELS: u64 = 800;
 const DISPLAY_HEIGHT_PIXELS: u64 = 480;
 const CARPLAY_SOURCE_VERSION: &str = "320.17";
+const HEVC_FEATURE: &str = "hevc";
 const MAXIMUM_PENDING_EVENT_RESPONSES: usize = 256;
 const RECORD_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const PEER_SILENCE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -186,6 +190,10 @@ pub(crate) enum EventWorkerCommand {
     },
     ForceKeyFrame,
     IapSendMessage(Vec<u8>),
+    Command {
+        body: Value,
+        stream_id: Option<u64>,
+    },
 }
 const PCM_VOICE_FORMATS: u64 = 0x03fc;
 const PCM_MEDIA_48K_FORMATS: u64 = 0xc000;
@@ -249,6 +257,7 @@ struct ReceiverMediaClaims {
     screen: bool,
     audio: bool,
     microphone: bool,
+    hevc: bool,
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-media"))]
@@ -258,6 +267,7 @@ impl From<MediaCapabilities> for ReceiverMediaClaims {
             screen: capabilities.screen,
             audio: capabilities.audio,
             microphone: capabilities.microphone,
+            hevc: capabilities.hevc,
         }
     }
 }
@@ -512,6 +522,7 @@ impl BoundPorts {
                     self.bind_unique_udp_socket()?,
                 )),
                 Some(BoundStreamSockets::DataChannel(_)) => None,
+                None if !self.claimed_streams.contains(key) => continue,
                 None => {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -585,6 +596,9 @@ impl PortProvider for BoundPorts {
     }
 
     fn stream_ports(&mut self, stream: &StreamDescriptor) -> prelude_net::Result<StreamPorts> {
+        if matches!(stream, StreamDescriptor::MessageChannel(_)) {
+            return Ok(StreamPorts::MessageChannel);
+        }
         let key = stream.key();
         if let Some(sockets) = self.streams.get(&key) {
             return stream_socket_ports(sockets);
@@ -615,6 +629,9 @@ impl PortProvider for BoundPorts {
                     ))
                 })?,
             ),
+            StreamDescriptor::MessageChannel(_) => {
+                unreachable!("message channels were answered before socket allocation")
+            }
         };
         let ports = stream_socket_ports(&sockets)?;
         self.streams.insert(key, sockets);
@@ -870,6 +887,7 @@ impl AirPlayRuntime {
             screen: media_claims.screen,
             audio: media_claims.audio && !config.disable_audio_output,
             microphone: media_claims.microphone && !config.disable_audio_output,
+            hevc: media_claims.screen && media_claims.hevc,
         };
         let info = build_info_payload(
             config,
@@ -893,6 +911,7 @@ impl AirPlayRuntime {
             audio_formats = if advertised_media_claims.audio { 9 } else { 0 },
             audio_latencies = if advertised_media_claims.audio { 9 } else { 0 },
             microphone = advertised_media_claims.microphone,
+            hevc = advertised_media_claims.hevc,
             dock = ?config.dock,
             "built AirPlay /info capability declaration"
         );
@@ -925,10 +944,25 @@ impl AirPlayRuntime {
                 .map_err(|error| format!("loading persistent AirPlay identity failed: {error}"))?,
         );
         let metadata = receiver_start_metadata(service_port, host_mac, &identity);
-        let receiver_config =
+        let mut receiver_config =
             ReceiverConfig::new(setup_code, identity.pairing_id().to_owned(), info)
                 .with_pairing_timeout(Duration::from_millis(config.pairing_timeout_ms))
                 .with_enabled_features(vec!["iAPChannel".to_owned(), "viewAreas".to_owned()]);
+        if advertised_media_claims.hevc {
+            receiver_config =
+                receiver_config.with_conditional_feature(HEVC_FEATURE, Dictionary::new());
+        }
+        if advertised_media_claims.screen && cfg!(all(target_os = "linux", feature = "linux-media"))
+        {
+            receiver_config = receiver_config.with_conditional_feature(
+                carplay_video::VIDEO_PLAYBACK_FEATURE,
+                carplay_video::info_entries(if advertised_media_claims.audio {
+                    CARPLAY_FEATURES
+                } else {
+                    CARPLAY_FEATURES_NO_AUDIO
+                }),
+            );
+        }
         let receiver = AirPlayReceiver::new(receiver_config, store, identity, signer)
             .map_err(|error| format!("constructing the AirPlay receiver failed: {error}"))?;
         let progress = Arc::new(Mutex::new(initial_airplay_progress(
@@ -997,6 +1031,7 @@ impl AirPlayRuntime {
                 let result = run_listener(
                     listener,
                     bind_address,
+                    scope_id,
                     receiver,
                     control_ports,
                     event_key_sender,
@@ -1164,6 +1199,7 @@ impl Drop for AirPlayRuntime {
 fn run_listener<S: MfiSigner>(
     listener: TcpListener,
     bind_address: ScopedBindAddress,
+    scope_id: u32,
     mut receiver: AirPlayReceiver<S>,
     mut ports: SharedBoundPorts,
     event_key_sender: mpsc::SyncSender<EventChannelKeys>,
@@ -1210,6 +1246,11 @@ fn run_listener<S: MfiSigner>(
                     .set_write_timeout(Some(io_timeout))
                     .map_err(|error| format!("setting AirPlay write timeout failed: {error}"))?;
                 set_stage(progress, AirPlayStage::Connected);
+                let mut video = VideoSession::new(
+                    event_command_sender.clone(),
+                    video_player_factory(media.as_ref()),
+                    scope_id,
+                );
                 return run_control_connection(
                     &mut stream,
                     &mut receiver,
@@ -1220,6 +1261,7 @@ fn run_listener<S: MfiSigner>(
                     progress,
                     cancellation,
                     media.as_ref(),
+                    &mut video,
                 )
                 .inspect_err(|_| set_stage(progress, AirPlayStage::Failed));
             }
@@ -1247,6 +1289,7 @@ fn run_control_connection<S: MfiSigner, W: Read + Write>(
     progress: &SharedProgress,
     cancellation: &CancellationToken,
     media: Option<&MediaController>,
+    video: &mut VideoSession,
 ) -> Result<(), String> {
     let mut codec = RtspCodec::new(RtspLimits::default())
         .map_err(|error| format!("initializing the RTSP parser failed: {error}"))?;
@@ -1285,6 +1328,7 @@ fn run_control_connection<S: MfiSigner, W: Read + Write>(
         if let Some(media) = media {
             check_first_screen_frame(&mut first_video, media, event_command_sender)?;
         }
+        video.poll();
         let read_buffer = if cipher.is_some() {
             &mut input[..]
         } else {
@@ -1347,6 +1391,16 @@ fn run_control_connection<S: MfiSigner, W: Read + Write>(
                 .handle(&request, transport, ports)
                 .map_err(|error| format!("handling AirPlay RTSP request failed: {error}"))?;
             keep_alive_armed |= output.events.contains(&ReceiverEvent::KeepAlive);
+            if output
+                .events
+                .iter()
+                .any(|event| matches!(event, ReceiverEvent::SessionNegotiated { .. }))
+            {
+                info!(
+                    enabled = ?receiver.negotiated_features(),
+                    "CarPlay session features enabled"
+                );
+            }
             let rejection = output.events.iter().find_map(|event| match event {
                 ReceiverEvent::Reset { reason, .. } => Some(reason.as_str()),
                 _ => None,
@@ -1384,6 +1438,7 @@ fn run_control_connection<S: MfiSigner, W: Read + Write>(
                 &mut data_channels,
                 progress,
             )?;
+            video.handle(&output.events);
             if !recording_reached
                 && progress
                     .lock()
@@ -1417,6 +1472,16 @@ fn run_control_connection<S: MfiSigner, W: Read + Write>(
             }
         }
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-media"))]
+fn video_player_factory(media: Option<&MediaController>) -> Option<Box<dyn PlayerFactory>> {
+    media.map(|media| Box::new(GstPlayerFactory::new(media.clone())) as Box<dyn PlayerFactory>)
+}
+
+#[cfg(not(all(target_os = "linux", feature = "linux-media")))]
+fn video_player_factory(_media: Option<&MediaController>) -> Option<Box<dyn PlayerFactory>> {
+    None
 }
 
 fn check_first_screen_frame(
@@ -1553,12 +1618,26 @@ fn prepare_media_output<S: MfiSigner>(
                     keep_alive_port = negotiated_ports.keep_alive_port.map(NonZeroU16::get),
                     "negotiated AirPlay session ports"
                 );
+                info!(
+                    offered = ?timing.offered_features,
+                    "the iPhone offered CarPlay session features"
+                );
                 let media = require_media(media)?;
                 let socket = ports
                     .take_timing_socket()
                     .map_err(|error| format!("claiming timing socket failed: {error}"))?
                     .ok_or_else(|| "timing socket was already claimed".to_owned())?;
                 media.start_timing(timing.clone(), socket)?;
+            }
+            ReceiverEvent::StreamNegotiated {
+                stream: StreamDescriptor::MessageChannel(channel),
+                ..
+            } => {
+                info!(
+                    stream_id = channel.stream_id,
+                    client_type = %channel.client_type_uuid,
+                    "CarPlay message stream negotiated"
+                );
             }
             ReceiverEvent::StreamNegotiated { stream, .. } => {
                 match stream {
@@ -1575,7 +1654,7 @@ fn prepare_media_output<S: MfiSigner>(
                         stream_type = screen.stream_type(),
                         "CarPlay screen stream negotiated"
                     ),
-                    StreamDescriptor::DataChannel(_) => {
+                    StreamDescriptor::DataChannel(_) | StreamDescriptor::MessageChannel(_) => {
                         unreachable!("data channels are matched before media streams")
                     }
                 }
@@ -1641,7 +1720,13 @@ fn prepare_media_output<S: MfiSigner>(
                             current.bluetooth_handoff_requested = true;
                         }
                     }
-                    Some(ControlEvent::HostUiRequested) | None => {}
+                    Some(
+                        ControlEvent::HostUiRequested
+                        | ControlEvent::VideoPlaybackRequested
+                        | ControlEvent::VideoProxyOffered(_)
+                        | ControlEvent::VideoMovedToAudioOnly,
+                    )
+                    | None => {}
                 }
             }
             ReceiverEvent::StreamsTornDown(streams) => {
@@ -1669,6 +1754,7 @@ fn prepare_media_output<S: MfiSigner>(
             }
             ReceiverEvent::ControlEncryptionReady { .. }
             | ReceiverEvent::MfiAuthenticated
+            | ReceiverEvent::StreamMessage { .. }
             | ReceiverEvent::InfoRequested
             | ReceiverEvent::ParametersSet(_)
             | ReceiverEvent::ParametersRequested(_)
@@ -1863,6 +1949,7 @@ fn run_event_connection_with_ambient<S: Read + Write>(
         .map_err(|error| format!("initializing the event RTSP parser failed: {error}"))?;
     let mut wire = InputWireSession::new();
     let mut pending_responses = BTreeSet::new();
+    let mut lenient_responses = BTreeSet::new();
     let mut last_timestamp = MonotonicTimestamp(0);
     let mut last_night_mode = None;
     if let Ok(mut progress) = progress.lock() {
@@ -1915,6 +2002,7 @@ fn run_event_connection_with_ambient<S: Read + Write>(
             &mut cipher,
             &mut wire,
             &mut pending_responses,
+            &mut lenient_responses,
             last_timestamp,
             command_receiver,
             &mut last_night_mode,
@@ -1948,7 +2036,13 @@ fn run_event_connection_with_ambient<S: Read + Write>(
                     .push(&plaintext)
                     .map_err(|error| format!("decoding AirPlay event RTSP failed: {error}"))?
                 {
-                    handle_event_message(stream, &mut cipher, message, &mut pending_responses)?;
+                    handle_event_message(
+                        stream,
+                        &mut cipher,
+                        message,
+                        &mut pending_responses,
+                        &mut lenient_responses,
+                    )?;
                 }
             }
             Err(error)
@@ -2030,6 +2124,7 @@ fn handle_event_message<W: Write>(
     cipher: &mut EventChannelCipher,
     message: EventChannelMessage,
     pending_responses: &mut BTreeSet<u32>,
+    lenient_responses: &mut BTreeSet<u32>,
 ) -> Result<(), String> {
     match message {
         EventChannelMessage::Request(request) => {
@@ -2060,6 +2155,14 @@ fn handle_event_message<W: Write>(
                 return Err(
                     "AirPlay event response was unexpected, duplicated, or replayed".to_owned(),
                 );
+            }
+            if lenient_responses.remove(&sequence) && response.status != 200 {
+                tracing::warn!(
+                    cseq = sequence,
+                    status = response.status,
+                    "the iPhone declined a CarPlay video command"
+                );
+                return Ok(());
             }
             if response.status != 200 {
                 return Err(format!(
@@ -2105,6 +2208,7 @@ fn process_event_worker_commands<W: Write>(
     cipher: &mut EventChannelCipher,
     wire: &mut InputWireSession,
     pending_responses: &mut BTreeSet<u32>,
+    lenient_responses: &mut BTreeSet<u32>,
     timestamp: MonotonicTimestamp,
     receiver: &mpsc::Receiver<EventWorkerCommand>,
     last_night_mode: &mut Option<bool>,
@@ -2148,6 +2252,18 @@ fn process_event_worker_commands<W: Write>(
                     .iap_message(&data, timestamp)
                     .map_err(|error| format!("encoding an iAP2 tunnel message failed: {error}"))?;
                 send_airplay_event(stream, cipher, event, pending_responses)?;
+            }
+            EventWorkerCommand::Command { body, stream_id } => {
+                let event = match wire.command(&body, stream_id, timestamp) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        tracing::warn!(%error, "dropping an unencodable CarPlay event command");
+                        continue;
+                    }
+                };
+                let sequence = event.sequence;
+                send_airplay_event(stream, cipher, event, pending_responses)?;
+                lenient_responses.insert(sequence);
             }
         }
     }
@@ -2433,6 +2549,7 @@ fn apply_events(progress: &SharedProgress, events: &[ReceiverEvent]) {
                 }
                 ReceiverEvent::InfoRequested
                 | ReceiverEvent::CommandReceived(_)
+                | ReceiverEvent::StreamMessage { .. }
                 | ReceiverEvent::ParametersSet(_)
                 | ReceiverEvent::ParametersRequested(_)
                 | ReceiverEvent::Flushed(_)
@@ -2512,7 +2629,7 @@ fn build_info_payload(
 ) -> Result<InfoPayload, String> {
     if !media.screen {
         return Err(
-            "AirPlay /info cannot claim a display without a preflighted H.264 backend".to_owned(),
+            "AirPlay /info cannot claim a display without a preflighted video backend".to_owned(),
         );
     }
     if media.microphone && !media.audio {
@@ -2560,6 +2677,9 @@ fn build_info_payload(
         ]),
     );
     info.insert("oemIconVisible".to_owned(), Value::Boolean(false));
+    if media.hevc {
+        info.insert("hevcInfo".to_owned(), Value::Dictionary(Dictionary::new()));
+    }
     info.insert(
         "displays".to_owned(),
         Value::Array(vec![Value::Dictionary(main_display(config))]),
@@ -3277,6 +3397,7 @@ mod tests {
                 screen: true,
                 audio: false,
                 microphone: false,
+                hevc: false,
             },
         )
         .expect("info");
@@ -3460,6 +3581,39 @@ mod tests {
     }
 
     #[test]
+    fn hevc_info_is_advertised_only_with_a_hardware_hevc_decoder() {
+        let identity = Iap2Config {
+            accessory_name: Some("Prelude".to_owned()),
+            model_identifier: Some("Prelude".to_owned()),
+            manufacturer: Some("Vanta Labs".to_owned()),
+            ..Iap2Config::default()
+        };
+        let info = |hevc| {
+            let payload = build_info_payload(
+                &DaemonConfig::default().airplay,
+                &identity,
+                [0x02, 0x11, 0x22, 0x33, 0x44, 0x55],
+                false,
+                ReceiverMediaClaims {
+                    screen: true,
+                    hevc,
+                    ..ReceiverMediaClaims::default()
+                },
+            )
+            .expect("info");
+            Value::from_reader(Cursor::new(payload.as_bytes()))
+                .expect("binary plist")
+                .into_dictionary()
+                .expect("dictionary")
+        };
+        assert_eq!(
+            info(true).get("hevcInfo"),
+            Some(&Value::Dictionary(Dictionary::new()))
+        );
+        assert!(!info(false).contains_key("hevcInfo"));
+    }
+
+    #[test]
     fn customized_dpi_is_advertised_in_carplay_info() {
         let mut config = DaemonConfig::default();
         RuntimeSettings {
@@ -3485,6 +3639,7 @@ mod tests {
                 screen: true,
                 audio: false,
                 microphone: false,
+                hevc: false,
             },
         )
         .expect("info");
@@ -3539,6 +3694,7 @@ mod tests {
                     screen: true,
                     audio: false,
                     microphone: false,
+                    hevc: false,
                 },
             )
             .expect("info");
@@ -3588,6 +3744,7 @@ mod tests {
                 screen: true,
                 audio: false,
                 microphone: false,
+                hevc: false,
             },
         )
         .expect("info");
@@ -3615,6 +3772,7 @@ mod tests {
                 screen: true,
                 audio: true,
                 microphone: true,
+                hevc: false,
             },
         )
         .expect("info");
@@ -3714,11 +3872,13 @@ mod tests {
             screen: true,
             audio: true,
             microphone: true,
+            hevc: false,
         };
         let advertised = ReceiverMediaClaims {
             screen: backend.screen,
             audio: backend.audio && !config.disable_audio_output,
             microphone: backend.microphone && !config.disable_audio_output,
+            hevc: false,
         };
         let info = build_info_payload(
             &config,
@@ -3822,6 +3982,7 @@ mod tests {
                     wifi_mac_address: None,
                     model: None,
                 },
+                offered_features: Vec::new(),
             })
             .expect("session ports");
         assert_ne!(session.timing_port, session.event_port);
@@ -3845,6 +4006,7 @@ mod tests {
                     wifi_mac_address: None,
                     model: None,
                 },
+                offered_features: Vec::new(),
             })
             .expect("session ports");
         assert!(ports.take_timing_socket().expect("timing").is_some());
@@ -3983,6 +4145,7 @@ mod tests {
             &progress(),
             &cancellation,
             None,
+            &mut VideoSession::new(command_sender.clone(), None, 0),
         );
         assert!(result.is_err(), "script ends by closing after its response");
         let response = String::from_utf8(io.written).expect("ASCII response");
@@ -4128,6 +4291,7 @@ mod tests {
                 &progress(),
                 &CancellationToken::default(),
                 None,
+                &mut VideoSession::new(command_sender.clone(), None, 0),
             )
             .is_err()
         );
@@ -4204,14 +4368,58 @@ mod tests {
         let mut cipher = EventChannelCipher::new(keys).expect("cipher");
         let response = EventChannelMessage::Response(RtspResponse::new(200, "OK"));
         let mut pending = BTreeSet::from([7]);
-        handle_event_message(&mut Vec::new(), &mut cipher, response.clone(), &mut pending)
-            .expect("single pending command");
+        handle_event_message(
+            &mut Vec::new(),
+            &mut cipher,
+            response.clone(),
+            &mut pending,
+            &mut BTreeSet::new(),
+        )
+        .expect("single pending command");
         assert!(pending.is_empty());
 
         let mut ordered = BTreeSet::from([7, 8]);
-        handle_event_message(&mut Vec::new(), &mut cipher, response, &mut ordered)
-            .expect("oldest pending command");
+        handle_event_message(
+            &mut Vec::new(),
+            &mut cipher,
+            response,
+            &mut ordered,
+            &mut BTreeSet::new(),
+        )
+        .expect("oldest pending command");
         assert_eq!(ordered, BTreeSet::from([8]));
+    }
+
+    #[test]
+    fn declined_video_commands_do_not_end_the_session() {
+        let (keys, _) = event_cipher_pair();
+        let mut cipher = EventChannelCipher::new(keys).expect("cipher");
+        let mut declined = RtspResponse::new(400, "Bad Request");
+        declined.headers.insert("cseq".to_owned(), "9".to_owned());
+        let declined = EventChannelMessage::Response(declined);
+        let mut pending = BTreeSet::from([9]);
+        let mut lenient = BTreeSet::from([9]);
+        handle_event_message(
+            &mut Vec::new(),
+            &mut cipher,
+            declined.clone(),
+            &mut pending,
+            &mut lenient,
+        )
+        .expect("a declined video command is tolerated");
+        assert!(pending.is_empty() && lenient.is_empty());
+
+        let mut pending = BTreeSet::from([9]);
+        assert!(
+            handle_event_message(
+                &mut Vec::new(),
+                &mut cipher,
+                declined,
+                &mut pending,
+                &mut BTreeSet::new(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

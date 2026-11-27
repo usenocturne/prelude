@@ -34,9 +34,31 @@ impl SiriSpeechMode {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct VideoProxyOffer {
+    pub url: String,
+    pub port: u16,
+    pub psk: Vec<u8>,
+    pub identity: Vec<u8>,
+    pub authorization: String,
+}
+
+impl std::fmt::Debug for VideoProxyOffer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VideoProxyOffer")
+            .field("url", &self.url)
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlEvent {
     HostUiRequested,
+    VideoPlaybackRequested,
+    VideoProxyOffered(VideoProxyOffer),
+    VideoMovedToAudioOnly,
     DisableBluetooth,
     DuckAudio {
         duration_ms: u32,
@@ -69,7 +91,20 @@ impl ControlEventDecoder {
             .and_then(Value::as_string)
             .ok_or_else(|| Error::MalformedWire("control command has no string type".to_owned()))?;
         match command_type {
-            "requestUI" => Ok(Some(ControlEvent::HostUiRequested)),
+            "requestUI" => {
+                let params = optional_params(&dictionary)?;
+                let url = params.get("url").and_then(Value::as_string);
+                Ok(Some(if url == Some("videoplayback:") {
+                    ControlEvent::VideoPlaybackRequested
+                } else {
+                    ControlEvent::HostUiRequested
+                }))
+            }
+            "setProxyParameters" => {
+                let params = optional_params(&dictionary)?;
+                Ok(decode_proxy_offer(params).map(ControlEvent::VideoProxyOffered))
+            }
+            "changeVideoPlaybackToAudioOnly" => Ok(Some(ControlEvent::VideoMovedToAudioOnly)),
             "disableBluetooth" => Ok(Some(ControlEvent::DisableBluetooth)),
             "duckAudio" => {
                 let params = optional_params(&dictionary)?;
@@ -126,6 +161,21 @@ impl ControlEventDecoder {
         self.speech_active = active;
         Ok(Some(ControlEvent::SiriSpeechChanged { mode, active }))
     }
+}
+
+fn decode_proxy_offer(params: &Dictionary) -> Option<VideoProxyOffer> {
+    let port = params
+        .get("proxyPort")
+        .and_then(Value::as_unsigned_integer)
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)?;
+    Some(VideoProxyOffer {
+        url: params.get("proxyUrl")?.as_string()?.to_owned(),
+        port,
+        psk: params.get("proxyPsk")?.as_data()?.to_vec(),
+        identity: params.get("proxyPskIdentity")?.as_data()?.to_vec(),
+        authorization: params.get("proxyAuthorization")?.as_string()?.to_owned(),
+    })
 }
 
 fn decode_dictionary(body: &[u8]) -> Result<Dictionary> {
@@ -276,6 +326,59 @@ mod tests {
             command.insert("params".to_owned(), Value::Dictionary(params));
         }
         encode(command)
+    }
+
+    #[test]
+    fn video_request_ui_and_proxy_parameters_decode() {
+        let mut decoder = ControlEventDecoder::default();
+        let mut video = Dictionary::new();
+        video.insert("url".to_owned(), Value::String("videoplayback:".to_owned()));
+        assert_eq!(
+            decoder
+                .decode(&command("requestUI", Some(video)))
+                .expect("decode"),
+            Some(ControlEvent::VideoPlaybackRequested)
+        );
+        let mut maps = Dictionary::new();
+        maps.insert("url".to_owned(), Value::String("maps:".to_owned()));
+        assert_eq!(
+            decoder
+                .decode(&command("requestUI", Some(maps)))
+                .expect("decode"),
+            Some(ControlEvent::HostUiRequested)
+        );
+
+        let mut proxy = Dictionary::new();
+        proxy.insert(
+            "proxyUrl".to_owned(),
+            Value::String("https://[fe80::1]".to_owned()),
+        );
+        proxy.insert("proxyPort".to_owned(), Value::from(49_152_u64));
+        proxy.insert("proxyPsk".to_owned(), Value::Data(vec![7; 32]));
+        proxy.insert("proxyPskIdentity".to_owned(), Value::Data(b"id".to_vec()));
+        proxy.insert(
+            "proxyAuthorization".to_owned(),
+            Value::String("Basic dXNlcjpwYXNz".to_owned()),
+        );
+        assert_eq!(
+            decoder
+                .decode(&command("setProxyParameters", Some(proxy.clone())))
+                .expect("decode"),
+            Some(ControlEvent::VideoProxyOffered(VideoProxyOffer {
+                url: "https://[fe80::1]".to_owned(),
+                port: 49_152,
+                psk: vec![7; 32],
+                identity: b"id".to_vec(),
+                authorization: "Basic dXNlcjpwYXNz".to_owned(),
+            }))
+        );
+        proxy.remove("proxyPsk");
+        assert_eq!(
+            decoder
+                .decode(&command("setProxyParameters", Some(proxy)))
+                .expect("decode"),
+            None
+        );
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub enum AirPlayEventKind {
     IapMessage {
         length: usize,
     },
+    Command {
+        stream_id: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,10 +182,50 @@ impl EventChannelEncoder {
         )
     }
 
+    pub fn encode_command(
+        &mut self,
+        body: &plist::Value,
+        stream_id: Option<u64>,
+        timestamp: MonotonicTimestamp,
+    ) -> Result<AirPlayEvent> {
+        let typed = body
+            .as_dictionary()
+            .and_then(|dictionary| dictionary.get("type"))
+            .and_then(plist::Value::as_string)
+            .is_some_and(|name| !name.is_empty());
+        if !typed && stream_id.is_none() {
+            return Err(Error::MalformedWire(
+                "an untyped event command must name its stream".to_owned(),
+            ));
+        }
+        let mut encoded = Vec::new();
+        body.to_writer_binary(&mut encoded)
+            .map_err(|error| Error::MalformedWire(format!("event plist failed: {error}")))?;
+        let headers = stream_id
+            .map(|stream_id| format!("X-Apple-StreamID: {stream_id}\r\n"))
+            .unwrap_or_default();
+        self.finish_with_headers(
+            AirPlayEventKind::Command { stream_id },
+            encoded,
+            &headers,
+            timestamp,
+        )
+    }
+
     fn finish(
         &mut self,
         kind: AirPlayEventKind,
         body: Vec<u8>,
+        timestamp: MonotonicTimestamp,
+    ) -> Result<AirPlayEvent> {
+        self.finish_with_headers(kind, body, "", timestamp)
+    }
+
+    fn finish_with_headers(
+        &mut self,
+        kind: AirPlayEventKind,
+        body: Vec<u8>,
+        headers: &str,
         timestamp: MonotonicTimestamp,
     ) -> Result<AirPlayEvent> {
         if let Some(previous) = self.last_timestamp {
@@ -205,7 +248,7 @@ impl EventChannelEncoder {
             .checked_add(1)
             .ok_or(Error::SequenceExhausted)?;
         let header = format!(
-            "POST /command RTSP/1.0\r\nContent-Type: {EVENT_CONTENT_TYPE}\r\nContent-Length: {}\r\nCSeq: {sequence}\r\n\r\n",
+            "POST /command RTSP/1.0\r\nContent-Type: {EVENT_CONTENT_TYPE}\r\nContent-Length: {}\r\nCSeq: {sequence}\r\n{headers}\r\n",
             body.len()
         );
         let mut message = Vec::with_capacity(header.len() + body.len());
@@ -490,6 +533,16 @@ impl InputWireSession {
         self.encoder.encode_iap_message(data, timestamp)
     }
 
+    pub fn command(
+        &mut self,
+        body: &plist::Value,
+        stream_id: Option<u64>,
+        timestamp: MonotonicTimestamp,
+    ) -> Result<AirPlayEvent> {
+        self.ensure_live()?;
+        self.encoder.encode_command(body, stream_id, timestamp)
+    }
+
     pub fn release_all(&mut self, timestamp: MonotonicTimestamp) -> Result<Vec<AirPlayEvent>> {
         self.ensure_live()?;
         let mut next_encoder = self.encoder.clone();
@@ -714,6 +767,32 @@ fn write_be(target: &mut Vec<u8>, value: u64, width: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_commands_carry_the_stream_header() {
+        let mut encoder = EventChannelEncoder::default();
+        let mut body = plist::Dictionary::new();
+        body.insert(
+            "params".to_owned(),
+            plist::Value::Dictionary(plist::Dictionary::new()),
+        );
+        let event = encoder
+            .encode_command(
+                &plist::Value::Dictionary(body.clone()),
+                Some(3),
+                MonotonicTimestamp(1),
+            )
+            .expect("stream command");
+        let text = String::from_utf8_lossy(&event.message);
+        assert!(text.starts_with("POST /command RTSP/1.0\r\n"));
+        assert!(text.contains("CSeq: 1\r\nX-Apple-StreamID: 3\r\n\r\nbplist00"));
+        assert_eq!(event.kind, AirPlayEventKind::Command { stream_id: Some(3) });
+        assert!(
+            encoder
+                .encode_command(&plist::Value::Dictionary(body), None, MonotonicTimestamp(2))
+                .is_err()
+        );
+    }
 
     fn hex(bytes: &[u8]) -> String {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";

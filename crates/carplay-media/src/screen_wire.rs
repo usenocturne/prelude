@@ -14,6 +14,15 @@ pub enum WireVideoCodec {
     H265,
 }
 
+impl WireVideoCodec {
+    pub fn is_random_access(self, unit_type: u8) -> bool {
+        match self {
+            Self::H264 => unit_type == 5,
+            Self::H265 => (16..=21).contains(&unit_type),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenWireState {
     Active,
@@ -52,6 +61,14 @@ pub struct EncryptedVideoFrame {
     pub nal_units: Vec<NalUnitDescriptor>,
     pub presentation_time_ns: Option<u64>,
     pub nonce_counter: u64,
+}
+
+impl EncryptedVideoFrame {
+    pub fn is_key_frame(&self) -> bool {
+        self.nal_units
+            .iter()
+            .any(|descriptor| self.codec.is_random_access(descriptor.unit_type))
+    }
 }
 
 impl std::fmt::Debug for EncryptedVideoFrame {
@@ -455,6 +472,18 @@ mod tests {
         let sealed = wire_crypto::seal(&KEY, &wire_crypto::nonce(counter), plaintext, &header)
             .expect("seal");
         [header.as_slice(), sealed.as_slice()].concat()
+    }
+
+    #[test]
+    fn random_access_pictures_depend_on_the_codec() {
+        assert!(WireVideoCodec::H264.is_random_access(5));
+        assert!(!WireVideoCodec::H264.is_random_access(1));
+        assert!(!WireVideoCodec::H264.is_random_access(19));
+        for unit_type in 16..=21 {
+            assert!(WireVideoCodec::H265.is_random_access(unit_type));
+        }
+        assert!(!WireVideoCodec::H265.is_random_access(1));
+        assert!(!WireVideoCodec::H265.is_random_access(5));
     }
 
     #[test]

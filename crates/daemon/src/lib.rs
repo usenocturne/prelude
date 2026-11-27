@@ -6,6 +6,7 @@ mod android_auto_latency;
 mod android_auto_runtime;
 mod audio_status;
 mod automatic_runtime;
+mod carplay_video;
 mod config;
 mod daemon;
 mod device_discovery;
@@ -15,6 +16,7 @@ mod error;
 mod first_video;
 #[cfg(any(test, all(target_os = "linux", feature = "linux-media")))]
 mod fonts;
+mod gstreamer_registry;
 mod h264_sps;
 mod hands_free;
 mod health;
@@ -60,6 +62,7 @@ pub use display_state::{
     persist_last_display_platform,
 };
 pub use error::{Error, Result};
+pub use gstreamer_registry::invalidate_stale_gstreamer_registry;
 pub use health::{ComponentHealth, HealthRegistry, HealthState, OverallHealth};
 pub use heartbeat::HeartbeatWriter;
 #[cfg(all(target_os = "linux", feature = "linux-media"))]

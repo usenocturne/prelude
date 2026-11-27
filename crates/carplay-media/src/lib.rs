@@ -69,6 +69,7 @@ pub use linux_backend::{
     AudioSinkStats, BackendFailure, LinuxAudioBackend, LinuxAudioBackendConfig,
     LinuxMicrophoneBackend, LinuxMicrophoneBackendConfig, LinuxVideoBackend,
     LinuxVideoBackendConfig, MicrophoneBackendEvent, MicrophoneCaptureLevel, MicrophoneInputRoute,
+    PCM_INPUT_CHANNELS, PCM_INPUT_SAMPLE_RATE, PcmInput, UrlPlayerStatus, UrlVideoPlayer,
     VideoBackendEvent, VideoSynchronizationTelemetry, VideoSynchronizationTelemetrySnapshot,
 };
 pub use microphone_wire::{

@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
         .init();
+    preluded::invalidate_stale_gstreamer_registry();
     let arguments = Arguments::parse();
     #[cfg(all(target_os = "linux", feature = "linux-media"))]
     if !arguments.diagnose

@@ -43,6 +43,16 @@ RDEPENDS:${PN} = " \
     gstreamer1.0-plugins-bad-faad \
     gstreamer1.0-plugins-bad-videoparsersbad \
     \
+    ca-certificates \
+    gstreamer1.0-plugins-base-playback \
+    gstreamer1.0-plugins-base-typefindfunctions \
+    gstreamer1.0-plugins-bad-hls \
+    gstreamer1.0-plugins-good-id3demux \
+    gstreamer1.0-plugins-good-isomp4 \
+    gstreamer1.0-plugins-good-soup \
+    gstreamer1.0-plugins-bad-mpegtsdemux \
+    gstreamer1.0-libav \
+    \
     kernel-module-snd-usb-audio \
     kernel-module-usb-storage \
     kernel-module-uas \

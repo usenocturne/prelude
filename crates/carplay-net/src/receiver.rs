@@ -15,9 +15,10 @@ use crate::{
     negotiation::{
         ALTERNATE_AUDIO_STREAM_TYPE, ALTERNATE_SCREEN_STREAM_TYPE, AudioDescriptor,
         AudioStreamKind, DATA_CHANNEL_STREAM_TYPE, DataChannelDescriptor, HIGH_AUDIO_STREAM_TYPE,
-        MAIN_AUDIO_STREAM_TYPE, MAIN_SCREEN_STREAM_TYPE, MicrophoneDescriptor, PeerIdentity,
-        PortProvider, ScreenDescriptor, ScreenKind, SessionPorts, StreamDescriptor, StreamKey,
-        StreamPorts, TimingDescriptor,
+        MAIN_AUDIO_STREAM_TYPE, MAIN_SCREEN_STREAM_TYPE, MessageChannelDescriptor,
+        MicrophoneDescriptor, PeerIdentity, PortProvider, ScreenDescriptor, ScreenKind,
+        SessionPorts, StreamDescriptor, StreamKey, StreamPorts, TimingDescriptor,
+        VIDEO_PLAYBACK_CLIENT_TYPE,
     },
     plist_codec,
 };
@@ -167,6 +168,7 @@ pub struct ReceiverConfig {
     info: InfoPayload,
     pairing_timeout: Duration,
     enabled_features: Vec<String>,
+    conditional_features: Vec<(String, Dictionary)>,
     limits: ReceiverLimits,
 }
 
@@ -179,6 +181,14 @@ impl std::fmt::Debug for ReceiverConfig {
             .field("info_bytes", &self.info.encoded.len())
             .field("pairing_timeout", &self.pairing_timeout)
             .field("enabled_features", &self.enabled_features)
+            .field(
+                "conditional_features",
+                &self
+                    .conditional_features
+                    .iter()
+                    .map(|(feature, _)| feature)
+                    .collect::<Vec<_>>(),
+            )
             .field("limits", &self.limits)
             .finish()
     }
@@ -196,6 +206,7 @@ impl ReceiverConfig {
             info,
             pairing_timeout: Duration::from_secs(15),
             enabled_features: Vec::new(),
+            conditional_features: Vec::new(),
             limits: ReceiverLimits::default(),
         }
     }
@@ -207,6 +218,16 @@ impl ReceiverConfig {
 
     pub fn with_enabled_features(mut self, features: Vec<String>) -> Self {
         self.enabled_features = features;
+        self
+    }
+
+    pub fn with_conditional_feature(
+        mut self,
+        feature: impl Into<String>,
+        info_entries: Dictionary,
+    ) -> Self {
+        self.conditional_features
+            .push((feature.into(), info_entries));
         self
     }
 
@@ -247,6 +268,10 @@ pub enum ReceiverEvent {
     RecordingStarted,
     ParametersSet(ParameterPacket),
     CommandReceived(Vec<u8>),
+    StreamMessage {
+        stream_id: u64,
+        payload: Vec<u8>,
+    },
     ParametersRequested(Vec<String>),
     Flushed(FlushPoint),
     KeepAlive,
@@ -294,6 +319,8 @@ pub struct AirPlayReceiver<S: MfiSigner> {
     session_id: String,
     info: InfoPayload,
     enabled_features: Vec<String>,
+    conditional_features: Vec<(String, Dictionary)>,
+    negotiated_features: Vec<String>,
     limits: ReceiverLimits,
     recent_cseqs: VecDeque<u64>,
     session_ports: Option<SessionPorts>,
@@ -329,10 +356,16 @@ impl<S: MfiSigner> AirPlayReceiver<S> {
         let limits = config.limits.validate()?;
         plist_codec::decode_dictionary(config.info.as_bytes(), limits.plist)?;
         validate_token("session identifier", &config.session_id, 128)?;
-        if config.enabled_features.len() > 32
+        if config.enabled_features.len() + config.conditional_features.len() > 32
             || config
                 .enabled_features
                 .iter()
+                .chain(
+                    config
+                        .conditional_features
+                        .iter()
+                        .map(|(feature, _)| feature),
+                )
                 .any(|feature| validate_token("enabled feature", feature, 128).is_err())
         {
             return Err(Error::InvalidRtsp(
@@ -355,6 +388,8 @@ impl<S: MfiSigner> AirPlayReceiver<S> {
             session_id: config.session_id,
             info: config.info,
             enabled_features: config.enabled_features,
+            conditional_features: config.conditional_features,
+            negotiated_features: Vec::new(),
             limits,
             recent_cseqs: VecDeque::with_capacity(RECENT_CSEQ_WINDOW),
             session_ports: None,
@@ -381,6 +416,10 @@ impl<S: MfiSigner> AirPlayReceiver<S> {
 
     pub fn state(&self) -> ReceiverState {
         self.state
+    }
+
+    pub fn negotiated_features(&self) -> &[String] {
+        &self.negotiated_features
     }
 
     pub fn pair_verify_failure_reason(&self) -> Option<&'static str> {
@@ -478,15 +517,56 @@ impl<S: MfiSigner> AirPlayReceiver<S> {
         if !content_type_is(request, PLIST_CONTENT_TYPE) || request.body.is_empty() {
             return self.reject(400, "Bad Request", "invalid command plist content type");
         }
-        if plist_codec::decode_dictionary(&request.body, self.limits.plist).is_err() {
+        let Ok(dictionary) = plist_codec::decode_dictionary(&request.body, self.limits.plist)
+        else {
             return self.reject(400, "Bad Request", "malformed command plist");
-        }
-        let response = ok_response();
+        };
+        let event = if dictionary.contains_key("type") {
+            ReceiverEvent::CommandReceived(request.body.clone())
+        } else {
+            match self.stream_message(request, &dictionary) {
+                Ok(event) => event,
+                Err(reason) => return self.reject(400, "Bad Request", reason),
+            }
+        };
         ReceiverOutput {
-            response,
-            events: vec![ReceiverEvent::CommandReceived(request.body.clone())],
+            response: ok_response(),
+            events: vec![event],
             control_keys: None,
         }
+    }
+
+    fn stream_message(
+        &self,
+        request: &RtspRequest,
+        dictionary: &Dictionary,
+    ) -> std::result::Result<ReceiverEvent, &'static str> {
+        let stream_id = request
+            .headers
+            .get("x-apple-streamid")
+            .ok_or("untyped command carried no stream identifier")?
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "command stream identifier is not an integer")?;
+        let negotiated = self.streams.values().any(|stream| {
+            matches!(
+                &stream.descriptor,
+                StreamDescriptor::MessageChannel(channel) if channel.stream_id == stream_id
+            )
+        });
+        if !negotiated {
+            return Err("command names a stream that was not negotiated");
+        }
+        let payload = dictionary
+            .get("params")
+            .and_then(Value::as_dictionary)
+            .and_then(|params| params.get("data"))
+            .and_then(Value::as_data)
+            .ok_or("stream command carried no data")?;
+        Ok(ReceiverEvent::StreamMessage {
+            stream_id,
+            payload: payload.to_vec(),
+        })
     }
 
     fn feedback(&mut self, request: &RtspRequest) -> ReceiverOutput {
@@ -780,12 +860,33 @@ impl<S: MfiSigner> AirPlayReceiver<S> {
         response
             .headers
             .insert("content-type".to_owned(), PLIST_CONTENT_TYPE.to_owned());
-        response.body = self.info.encoded.clone();
+        response.body = self.negotiated_info()?;
         Ok(ReceiverOutput {
             response,
             events: vec![ReceiverEvent::InfoRequested],
             control_keys: None,
         })
+    }
+
+    fn negotiated_info(&self) -> Result<Vec<u8>> {
+        let extensions: Vec<&Dictionary> = self
+            .conditional_features
+            .iter()
+            .filter(|(feature, entries)| {
+                !entries.is_empty() && self.negotiated_features.contains(feature)
+            })
+            .map(|(_, entries)| entries)
+            .collect();
+        if extensions.is_empty() {
+            return Ok(self.info.encoded.clone());
+        }
+        let mut info = plist_codec::decode_dictionary(&self.info.encoded, self.limits.plist)?;
+        for entries in extensions {
+            for (key, value) in entries {
+                info.insert(key.clone(), value.clone());
+            }
+        }
+        plist_codec::encode(&Value::Dictionary(info), self.limits.plist)
     }
 
     fn setup<P: PortProvider>(
@@ -835,8 +936,21 @@ impl<S: MfiSigner> AirPlayReceiver<S> {
                 "keepalive port did not match the peer's low-power request",
             ));
         }
-        let response_body =
-            session_setup_response(ports, &self.enabled_features, self.limits.plist)?;
+        let negotiated: Vec<String> = self
+            .conditional_features
+            .iter()
+            .map(|(feature, _)| feature)
+            .filter(|feature| timing.offered_features.contains(feature))
+            .cloned()
+            .collect();
+        let enabled: Vec<String> = self
+            .enabled_features
+            .iter()
+            .chain(&negotiated)
+            .cloned()
+            .collect();
+        let response_body = session_setup_response(ports, &enabled, self.limits.plist)?;
+        self.negotiated_features = negotiated;
         self.session_ports = Some(ports);
         self.state = ReceiverState::SessionConfigured;
         let response = plist_response(response_body);
@@ -868,7 +982,7 @@ impl<S: MfiSigner> AirPlayReceiver<S> {
         if let Some(output) = self.require_session(request) {
             return Ok(output);
         }
-        let descriptors = match parse_streams(dictionary, self.limits.maximum_streams) {
+        let mut descriptors = match parse_streams(dictionary, self.limits.maximum_streams) {
             Ok(descriptors) => descriptors,
             Err(Error::Unsupported(_)) => {
                 return Ok(self.reject(
@@ -888,6 +1002,22 @@ impl<S: MfiSigner> AirPlayReceiver<S> {
                 ));
             }
         };
+        let open_data_channels = self
+            .streams
+            .values()
+            .filter(|stream| stream.descriptor.stream_type() == DATA_CHANNEL_STREAM_TYPE)
+            .count();
+        let mut next_stream_id = open_data_channels as u64 + 1;
+        for descriptor in &mut descriptors {
+            match descriptor {
+                StreamDescriptor::MessageChannel(channel) => {
+                    channel.stream_id = next_stream_id;
+                    next_stream_id += 1;
+                }
+                StreamDescriptor::DataChannel(_) => next_stream_id += 1,
+                StreamDescriptor::Screen(_) | StreamDescriptor::Audio(_) => {}
+            }
+        }
         let mut keys = BTreeSet::new();
         for descriptor in &descriptors {
             if !keys.insert(descriptor.key()) || self.streams.contains_key(&descriptor.key()) {
@@ -910,11 +1040,6 @@ impl<S: MfiSigner> AirPlayReceiver<S> {
             }
             negotiated.push((descriptor, ports));
         }
-        let open_data_channels = self
-            .streams
-            .values()
-            .filter(|stream| matches!(stream.descriptor, StreamDescriptor::DataChannel(_)))
-            .count();
         let response_body =
             streams_setup_response(&negotiated, open_data_channels, self.limits.plist)?;
         let mut events = Vec::with_capacity(negotiated.len());
@@ -1337,7 +1462,28 @@ fn parse_timing(dictionary: &Dictionary) -> Result<TimingDescriptor> {
             wifi_mac_address: optional_string(dictionary, "macAddress", 64)?,
             model: optional_string(dictionary, "model", 256)?,
         },
+        offered_features: parse_offered_features(dictionary)?,
     })
+}
+
+fn parse_offered_features(dictionary: &Dictionary) -> Result<Vec<String>> {
+    let Some(features) = dictionary.get("features") else {
+        return Ok(Vec::new());
+    };
+    let features = features
+        .as_array()
+        .ok_or_else(|| Error::InvalidRtsp("plist field features is not an array".to_owned()))?;
+    if features.len() > 64 {
+        return Err(Error::InvalidRtsp(
+            "session SETUP offers too many features".to_owned(),
+        ));
+    }
+    Ok(features
+        .iter()
+        .filter_map(Value::as_string)
+        .filter(|feature| feature.len() <= 128)
+        .map(str::to_owned)
+        .collect())
 }
 
 fn parse_streams(dictionary: &Dictionary, maximum: usize) -> Result<Vec<StreamDescriptor>> {
@@ -1389,12 +1535,23 @@ fn parse_stream(dictionary: &Dictionary) -> Result<StreamDescriptor> {
         .try_into()
         .map_err(|_| Error::InvalidRtsp("SETUP stream type exceeds u16".to_owned()))?;
     if stream_type == DATA_CHANNEL_STREAM_TYPE {
+        let client_type_uuid = optional_string(dictionary, "clientTypeUUID", 64)?;
+        if client_type_uuid
+            .as_deref()
+            .is_some_and(|uuid| uuid.eq_ignore_ascii_case(VIDEO_PLAYBACK_CLIENT_TYPE))
+        {
+            return Ok(StreamDescriptor::MessageChannel(MessageChannelDescriptor {
+                stream_id: 0,
+                client_type_uuid: VIDEO_PLAYBACK_CLIENT_TYPE.to_owned(),
+                client_uuid: optional_string(dictionary, "clientUUID", 128)?,
+            }));
+        }
         let seed = optional_u64_identifier(dictionary, "seed")?
             .ok_or_else(|| Error::InvalidRtsp("data channel SETUP has no seed".to_owned()))?;
         return Ok(StreamDescriptor::DataChannel(DataChannelDescriptor {
             seed,
             channel_id: optional_string(dictionary, "channelID", 64)?,
-            client_type_uuid: optional_string(dictionary, "clientTypeUUID", 64)?,
+            client_type_uuid,
         }));
     }
     let connection_id = optional_u64_identifier(dictionary, "streamConnectionID")?
@@ -1511,6 +1668,13 @@ fn streams_setup_response(
                         "dataPort".to_owned(),
                         Value::Integer(u64::from(data_port.get()).into()),
                     );
+                }
+                StreamPorts::MessageChannel => {
+                    dictionary.insert(
+                        "streamID".to_owned(),
+                        Value::Integer(descriptor.connection_id().into()),
+                    );
+                    next_data_stream_id += 1;
                 }
                 StreamPorts::Audio {
                     data_port,
@@ -1729,6 +1893,7 @@ mod tests {
                 StreamDescriptor::DataChannel(_) => StreamPorts::DataChannel {
                     data_port: port(48_003),
                 },
+                StreamDescriptor::MessageChannel(_) => StreamPorts::MessageChannel,
             })
         }
     }
@@ -2633,6 +2798,209 @@ mod tests {
         assert_eq!(teardown.response.status, 200);
         assert_eq!(teardown.events, vec![ReceiverEvent::SessionTornDown]);
         assert_eq!(receiver.state(), ReceiverState::Teardown);
+    }
+
+    fn video_receiver() -> (TempDir, AirPlayReceiver<FixedSigner>) {
+        let temporary = TempDir::new().expect("temporary");
+        let store = Arc::new(PairingStore::open(temporary.path()).expect("store"));
+        let identity = Arc::new(store.load_or_create_identity().expect("identity"));
+        let mut entries = Dictionary::new();
+        entries.insert("videoPlaybackInfo".to_owned(), Value::Boolean(true));
+        let config = ReceiverConfig::new("3939", "cp-session-1", empty_info())
+            .with_enabled_features(vec!["viewAreas".to_owned()])
+            .with_conditional_feature("videoPlayback", entries);
+        let receiver =
+            AirPlayReceiver::new(config, store, identity, FixedSigner).expect("receiver");
+        (temporary, receiver)
+    }
+
+    fn offer_session(
+        receiver: &mut AirPlayReceiver<FixedSigner>,
+        ports: &mut FixedPorts,
+        offered: &[&str],
+    ) -> Dictionary {
+        let mut body = Dictionary::new();
+        body.insert("timingPort".to_owned(), Value::Integer(7_010_u64.into()));
+        body.insert("keepAliveLowPower".to_owned(), Value::Boolean(true));
+        body.insert(
+            "features".to_owned(),
+            Value::Array(
+                offered
+                    .iter()
+                    .map(|feature| Value::String((*feature).to_owned()))
+                    .collect(),
+            ),
+        );
+        let output = receiver
+            .handle(
+                &request(
+                    "SETUP",
+                    "rtsp://fe80::1/1",
+                    2,
+                    Some(PLIST_CONTENT_TYPE),
+                    false,
+                    encoded_dictionary(body),
+                ),
+                ControlTransport::Encrypted,
+                ports,
+            )
+            .expect("session setup");
+        assert_eq!(output.response.status, 200);
+        plist_codec::decode_dictionary(&output.response.body, PlistLimits::default())
+            .expect("session response")
+    }
+
+    fn enabled(response: &Dictionary) -> Vec<&str> {
+        response
+            .get("enabledFeatures")
+            .and_then(Value::as_array)
+            .expect("enabled features")
+            .iter()
+            .filter_map(Value::as_string)
+            .collect()
+    }
+
+    fn info_dictionary(
+        receiver: &mut AirPlayReceiver<FixedSigner>,
+        ports: &mut FixedPorts,
+    ) -> Dictionary {
+        let output = receiver
+            .handle(
+                &request("GET", "/info", 3, None, true, Vec::new()),
+                ControlTransport::Encrypted,
+                ports,
+            )
+            .expect("info");
+        assert_eq!(output.response.status, 200);
+        plist_codec::decode_dictionary(&output.response.body, PlistLimits::default())
+            .expect("info plist")
+    }
+
+    #[test]
+    fn conditional_feature_is_enabled_only_when_the_phone_offers_it() {
+        let mut ports = FixedPorts;
+        let (_temporary, mut declined) = video_receiver();
+        authenticate(&mut declined, &mut ports, 1);
+        let response = offer_session(&mut declined, &mut ports, &["hevc"]);
+        assert_eq!(enabled(&response), vec!["viewAreas"]);
+        assert!(declined.negotiated_features().is_empty());
+        assert!(!info_dictionary(&mut declined, &mut ports).contains_key("videoPlaybackInfo"));
+
+        let (_temporary, mut accepted) = video_receiver();
+        authenticate(&mut accepted, &mut ports, 1);
+        let response = offer_session(&mut accepted, &mut ports, &["videoPlayback", "hevc"]);
+        assert_eq!(enabled(&response), vec!["viewAreas", "videoPlayback"]);
+        assert_eq!(accepted.negotiated_features(), ["videoPlayback"]);
+        assert_eq!(
+            info_dictionary(&mut accepted, &mut ports).get("videoPlaybackInfo"),
+            Some(&Value::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn video_playback_stream_is_a_message_channel_without_a_port() {
+        let mut ports = FixedPorts;
+        let (_temporary, mut receiver) = video_receiver();
+        authenticate(&mut receiver, &mut ports, 1);
+        offer_session(&mut receiver, &mut ports, &["videoPlayback"]);
+        let mut stream = Dictionary::new();
+        stream.insert(
+            "type".to_owned(),
+            Value::Integer(u64::from(DATA_CHANNEL_STREAM_TYPE).into()),
+        );
+        stream.insert(
+            "clientTypeUUID".to_owned(),
+            Value::String(VIDEO_PLAYBACK_CLIENT_TYPE.to_lowercase()),
+        );
+        stream.insert(
+            "clientUUID".to_owned(),
+            Value::String("client-1".to_owned()),
+        );
+        let mut body = Dictionary::new();
+        body.insert(
+            "streams".to_owned(),
+            Value::Array(vec![Value::Dictionary(stream)]),
+        );
+        let output = receiver
+            .handle(
+                &request(
+                    "SETUP",
+                    "/",
+                    4,
+                    Some(PLIST_CONTENT_TYPE),
+                    true,
+                    encoded_dictionary(body),
+                ),
+                ControlTransport::Encrypted,
+                &mut ports,
+            )
+            .expect("message channel setup");
+        assert_eq!(output.response.status, 200);
+        assert_eq!(
+            output.events,
+            vec![ReceiverEvent::StreamNegotiated {
+                stream: StreamDescriptor::MessageChannel(MessageChannelDescriptor {
+                    stream_id: 1,
+                    client_type_uuid: VIDEO_PLAYBACK_CLIENT_TYPE.to_owned(),
+                    client_uuid: Some("client-1".to_owned()),
+                }),
+                ports: StreamPorts::MessageChannel,
+            }]
+        );
+        let response =
+            plist_codec::decode_dictionary(&output.response.body, PlistLimits::default())
+                .expect("response plist");
+        let stream = response
+            .get("streams")
+            .and_then(Value::as_array)
+            .expect("streams")[0]
+            .as_dictionary()
+            .expect("stream");
+        assert_eq!(optional_u64(stream, "streamID").expect("id"), Some(1));
+        assert!(!stream.contains_key("dataPort"));
+
+        let mut params = Dictionary::new();
+        params.insert("data".to_owned(), Value::Data(b"bplist00payload".to_vec()));
+        let mut command = Dictionary::new();
+        command.insert("params".to_owned(), Value::Dictionary(params));
+        let mut message = request(
+            "POST",
+            "/command",
+            5,
+            Some(PLIST_CONTENT_TYPE),
+            false,
+            encoded_dictionary(command.clone()),
+        );
+        message
+            .headers
+            .insert("x-apple-streamid".to_owned(), "1".to_owned());
+        let output = receiver
+            .handle(&message, ControlTransport::Encrypted, &mut ports)
+            .expect("stream message");
+        assert_eq!(output.response.status, 200);
+        assert_eq!(
+            output.events,
+            vec![ReceiverEvent::StreamMessage {
+                stream_id: 1,
+                payload: b"bplist00payload".to_vec(),
+            }]
+        );
+
+        let mut stranger = request(
+            "POST",
+            "/command",
+            6,
+            Some(PLIST_CONTENT_TYPE),
+            false,
+            encoded_dictionary(command),
+        );
+        stranger
+            .headers
+            .insert("x-apple-streamid".to_owned(), "9".to_owned());
+        let output = receiver
+            .handle(&stranger, ControlTransport::Encrypted, &mut ports)
+            .expect("unknown stream message");
+        assert_eq!(output.response.status, 400);
     }
 
     #[test]

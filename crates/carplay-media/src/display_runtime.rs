@@ -80,6 +80,18 @@ impl fmt::Debug for LinuxDisplayHandle {
 }
 
 impl LinuxDisplayHandle {
+    #[cfg(test)]
+    pub(crate) fn detached_for_test() -> Self {
+        Self {
+            shared: Arc::new(SharedDisplay::default()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latest_video_for_test(&self) -> Option<Arc<[u8]>> {
+        self.shared.state.lock().ok()?.video.clone()
+    }
+
     pub fn submit_video(&self, frame: Vec<u8>) -> Result<()> {
         self.replace_frame(frame, false)
     }
@@ -272,7 +284,7 @@ impl LinuxDisplayHandle {
         Ok(())
     }
 
-    pub(crate) fn submit_video_for_source(&self, source: u64, frame: Vec<u8>) -> Result<()> {
+    pub fn submit_video_for_source(&self, source: u64, frame: Vec<u8>) -> Result<()> {
         validate_frame(&frame)?;
         let frame = Arc::<[u8]>::from(frame);
         let mut state = self
@@ -307,7 +319,7 @@ impl LinuxDisplayHandle {
             .unwrap_or_default()
     }
 
-    pub(crate) fn register_video_source(&self) -> Result<u64> {
+    pub fn register_video_source(&self) -> Result<u64> {
         let mut state = self
             .shared
             .state
@@ -326,7 +338,7 @@ impl LinuxDisplayHandle {
         Ok(source)
     }
 
-    pub(crate) fn unregister_video_source(&self, source: u64) -> Result<()> {
+    pub fn unregister_video_source(&self, source: u64) -> Result<()> {
         let mut state = self
             .shared
             .state

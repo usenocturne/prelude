@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use crate::{
     EncryptedVideoFrame, Error, MAXIMUM_BACKEND_FRAME_BYTES, Result, VideoCodecConfiguration,
-    VideoPipelinePlan, WireVideoCodec,
+    VideoPipelinePlan,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,7 +243,7 @@ impl VideoIngressBuffer {
     }
 
     pub fn submit_configuration(&self, configuration: VideoCodecConfiguration) -> Result<()> {
-        VideoPipelinePlan::h264(&configuration)?;
+        VideoPipelinePlan::new(&configuration)?;
         let mut state = self.lock()?;
         require_open(&state)?;
         if state.configuration.as_ref() == Some(&configuration) {
@@ -267,15 +267,7 @@ impl VideoIngressBuffer {
                 "video frame is empty or exceeds the backend bound".to_owned(),
             ));
         }
-        if frame.codec != WireVideoCodec::H264 {
-            return Err(Error::Unsupported(
-                "the target media backend currently supports H.264 only",
-            ));
-        }
-        let keyframe = frame
-            .nal_units
-            .iter()
-            .any(|descriptor| descriptor.unit_type == 5);
+        let keyframe = frame.is_key_frame();
         let mut state = self.lock()?;
         require_open(&state)?;
         let Some(configuration) = state.configuration.as_ref() else {
@@ -397,7 +389,7 @@ fn remove_all_frames(commands: &mut VecDeque<VideoCommand>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NalUnitDescriptor;
+    use crate::{NalUnitDescriptor, WireVideoCodec};
 
     fn configuration() -> VideoCodecConfiguration {
         VideoCodecConfiguration {
@@ -460,6 +452,29 @@ mod tests {
         );
         assert_eq!(
             queue.submit_frame(frame(5, 2)).expect("key"),
+            VideoFrameDisposition::Queued
+        );
+    }
+
+    #[test]
+    fn hevc_frames_wait_for_a_random_access_picture() {
+        let queue = VideoIngressBuffer::new(VideoBackpressureConfig::default()).expect("queue");
+        queue
+            .submit_configuration(VideoCodecConfiguration {
+                codec: WireVideoCodec::H265,
+                ..configuration()
+            })
+            .expect("config");
+        let hevc = |unit_type, marker| EncryptedVideoFrame {
+            codec: WireVideoCodec::H265,
+            ..frame(unit_type, marker)
+        };
+        assert_eq!(
+            queue.submit_frame(hevc(1, 1)).expect("delta"),
+            VideoFrameDisposition::DroppedAwaitingKeyframe
+        );
+        assert_eq!(
+            queue.submit_frame(hevc(19, 2)).expect("key"),
             VideoFrameDisposition::Queued
         );
     }

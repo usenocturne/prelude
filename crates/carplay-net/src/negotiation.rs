@@ -8,6 +8,7 @@ pub const MAIN_AUDIO_STREAM_TYPE: u16 = 100;
 pub const ALTERNATE_AUDIO_STREAM_TYPE: u16 = 101;
 pub const HIGH_AUDIO_STREAM_TYPE: u16 = 102;
 pub const DATA_CHANNEL_STREAM_TYPE: u16 = 130;
+pub const VIDEO_PLAYBACK_CLIENT_TYPE: &str = "A6B27562-B43A-4F2D-B75F-82391E250194";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ScreenKind {
@@ -35,6 +36,7 @@ pub struct TimingDescriptor {
     pub peer_timing_port: Option<NonZeroU16>,
     pub low_power_keepalive: bool,
     pub peer: PeerIdentity,
+    pub offered_features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,10 +97,18 @@ pub struct DataChannelDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageChannelDescriptor {
+    pub stream_id: u64,
+    pub client_type_uuid: String,
+    pub client_uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamDescriptor {
     Screen(ScreenDescriptor),
     Audio(AudioDescriptor),
     DataChannel(DataChannelDescriptor),
+    MessageChannel(MessageChannelDescriptor),
 }
 
 impl StreamDescriptor {
@@ -106,7 +116,7 @@ impl StreamDescriptor {
         match self {
             Self::Screen(screen) => screen.stream_type(),
             Self::Audio(audio) => audio.stream_type(),
-            Self::DataChannel(_) => DATA_CHANNEL_STREAM_TYPE,
+            Self::DataChannel(_) | Self::MessageChannel(_) => DATA_CHANNEL_STREAM_TYPE,
         }
     }
 
@@ -115,6 +125,7 @@ impl StreamDescriptor {
             Self::Screen(screen) => screen.connection_id,
             Self::Audio(audio) => audio.connection_id,
             Self::DataChannel(channel) => channel.seed,
+            Self::MessageChannel(channel) => channel.stream_id,
         }
     }
 
@@ -144,6 +155,7 @@ pub enum StreamPorts {
     DataChannel {
         data_port: NonZeroU16,
     },
+    MessageChannel,
 }
 
 impl StreamPorts {
@@ -153,6 +165,7 @@ impl StreamPorts {
             (Self::Screen { .. }, StreamDescriptor::Screen(_))
                 | (Self::Audio { .. }, StreamDescriptor::Audio(_))
                 | (Self::DataChannel { .. }, StreamDescriptor::DataChannel(_))
+                | (Self::MessageChannel, StreamDescriptor::MessageChannel(_))
         )
     }
 }

@@ -6,7 +6,7 @@ use std::{
     net::{SocketAddr, SocketAddrV6, TcpListener, UdpSocket},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -20,8 +20,8 @@ use prelude_media::{
     Error as MediaError, LinuxAudioBackend, LinuxAudioBackendConfig, LinuxDisplayHandle,
     LinuxMicrophoneBackend, LinuxMicrophoneBackendConfig, LinuxVideoBackend,
     LinuxVideoBackendConfig, MicrophoneBackendEvent, MicrophoneCodec, MicrophoneConfig,
-    MicrophoneInputRoute, MicrophonePacketizer, NtpTimestamp, ScreenWireDecoder, ScreenWireEvent,
-    ScreenWireLimits, TimingCodec, TimingEvent, UsbDacMatcher, VideoBackendEvent,
+    MicrophoneInputRoute, MicrophonePacketizer, NtpTimestamp, PcmInput, ScreenWireDecoder,
+    ScreenWireEvent, ScreenWireLimits, TimingCodec, TimingEvent, UsbDacMatcher, VideoBackendEvent,
     VideoSynchronizationTelemetry, VideoSynchronizationTelemetrySnapshot,
 };
 use prelude_net::{
@@ -45,6 +45,8 @@ type RecordedDuckingEvents = Arc<Mutex<Vec<(bool, Option<f64>, u32)>>>;
 const COMMAND_CAPACITY: usize = 32;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const VIDEO_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(10);
+const SCREEN_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
+const SCREEN_RELEASE_POLL: Duration = Duration::from_millis(10);
 const MAXIMUM_UDP_PACKET_BYTES: usize = 64 * 1024;
 const MAXIMUM_AUDIO_CONTROL_BYTES: usize = 2 * 1024;
 const MAXIMUM_AUDIO_PREROLL_BYTES: usize = 512 * 1024;
@@ -101,6 +103,7 @@ pub(crate) struct MediaCapabilities {
     pub screen: bool,
     pub audio: bool,
     pub microphone: bool,
+    pub hevc: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -219,6 +222,20 @@ enum MediaCommand {
     TestTone(SyncSender<Result<(), String>>),
     Flush(FlushPoint, SyncSender<Result<(), String>>),
     Teardown(Vec<StreamKey>, SyncSender<Result<(), String>>),
+    BeginVideoPlayback(SyncSender<Result<VideoOutputs, String>>),
+    EndVideoPlayback(SyncSender<Result<(), String>>),
+}
+
+#[derive(Debug)]
+pub(crate) struct VideoOutputs {
+    pub(crate) display: LinuxDisplayHandle,
+    pub(crate) audio: Option<PcmInput>,
+}
+
+#[derive(Debug, Default)]
+struct ScreenSuspension {
+    requested: AtomicBool,
+    decoder_active: AtomicBool,
 }
 
 struct MediaSupervisor {
@@ -248,7 +265,9 @@ struct MediaSupervisor {
     ducked_main_gain: Option<f64>,
     feedback_clock: Arc<FeedbackClock>,
     screen_frames: Arc<AtomicU64>,
+    screen_suspension: Arc<ScreenSuspension>,
     recording_requested: bool,
+    video_audio_mixer: bool,
     flush_state: Arc<Mutex<AudioFlushState>>,
     audio_stream_latencies: Arc<Mutex<Vec<AudioStreamLatencyStatus>>>,
 }
@@ -562,7 +581,9 @@ impl LiveMediaRuntime {
             ducked_main_gain: None,
             feedback_clock: Arc::clone(&feedback_clock),
             screen_frames: Arc::clone(&screen_frames),
+            screen_suspension: Arc::new(ScreenSuspension::default()),
             recording_requested: false,
+            video_audio_mixer: false,
             flush_state,
             audio_stream_latencies: Arc::clone(&audio_stream_latencies),
         };
@@ -584,6 +605,7 @@ impl LiveMediaRuntime {
                 screen: true,
                 audio: audio_output_available,
                 microphone: audio_output_available,
+                hevc: LinuxVideoBackend::hevc_available(),
             },
             progress,
             failure,
@@ -876,6 +898,12 @@ impl MediaController {
                     MediaCommand::Record(reply) => {
                         let _ = reply.send(Ok(true));
                     }
+                    MediaCommand::BeginVideoPlayback(reply) => {
+                        let _ = reply.send(Err("no display in tests".to_owned()));
+                    }
+                    MediaCommand::EndVideoPlayback(reply) => {
+                        let _ = reply.send(Ok(()));
+                    }
                 }
             }
         });
@@ -986,6 +1014,29 @@ impl MediaController {
 
     pub(crate) fn teardown(&self, streams: Vec<StreamKey>) -> Result<(), String> {
         self.call(|reply| MediaCommand::Teardown(streams, reply))
+    }
+
+    pub(crate) fn begin_video_playback(&self) -> Result<VideoOutputs, String> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        match self
+            .commands
+            .try_send(MediaCommand::BeginVideoPlayback(reply_tx))
+        {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err("media command queue is full; request rejected".to_owned());
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err("media supervisor is stopped".to_owned());
+            }
+        }
+        reply_rx
+            .recv_timeout(COMMAND_TIMEOUT)
+            .map_err(|_| "media command did not complete within its bound".to_owned())?
+    }
+
+    pub(crate) fn end_video_playback(&self) -> Result<(), String> {
+        self.call(MediaCommand::EndVideoPlayback)
     }
 
     fn call(
@@ -1103,7 +1154,87 @@ impl MediaSupervisor {
                 let result = self.teardown_streams(&streams);
                 let _ = reply.send(result);
             }
+            MediaCommand::BeginVideoPlayback(reply) => {
+                let result = self.begin_video_playback();
+                let _ = reply.send(result);
+            }
+            MediaCommand::EndVideoPlayback(reply) => {
+                self.screen_suspension
+                    .requested
+                    .store(false, Ordering::Release);
+                tracing::info!("CarPlay screen decoding resumes after video");
+                let result = self.release_video_audio_mixer();
+                let _ = reply.send(result);
+            }
         }
+    }
+
+    fn begin_video_playback(&mut self) -> Result<VideoOutputs, String> {
+        let display = self
+            .display
+            .clone()
+            .ok_or_else(|| "video playback needs the display runtime".to_owned())?;
+        self.screen_suspension
+            .requested
+            .store(true, Ordering::Release);
+        let deadline = Instant::now() + SCREEN_RELEASE_TIMEOUT;
+        while self
+            .screen_suspension
+            .decoder_active
+            .load(Ordering::Acquire)
+        {
+            if Instant::now() >= deadline {
+                self.screen_suspension
+                    .requested
+                    .store(false, Ordering::Release);
+                return Err("the CarPlay screen decoder did not release for video".to_owned());
+            }
+            thread::sleep(SCREEN_RELEASE_POLL);
+        }
+        if let Err(error) = self.start_video_audio_mixer() {
+            tracing::warn!(error, "the audio mixer could not start for CarPlay video");
+        }
+        let audio = match self
+            .audio
+            .lock()
+            .map_err(|_| "audio backend lock is poisoned".to_owned())?
+            .as_ref()
+        {
+            Some(backend) => match backend.attach_pcm_input() {
+                Ok(input) => Some(input),
+                Err(error) => {
+                    tracing::warn!(%error, "CarPlay video will play without sound");
+                    None
+                }
+            },
+            None => {
+                tracing::warn!("CarPlay video will play without sound; the mixer is not running");
+                None
+            }
+        };
+        Ok(VideoOutputs { display, audio })
+    }
+
+    fn start_video_audio_mixer(&mut self) -> Result<(), String> {
+        let running = self
+            .audio
+            .lock()
+            .map_err(|_| "audio backend lock is poisoned".to_owned())?
+            .is_some();
+        if running || !self.audio_output_enabled || self.audio_route.is_none() {
+            return Ok(());
+        }
+        self.launch_audio_backend()?;
+        self.video_audio_mixer = true;
+        tracing::info!("started the audio mixer for CarPlay video");
+        Ok(())
+    }
+
+    fn release_video_audio_mixer(&mut self) -> Result<(), String> {
+        if !std::mem::take(&mut self.video_audio_mixer) || !self.audio_descriptors.is_empty() {
+            return Ok(());
+        }
+        self.stop_audio_backend()
     }
 
     fn set_peer(&mut self, peer: SocketAddrV6) -> Result<(), String> {
@@ -1200,6 +1331,7 @@ impl MediaSupervisor {
         let video_synchronization = self.video_synchronization.clone();
         let display = self.display.clone();
         let screen_frames = Arc::clone(&self.screen_frames);
+        let screen_suspension = Arc::clone(&self.screen_suspension);
         let audio = Arc::clone(&self.audio);
         let progress = Arc::clone(&self.progress);
         let event_commands = self.event_commands.clone();
@@ -1280,6 +1412,7 @@ impl MediaSupervisor {
                             video_synchronization,
                             display,
                             screen_frames,
+                            suspension: screen_suspension,
                         });
                         if let Err(error) = &result {
                             tracing::warn!(error, "screen media worker stopped");
@@ -1426,6 +1559,10 @@ impl MediaSupervisor {
         if self.audio_descriptors.is_empty() {
             return Ok(());
         }
+        self.launch_audio_backend()
+    }
+
+    fn launch_audio_backend(&mut self) -> Result<(), String> {
         let streams = self.audio_streams();
         let base_route = self
             .audio_route
@@ -1807,6 +1944,7 @@ struct ScreenWorkerContext {
     video_synchronization: VideoSynchronizationTelemetry,
     display: Option<LinuxDisplayHandle>,
     screen_frames: Arc<AtomicU64>,
+    suspension: Arc<ScreenSuspension>,
 }
 
 fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
@@ -1821,6 +1959,7 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
         video_synchronization,
         display,
         screen_frames,
+        suspension,
     } = context;
     listener
         .set_nonblocking(true)
@@ -1847,10 +1986,30 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
     let mut decoder = ScreenWireDecoder::new(*key, ScreenWireLimits::default())
         .map_err(|error| format!("initializing screen decoder failed: {error}"))?;
     let mut backend: Option<LinuxVideoBackend> = None;
+    let mut last_configuration = None;
+    let mut suspended = false;
     let mut frame_ordinal = 0_u64;
     let mut input = [0_u8; 64 * 1024];
     let mut next_diagnostic = Instant::now() + VIDEO_DIAGNOSTIC_INTERVAL;
     'screen: while !cancellation.is_cancelled() {
+        if suspension.requested.load(Ordering::Acquire) {
+            if let Some(active) = backend.take() {
+                active
+                    .shutdown()
+                    .map_err(|error| format!("pausing the video backend failed: {error}"))?;
+                tracing::info!("paused CarPlay screen decoding for video playback");
+            }
+            suspension.decoder_active.store(false, Ordering::Release);
+            suspended = true;
+        } else if suspended {
+            suspended = false;
+            if event_commands
+                .try_send(EventWorkerCommand::ForceKeyFrame)
+                .is_err()
+            {
+                tracing::debug!("could not request a keyframe after video playback");
+            }
+        }
         let now = Instant::now();
         if now >= next_diagnostic {
             next_diagnostic = now + VIDEO_DIAGNOSTIC_INTERVAL;
@@ -1884,6 +2043,10 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
                         "received CarPlay screen codec configuration"
                     );
                     frame_ordinal = 0;
+                    last_configuration = Some(configuration.clone());
+                    if suspended {
+                        continue;
+                    }
                     match backend.as_ref() {
                         Some(active) => {
                             active
@@ -1901,9 +2064,10 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
                                     display.clone(),
                                 )
                                 .map_err(|error| {
-                                    format!("starting H.264 backend failed: {error}")
+                                    format!("starting the video backend failed: {error}")
                                 })?,
                             );
+                            suspension.decoder_active.store(true, Ordering::Release);
                         }
                     }
                 }
@@ -1913,10 +2077,28 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
                     video_synchronization
                         .latency()
                         .record_arrival(frame.nonce_counter, arrived_at);
-                    let idr = frame
-                        .nal_units
-                        .iter()
-                        .any(|descriptor| descriptor.unit_type == 5);
+                    let idr = frame.is_key_frame();
+                    if suspended {
+                        continue;
+                    }
+                    if backend.is_none() {
+                        let Some(configuration) = last_configuration.clone().filter(|_| idr) else {
+                            continue;
+                        };
+                        backend = Some(
+                            LinuxVideoBackend::start_with_display(
+                                video,
+                                configuration,
+                                video_synchronization.clone(),
+                                display.clone(),
+                            )
+                            .map_err(|error| {
+                                format!("restarting the video backend failed: {error}")
+                            })?,
+                        );
+                        suspension.decoder_active.store(true, Ordering::Release);
+                        tracing::info!("CarPlay screen decoding resumed on a keyframe");
+                    }
                     if frame_ordinal == 1 {
                         tracing::info!(
                             idr,
@@ -1950,7 +2132,7 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
                             "screen frame arrived before backend configuration".to_owned()
                         })?
                         .submit_frame(frame)
-                        .map_err(|error| format!("submitting H.264 frame failed: {error}"))
+                        .map_err(|error| format!("submitting a video frame failed: {error}"))
                         .map(|_| ())?;
                 }
                 ScreenWireEvent::Control(_) => {}
@@ -1960,6 +2142,7 @@ fn screen_worker(context: ScreenWorkerContext) -> Result<(), String> {
         poll_video_backend(backend.as_ref(), &event_commands)?;
     }
     let _ = decoder.teardown();
+    suspension.decoder_active.store(false, Ordering::Release);
     if let Some(active) = backend {
         active
             .shutdown()

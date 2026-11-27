@@ -1,0 +1,29 @@
+[package]
+name = "prelude-tls-psk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+foreign-types = "0.3.2"
+openssl = "0.10.75"
+openssl-sys = "0.9.117"
+zeroize = "1.8.1"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+multiple_unsafe_ops_per_block = "deny"

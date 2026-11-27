@@ -1861,6 +1861,7 @@ dependencies = [
  "sonora",
  "tempfile",
  "thiserror 2.0.20",
+ "tracing",
  "wayland-client",
  "zeroize",
 ]
@@ -1901,6 +1902,16 @@ dependencies = [
  "thiserror 2.0.20",
  "uuid",
  "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "prelude-tls-psk"
+version = "0.1.4"
+dependencies = [
+ "foreign-types",
+ "openssl",
+ "openssl-sys",
  "zeroize",
 ]
 
@@ -1967,6 +1978,7 @@ dependencies = [
  "fontdue",
  "hex",
  "nix 0.30.1",
+ "openssl",
  "platform-superbird",
  "plist",
  "prelude-android-auto",
@@ -1977,6 +1989,7 @@ dependencies = [
  "prelude-media",
  "prelude-mfi",
  "prelude-net",
+ "prelude-tls-psk",
  "prelude-usb-carkit",
  "prelude-wireless",
  "serde",

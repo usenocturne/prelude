@@ -7,7 +7,7 @@ mod hid;
 mod input;
 mod session;
 
-pub use control_event::{ControlEvent, ControlEventDecoder, SiriSpeechMode};
+pub use control_event::{ControlEvent, ControlEventDecoder, SiriSpeechMode, VideoProxyOffer};
 pub use error::{Error, Result};
 pub use event::{
     AirPlayEvent, AirPlayEventKind, EventChannelEncoder, InputWireSession, MonotonicTimestamp,

@@ -29,9 +29,9 @@ pub use mfisap::{
 pub use negotiation::{
     ALTERNATE_AUDIO_STREAM_TYPE, ALTERNATE_SCREEN_STREAM_TYPE, AudioDescriptor, AudioStreamKind,
     DATA_CHANNEL_STREAM_TYPE, DataChannelDescriptor, HIGH_AUDIO_STREAM_TYPE,
-    MAIN_AUDIO_STREAM_TYPE, MAIN_SCREEN_STREAM_TYPE, MicrophoneDescriptor, PeerIdentity,
-    PortProvider, ScreenDescriptor, ScreenKind, SessionPorts, StreamDescriptor, StreamKey,
-    StreamPorts, TimingDescriptor,
+    MAIN_AUDIO_STREAM_TYPE, MAIN_SCREEN_STREAM_TYPE, MessageChannelDescriptor,
+    MicrophoneDescriptor, PeerIdentity, PortProvider, ScreenDescriptor, ScreenKind, SessionPorts,
+    StreamDescriptor, StreamKey, StreamPorts, TimingDescriptor, VIDEO_PLAYBACK_CLIENT_TYPE,
 };
 pub use pair_setup::{PairSetup, PairSetupState};
 pub use pair_verify::{PairVerify, PairVerifyState};

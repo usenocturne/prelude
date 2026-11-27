@@ -21,11 +21,13 @@ prelude-iap2 = { path = "../iap2" }
 prelude-media = { path = "../carplay-media", default-features = false }
 prelude-mfi = { path = "../mfi" }
 prelude-net = { path = "../carplay-net" }
+prelude-tls-psk = { path = "../tls-psk" }
 prelude-usb-carkit = { path = "../usb-carkit" }
 prelude-wireless = { path = "../wireless" }
 fontdue.workspace = true
 hex.workspace = true
 nix.workspace = true
+openssl = "0.10.75"
 platform-superbird = { path = "../platform-superbird" }
 plist = "=1.7.0"
 serde.workspace = true

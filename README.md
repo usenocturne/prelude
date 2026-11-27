@@ -107,6 +107,16 @@ Drag a band vertically or the preamp horizontally. With the knob, rotate to sele
 
 The equalizer affects all USB DAC output, including music, navigation, calls and assistants, for both CarPlay and Android Auto. **Phone audio bypasses it**, and the microphone is unaffected.
 
+### Video while parked (CarPlay)
+
+> [!WARNING]
+> Prelude can't tell whether your car is parked, so please only watch while parked.
+
+On iOS 26.4 and later, you can AirPlay video from your iPhone to Prelude. Start a video, tap the AirPlay button, and choose your car. Prelude decodes the stream itself and shows it full screen, and the sound plays through your USB DAC. Stop the video on your iPhone to get back to CarPlay.
+
+Only unprotected video plays. Content protected with FairPlay DRM, which includes most shows and films in the Apple TV app, can't be decoded on the Car Thing. 
+
+
 ### Uninstall
 
 Use a tool of your choice (`flashthing-cli` with stock firmware, or Terbium for the old Buildroot path) to flash stock or a different firmware.

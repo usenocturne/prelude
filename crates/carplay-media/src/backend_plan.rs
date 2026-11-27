@@ -64,18 +64,17 @@ pub struct VideoPipelinePlan {
 }
 
 impl VideoPipelinePlan {
-    pub fn h264(configuration: &VideoCodecConfiguration) -> Result<Self> {
-        if configuration.codec != WireVideoCodec::H264 {
-            return Err(Error::Unsupported(
-                "the target media backend currently supports H.264 only",
-            ));
-        }
+    pub fn new(configuration: &VideoCodecConfiguration) -> Result<Self> {
+        let (media_type, stream_format, parser, decoder) = match configuration.codec {
+            WireVideoCodec::H264 => ("video/x-h264", "avc", "h264parse", "v4l2h264dec"),
+            WireVideoCodec::H265 => ("video/x-h265", "hvc1", "h265parse", "v4l2h265dec"),
+        };
         if configuration.codec_data.is_empty()
             || configuration.codec_data.len() > MAXIMUM_CODEC_DATA_BYTES
             || !matches!(configuration.nal_length_bytes, 1 | 2 | 4)
         {
             return Err(Error::InvalidVideo(
-                "H.264 codec data or NAL length width is invalid".to_owned(),
+                "video codec data or NAL length width is invalid".to_owned(),
             ));
         }
         Ok(Self {
@@ -87,9 +86,9 @@ impl VideoPipelinePlan {
             decoder_device: TARGET_VIDEO_DEVICE,
             decoder_driver_name: TARGET_VIDEO_DRIVER_NAME,
             input_caps: CapsPlan {
-                media_type: "video/x-h264",
+                media_type,
                 fields: vec![
-                    ("stream-format", CapsValue::String("avc".to_owned())),
+                    ("stream-format", CapsValue::String(stream_format.to_owned())),
                     ("alignment", CapsValue::String("au".to_owned())),
                     (
                         "codec_data",
@@ -121,15 +120,15 @@ impl VideoPipelinePlan {
                     name: "screen-source",
                 },
                 PipelineElementPlan {
-                    factory: "h264parse",
-                    name: "h264-parser",
+                    factory: parser,
+                    name: "video-parser",
                 },
                 PipelineElementPlan {
                     factory: "queue",
                     name: "decoder-input-queue",
                 },
                 PipelineElementPlan {
-                    factory: "v4l2h264dec",
+                    factory: decoder,
                     name: "hardware-decoder",
                 },
                 PipelineElementPlan {
@@ -875,7 +874,7 @@ mod tests {
 
     #[test]
     fn video_plan_is_fixed_to_target_stateful_decoder_and_avc_caps() {
-        let plan = VideoPipelinePlan::h264(&h264_configuration()).expect("plan");
+        let plan = VideoPipelinePlan::new(&h264_configuration()).expect("plan");
         assert_eq!(plan.decoder_device, "/dev/video1");
         assert_eq!(plan.decoder_driver_name, "meson-video-decoder");
         assert_eq!(plan.elements[2].factory, "queue");
@@ -903,13 +902,17 @@ mod tests {
     }
 
     #[test]
-    fn video_plan_rejects_hevc_without_fallback() {
+    fn hevc_plan_uses_the_hardware_hevc_decoder_and_hvcc_caps() {
         let mut configuration = h264_configuration();
         configuration.codec = WireVideoCodec::H265;
-        assert!(matches!(
-            VideoPipelinePlan::h264(&configuration),
-            Err(Error::Unsupported(_))
-        ));
+        let plan = VideoPipelinePlan::new(&configuration).expect("plan");
+        assert_eq!(plan.input_caps.media_type, "video/x-h265");
+        assert_eq!(
+            plan.input_caps.field("stream-format"),
+            Some(&CapsValue::String("hvc1".to_owned()))
+        );
+        assert_eq!(plan.elements[1].factory, "h265parse");
+        assert_eq!(plan.elements[3].factory, "v4l2h265dec");
     }
 
     #[test]

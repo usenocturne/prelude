@@ -21,7 +21,7 @@ use crate::{
     MicrophoneCodec, MicrophoneConfig, MicrophonePacket, MicrophonePacketizer, Result,
     TARGET_VIDEO_DEVICE, TARGET_VIDEO_DRIVER_ATTRIBUTE, UNITY_GAIN_Q15, UsbDacMatcher,
     VideoBackpressureConfig, VideoBackpressureStats, VideoCodecConfiguration,
-    VideoFrameDisposition, VideoIngressBuffer, VideoPipelinePlan,
+    VideoFrameDisposition, VideoIngressBuffer, VideoPipelinePlan, WireVideoCodec,
     backend_plan::AudioGainRamp,
     backpressure::{DecodeStallWatchdog, StartupSampleDisposition, VideoStartupRenderGate},
     decoder_flush::{DecoderFlush, FlushPacing, take_flush_output},
@@ -39,7 +39,13 @@ use gstreamer_video::{VideoFrameExt, VideoFrameRef, VideoInfo};
 
 #[path = "output_equalizer.rs"]
 mod output_equalizer;
+#[path = "pcm_input.rs"]
+mod pcm_input;
+#[path = "url_player.rs"]
+mod url_player;
 use output_equalizer::OutputEqualizer;
+pub use pcm_input::{PCM_INPUT_CHANNELS, PCM_INPUT_SAMPLE_RATE, PcmInput};
+pub use url_player::{UrlPlayerStatus, UrlVideoPlayer};
 
 const WORKER_POLL: Duration = Duration::from_millis(10);
 const LOW_LATENCY_VIDEO_POLL: Duration = Duration::from_millis(1);
@@ -314,6 +320,13 @@ impl LinuxVideoBackend {
         Ok(())
     }
 
+    pub fn hevc_available() -> bool {
+        gst::init().is_ok()
+            && ["h265parse", "v4l2h265dec"]
+                .into_iter()
+                .all(|factory| require_factory(factory).is_ok())
+    }
+
     pub fn start(
         config: LinuxVideoBackendConfig,
         initial_configuration: VideoCodecConfiguration,
@@ -347,7 +360,7 @@ impl LinuxVideoBackend {
             ));
         }
         probe_target_video_decoder()?;
-        VideoPipelinePlan::h264(&initial_configuration)?;
+        VideoPipelinePlan::new(&initial_configuration)?;
         let ingress = VideoIngressBuffer::new(config.backpressure)?;
         ingress.submit_configuration(initial_configuration)?;
         let worker_ingress = ingress.clone();
@@ -757,18 +770,19 @@ impl VideoGstPipeline {
         output_delay: AudioOutputDelay,
         low_latency: bool,
     ) -> Result<Self> {
-        let plan = VideoPipelinePlan::h264(configuration)?;
+        let plan = VideoPipelinePlan::new(configuration)?;
         let pipeline = gst::Pipeline::new();
         let clock = gst::SystemClock::obtain();
         pipeline.use_clock(Some(&clock));
+        let h264 = configuration.codec == WireVideoCodec::H264;
         let source_element = make("appsrc", "screen-source")?;
-        let parser = make("h264parse", "h264-parser")?;
+        let parser = make(plan.elements[1].factory, "video-parser")?;
         set_checked(&parser, "config-interval", -1_i32)?;
-        let parser_caps = make("capsfilter", "h264-parser-output-caps")?;
+        let parser_caps = make("capsfilter", "video-parser-output-caps")?;
         set_checked(
             &parser_caps,
             "caps",
-            gst::Caps::builder("video/x-h264")
+            gst::Caps::builder(plan.input_caps.media_type)
                 .field("stream-format", "byte-stream")
                 .field("alignment", "au")
                 .build(),
@@ -788,14 +802,14 @@ impl VideoGstPipeline {
                 HARDWARE_DECODER_PREROLL_BUFFERS,
             )?;
         }
-        let decoder = make("v4l2h264dec", "hardware-decoder")?;
+        let decoder = make(plan.elements[3].factory, "hardware-decoder")?;
         require_string_property_equals(&decoder, "device", TARGET_VIDEO_DEVICE)?;
         set_enum_checked(&decoder, "output-io-mode", "mmap")?;
         set_enum_checked(&decoder, "capture-io-mode", "mmap")?;
         set_checked(&decoder, "discard-corrupted-frames", true)?;
-        install_h264_decoder_caps_adapter(&parser)?;
+        install_decoder_caps_adapter(&parser)?;
         let flush_outputs = FlushOutputs::default();
-        if low_latency {
+        if low_latency && h264 {
             discard_flush_pictures(&decoder, Arc::clone(&flush_outputs))?;
         }
         let renderer_queue = make("queue", "renderer-queue")?;
@@ -863,7 +877,7 @@ impl VideoGstPipeline {
             startup_gate: Some(VideoStartupRenderGate::default()),
             startup_recovery_deadline: None,
             last_keyframe_request: None,
-            flush: low_latency.then(|| DecoderFlush::new(configuration)),
+            flush: (low_latency && h264).then(|| DecoderFlush::new(configuration)),
             flush_outputs,
             flush_pacing: FlushPacing::default(),
             owed_flush: None,
@@ -875,10 +889,7 @@ impl VideoGstPipeline {
             .flush
             .as_mut()
             .and_then(|flush| flush.prepare(&mut frame));
-        let idr = frame
-            .nal_units
-            .iter()
-            .any(|descriptor| descriptor.unit_type == 5);
+        let idr = frame.is_key_frame();
         let pts_ns = frame.presentation_time_ns.unwrap_or(self.next_pts_ns);
         if self.next_pts_ns != 0
             && pts_ns < self.next_pts_ns.saturating_sub(VIDEO_FRAME_DURATION_NS)
@@ -1074,7 +1085,7 @@ impl VideoGstPipeline {
         check_bus(&self.pipeline, "video pipeline").map_err(|error| match error {
             Error::Backend(message) => Error::Backend(format!(
                 "{message}; stream caps {}; decoded caps {}",
-                pad_caps(&self.pipeline, "h264-parser-output-caps", "src"),
+                pad_caps(&self.pipeline, "video-parser-output-caps", "src"),
                 pad_caps(&self.pipeline, "hardware-decoder", "src"),
             )),
             error => error,
@@ -1127,10 +1138,10 @@ fn discard_flush_pictures(decoder: &gst::Element, pending: FlushOutputs) -> Resu
     Ok(())
 }
 
-fn install_h264_decoder_caps_adapter(parser: &gst::Element) -> Result<()> {
+fn install_decoder_caps_adapter(parser: &gst::Element) -> Result<()> {
     let source_pad = parser
         .static_pad("src")
-        .ok_or_else(|| Error::Backend("H.264 parser has no source pad".to_owned()))?;
+        .ok_or_else(|| Error::Backend("video parser has no source pad".to_owned()))?;
     source_pad
         .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
             let Some(gst::PadProbeData::Event(event)) = info.data.as_ref() else {
@@ -1140,7 +1151,7 @@ fn install_h264_decoder_caps_adapter(parser: &gst::Element) -> Result<()> {
                 return gst::PadProbeReturn::Ok;
             };
             let caps = caps_event.caps_owned();
-            let Some(adapted_caps) = h264_caps_without_unsupported_colorimetry(&caps) else {
+            let Some(adapted_caps) = caps_without_unsupported_colorimetry(&caps) else {
                 return gst::PadProbeReturn::Ok;
             };
             info.data = Some(gst::PadProbeData::Event(gst::event::Caps::new(
@@ -1148,16 +1159,18 @@ fn install_h264_decoder_caps_adapter(parser: &gst::Element) -> Result<()> {
             )));
             gst::PadProbeReturn::Ok
         })
-        .ok_or_else(|| Error::Backend("cannot install H.264 decoder caps adapter".to_owned()))?;
+        .ok_or_else(|| {
+            Error::Backend("cannot install the video decoder caps adapter".to_owned())
+        })?;
     Ok(())
 }
 
-fn h264_caps_without_unsupported_colorimetry(caps: &gst::CapsRef) -> Option<gst::Caps> {
+fn caps_without_unsupported_colorimetry(caps: &gst::CapsRef) -> Option<gst::Caps> {
     if caps.size() != 1 {
         return None;
     }
     let structure = caps.structure(0)?;
-    if structure.name() != "video/x-h264"
+    if !matches!(structure.name().as_str(), "video/x-h264" | "video/x-h265")
         || structure.get::<u32>("bit-depth-luma").ok()? != 8
         || structure.get::<u32>("bit-depth-chroma").ok()? != 8
         || structure.get::<&str>("chroma-format").ok()? != "4:2:0"
@@ -1653,6 +1666,19 @@ impl LinuxAudioBackend {
             Error::InvalidAudio("audio frame has no bounded ingress queue".to_owned())
         })?;
         queue_audio_frame(sender, QueuedAudioFrame { generation, frame })
+    }
+
+    pub fn attach_pcm_input(&self) -> Result<PcmInput> {
+        let pipeline = self
+            .pipeline_control
+            .lock()
+            .map_err(|_| Error::Backend("pipeline control lock is poisoned".to_owned()))?
+            .clone()
+            .ok_or(Error::NotReady {
+                component: "audio mixer",
+                state: "stopped",
+            })?;
+        PcmInput::attach(&pipeline)
     }
 
     pub fn frame_sender(&self, stream_id: AudioStreamId) -> Option<AudioFrameSender> {
@@ -5080,6 +5106,28 @@ mod tests {
     }
 
     #[test]
+    fn iphone_hevc_colorimetry_is_removed_for_the_hardware_decoder() {
+        if gst::init().is_err() {
+            skip("GStreamer runtime is unavailable");
+            return;
+        }
+        let caps = gst::Caps::builder("video/x-h265")
+            .field("stream-format", "byte-stream")
+            .field("alignment", "au")
+            .field("chroma-format", "4:2:0")
+            .field("bit-depth-luma", 8_u32)
+            .field("bit-depth-chroma", 8_u32)
+            .field("colorimetry", "1:3:7:1")
+            .field("profile", "main")
+            .build();
+        let adapted =
+            caps_without_unsupported_colorimetry(&caps).expect("iPhone HEVC caps are adapted");
+        let structure = adapted.structure(0).expect("adapted caps structure");
+        assert!(!structure.has_field("colorimetry"));
+        assert_eq!(structure.get::<&str>("profile"), Ok("main"));
+    }
+
+    #[test]
     fn non_bt709_h264_colorimetry_is_removed_only_for_eight_bit_420() {
         if gst::init().is_err() {
             skip("GStreamer runtime is unavailable");
@@ -5094,7 +5142,7 @@ mod tests {
             .field("profile", "high-10")
             .field("colorimetry", "1:4:5:1")
             .build();
-        let adapted = h264_caps_without_unsupported_colorimetry(&caps)
+        let adapted = caps_without_unsupported_colorimetry(&caps)
             .expect("eligible H.264 caps should be adapted");
         let structure = adapted.structure(0).expect("adapted caps structure");
         assert!(!structure.has_field("colorimetry"));
@@ -5107,7 +5155,7 @@ mod tests {
                 .structure_mut(0)
                 .expect("incompatible caps contain one structure")
                 .set(field, 10_u32);
-            assert!(h264_caps_without_unsupported_colorimetry(&incompatible).is_none());
+            assert!(caps_without_unsupported_colorimetry(&incompatible).is_none());
         }
 
         let mut supported = caps.clone();
@@ -5116,7 +5164,7 @@ mod tests {
             .structure_mut(0)
             .expect("supported caps contain one structure")
             .set("colorimetry", "bt709");
-        assert!(h264_caps_without_unsupported_colorimetry(&supported).is_none());
+        assert!(caps_without_unsupported_colorimetry(&supported).is_none());
 
         for colorimetry in ["bt601", "2:4:5:4", "1:3:5:1", "1:4:7:1"] {
             let mut android = caps.clone();
@@ -5125,7 +5173,7 @@ mod tests {
                 .structure_mut(0)
                 .expect("android caps contain one structure")
                 .set("colorimetry", colorimetry);
-            let adapted = h264_caps_without_unsupported_colorimetry(&android)
+            let adapted = caps_without_unsupported_colorimetry(&android)
                 .expect("non-bt709 colorimetry should be removed");
             assert!(
                 !adapted
